@@ -519,8 +519,9 @@ fn set_pin_refusals() {
         ]),
         [INVALID_PARAMETER]
     );
-    // A key agreement key without alg, and one with alg -7 instead of -25 (§6.5.6 ecdh parses
-    // the key as getPublicKey specifies it).
+    // A key agreement key without alg, one with alg -7 instead of -25, and one with a further
+    // optional parameter, key_ops (label 4): §6.5.6 ecdh parses the key as getPublicKey specifies
+    // it, alg present and no other optional parameter (§6.5.5, keyAgreement).
     let point = &session.cose_key[11..];
     let no_alg = [&[0xA4, 0x01, 0x02, 0x20, 0x01, 0x21, 0x58, 0x20][..], point].concat();
     let es256 = [
@@ -528,7 +529,14 @@ fn set_pin_refusals() {
         point,
     ]
     .concat();
-    for key in [no_alg, es256] {
+    let key_ops = [
+        &[
+            0xA6, 0x01, 0x02, 0x03, 0x38, 0x18, 0x04, 0x81, 0x01, 0x20, 0x01, 0x21, 0x58, 0x20,
+        ][..],
+        point,
+    ]
+    .concat();
+    for key in [no_alg, es256, key_ops] {
         assert_eq!(
             send(&[
                 (0x01, Value::Uint(2)),

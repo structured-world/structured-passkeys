@@ -282,8 +282,9 @@ const fn oversized_new_pin(protocol: Protocol, len: usize) -> StatusCode {
 
 /// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key, parsed as §6.5.6 ecdh
 /// requires, "as specified for getPublicKey": kty 2 (EC2), alg -25, crv 1 (P-256), 32-byte x
-/// and y. Other labels are skipped: getPublicKey lists the parameters the key has, not a ban on
-/// further ones, and COSE ignores labels it does not use.
+/// and y, and nothing else: such a key "MUST contain the optional alg parameter and MUST NOT
+/// contain any other optional parameters" (§6.5.5, keyAgreement). A key with a further label
+/// cannot be decapsulated.
 fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
     decoder.map(|entries| {
         let mut kty = None;
@@ -291,6 +292,7 @@ fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
         let mut crv = None;
         let mut x = None;
         let mut y = None;
+        let mut other = false;
         while let Some(key) = entries.next_key()? {
             let value = entries.value();
             match key {
@@ -299,12 +301,15 @@ fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
                 Key::Int(-1) => crv = Some(value.int()?),
                 Key::Int(-2) => x = Some(value.bytes()?),
                 Key::Int(-3) => y = Some(value.bytes()?),
-                _ => value.skip()?,
+                _ => {
+                    value.skip()?;
+                    other = true;
+                }
             }
         }
         let point = match (kty, alg, crv, x, y) {
             (Some(2), Some(-25), Some(1), Some(x), Some(y))
-                if x.len() == KEY_LEN && y.len() == KEY_LEN =>
+                if !other && x.len() == KEY_LEN && y.len() == KEY_LEN =>
             {
                 let mut point = [0u8; PUBLIC_KEY_LEN];
                 point[0] = 0x04;

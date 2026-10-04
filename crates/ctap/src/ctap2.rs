@@ -430,7 +430,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
     /// until a version's command set exists and passes its conformance tests: §6.4 requires the
     /// member but not a non-empty list, and a version string is a promise platforms act on, so
-    /// an empty list is the truthful answer rather than an error for the command.
+    /// an empty list is the truthful answer rather than an error for the command. The options
+    /// `clientPin`, `pinUvAuthToken` and `uv`, and `minPINLength`, come with makeCredential and
+    /// getAssertion, the commands the tokens are for: a platform reading them now would start
+    /// PIN/UV flows that end in commands this authenticator does not have yet.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         encoder
             .map(4)?
