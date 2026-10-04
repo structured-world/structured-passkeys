@@ -5,12 +5,13 @@
 //! client PIN set, so the PIN subcommands reach their checks. Every response must be a known
 //! status and, on success, canonical CBOR; a request must never panic. Beyond the shape, the
 //! clientPIN rules that hold for any input: a pinUvAuthToken only after the consent was approved
-//! (CTAP 2.2 §6.5.5.7), built-in UV only on an unlocked device, and a PIN try spent only by a PIN
-//! check that fails, one at a time (§6.5.5.6, §6.5.5.7).
+//! (CTAP 2.2 §6.5.5.7), the NFC tap included, built-in UV only on an unlocked device, a PIN try
+//! spent only by a PIN check that fails, one at a time (§6.5.5.6, §6.5.5.7), and a selection only
+//! with user presence (§6.9).
 
 use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
 use structured_passkeys_ctap::crypto::{Crypto, KEY_LEN};
-use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings};
+use structured_passkeys_ctap::ctap2::{Authenticator, Link, MaxMsgSize, Settings, Transports};
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
 use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
@@ -83,10 +84,20 @@ pub fn run(data: &[u8]) {
     store.write_config(&config);
     let settings = Settings {
         max_msg_size: MaxMsgSize::try_from(1024).expect("at least 1024"),
+        transports: Transports::UsbAndNfc,
     };
     let mut authenticator = Authenticator::new(settings, crypto, store);
+    // Bit 6 sends the request over NFC, bit 7 with the device tapped first.
+    let link = if answers & 0x40 == 0 {
+        Link::Usb
+    } else {
+        Link::Nfc
+    };
+    if answers & 0x80 != 0 {
+        authenticator.nfc_tap(0);
+    }
     let mut response = [0u8; 1024];
-    let length = authenticator.process(request, &mut Fuzzed(answers), &mut response);
+    let length = authenticator.process(request, link, &mut Fuzzed(answers), &mut response);
     assert!(length >= 1, "every request is answered");
     assert!(
         STATUS_CODES.contains(&response[0]),
@@ -101,6 +112,15 @@ pub fn run(data: &[u8]) {
 
     let sub_command = client_pin_sub_command(request);
     let succeeded = response[0] == 0x00;
+    // authenticatorSelection answers OK only with user presence: a confirmation on the device, or
+    // over NFC the tap (§6.9).
+    if succeeded && request == [0x0B] {
+        let tapped = link == Link::Nfc && answers & 0x80 != 0;
+        assert!(
+            tapped || answers & 0x03 == 0,
+            "selection only with user presence"
+        );
+    }
     // getPinToken, getPinUvAuthTokenUsingUvWithPermissions, getPinUvAuthTokenUsingPinWithPermissions.
     if succeeded && matches!(sub_command, Some(0x05 | 0x06 | 0x09)) {
         assert_eq!(

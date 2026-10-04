@@ -5,6 +5,11 @@
 # Ledger's checks resolve them against this directory, so the target directory lives here.
 target-dir = "target"
 
+[env]
+# The C SDK's IO buffer, where an NFC APDU is assembled, holds 272 bytes by default; an extended
+# APDU carrying a 1024-byte CTAP request needs COMM_SIZE in src/main.rs.
+LEDGER_SDK_EXTRA_DEFINES = "CUSTOM_IO_APDU_BUFFER_SIZE=1040"
+
 [profile.release]
 opt-level = "z"
 lto = true
