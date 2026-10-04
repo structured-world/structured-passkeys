@@ -1,7 +1,7 @@
 //! authenticatorClientPIN (CTAP 2.2 §6.5.5): parsing a request into what its execution needs,
 //! and the subcommands.
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::{Authenticator, StatusCode};
 use crate::cbor::{self, Decoder, Encoder, Full, Key};
@@ -64,13 +64,22 @@ impl SubCommand {
 
 /// A byte string member copied out of the request, up to `N` bytes. A longer one keeps no bytes
 /// and is only known to be too long: no member this command takes is longer than its buffer for
-/// a well-formed request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// a well-formed request. The bytes can be PIN material, so they are wiped on drop and never
+/// copied implicitly.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Bytes<const N: usize> {
     bytes: [u8; N],
     /// The length, or `None` for a value longer than `N`.
     len: Option<usize>,
 }
+
+impl<const N: usize> Drop for Bytes<N> {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+
+impl<const N: usize> ZeroizeOnDrop for Bytes<N> {}
 
 impl<const N: usize> Bytes<N> {
     fn new(value: &[u8]) -> Self {
@@ -112,8 +121,9 @@ impl RpId {
     }
 }
 
-/// An authenticatorClientPIN request, owning its members.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An authenticatorClientPIN request, owning its members. Not `Copy`: the byte string members
+/// wipe themselves when the one request is dropped.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ClientPinRequest {
     protocol: Option<u64>,
     sub_command: u64,
@@ -124,6 +134,9 @@ pub struct ClientPinRequest {
     permissions: Option<u64>,
     rp_id: Option<RpId>,
 }
+
+// Every member holding request bytes is a `Bytes`, which wipes itself on drop.
+impl ZeroizeOnDrop for ClientPinRequest {}
 
 /// Parses the CBOR parameters of authenticatorClientPIN (§6.5.5). Unknown members are ignored
 /// (§8); `subCommand` is the one member every subcommand needs.
@@ -156,7 +169,14 @@ pub(super) fn parse<C: Crypto>(
                 Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
                 Key::Int(0x0A) => {
                     let rp_id = value.text()?;
-                    let (shown, shown_len) = crate::storage::stored_rp_id(rp_id);
+                    let (mut shown, shown_len) = crate::storage::stored_rp_id(rp_id);
+                    // A screen would end the text at a NUL or break the line at a control
+                    // character, hiding the rest of an RP ID the consent is for.
+                    for byte in &mut shown[..shown_len] {
+                        if byte.is_ascii_control() {
+                            *byte = b'?';
+                        }
+                    }
                     request.rp_id = Some(RpId {
                         hash: crypto.sha256(&[rp_id.as_bytes()]),
                         shown,
@@ -174,12 +194,14 @@ pub(super) fn parse<C: Crypto>(
     Ok(request)
 }
 
-/// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key: kty 2 (EC2), crv 1 (P-256),
-/// 32-byte x and y. `alg` is not checked: §6.5.6 sets it to -25 though that is not the algorithm
-/// used, so it carries nothing the key does not.
+/// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key, parsed as §6.5.6 ecdh
+/// requires, "as specified for getPublicKey": kty 2 (EC2), alg -25, crv 1 (P-256), 32-byte x
+/// and y. Other labels are skipped: getPublicKey lists the parameters the key has, not a ban on
+/// further ones, and COSE ignores labels it does not use.
 fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
     decoder.map(|entries| {
         let mut kty = None;
+        let mut alg = None;
         let mut crv = None;
         let mut x = None;
         let mut y = None;
@@ -187,14 +209,17 @@ fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
             let value = entries.value();
             match key {
                 Key::Int(1) => kty = Some(value.int()?),
+                Key::Int(3) => alg = Some(value.int()?),
                 Key::Int(-1) => crv = Some(value.int()?),
                 Key::Int(-2) => x = Some(value.bytes()?),
                 Key::Int(-3) => y = Some(value.bytes()?),
                 _ => value.skip()?,
             }
         }
-        let point = match (kty, crv, x, y) {
-            (Some(2), Some(1), Some(x), Some(y)) if x.len() == KEY_LEN && y.len() == KEY_LEN => {
+        let point = match (kty, alg, crv, x, y) {
+            (Some(2), Some(-25), Some(1), Some(x), Some(y))
+                if x.len() == KEY_LEN && y.len() == KEY_LEN =>
+            {
                 let mut point = [0u8; PUBLIC_KEY_LEN];
                 point[0] = 0x04;
                 point[1..=KEY_LEN].copy_from_slice(x);
@@ -252,14 +277,14 @@ fn decapsulate<C: Crypto>(
     }
 }
 
-/// The answer to a consent screen: approval goes on, a refusal is CTAP2_ERR_OPERATION_DENIED
-/// (§6.5.5.7.2 step 7), and a timeout or cancellation ends the request as for any screen.
+/// The answer to a consent screen: approval goes on; a refusal or no answer is consent not
+/// approved, CTAP2_ERR_OPERATION_DENIED (§6.5.5.7.1 and §6.5.5.7.2 step 7); a request the host
+/// cancelled is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
 fn consent(answer: Answer) -> Result<(), StatusCode> {
     match answer {
         Answer::Confirmed => Ok(()),
-        Answer::Rejected => Err(StatusCode::OperationDenied),
+        Answer::Rejected | Answer::TimedOut => Err(StatusCode::OperationDenied),
         Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
-        Answer::TimedOut => Err(StatusCode::UserActionTimeout),
     }
 }
 
@@ -333,8 +358,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     fn set_pin(&mut self, request: &ClientPinRequest) -> Result<(), StatusCode> {
         let number = required(request.protocol)?;
         let peer = required(request.key_agreement)?;
-        let new_pin_enc = required(request.new_pin_enc)?;
-        let param = required(request.pin_uv_auth_param)?;
+        let new_pin_enc = required(request.new_pin_enc.as_ref())?;
+        let param = required(request.pin_uv_auth_param.as_ref())?;
         let protocol = protocol(number)?;
         if self.store.config().pin.is_some() {
             return Err(StatusCode::PinAuthInvalid);
@@ -361,9 +386,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     fn change_pin(&mut self, request: &ClientPinRequest) -> Result<(), StatusCode> {
         let number = required(request.protocol)?;
         let peer = required(request.key_agreement)?;
-        let pin_hash_enc = required(request.pin_hash_enc)?;
-        let new_pin_enc = required(request.new_pin_enc)?;
-        let param = required(request.pin_uv_auth_param)?;
+        let pin_hash_enc = required(request.pin_hash_enc.as_ref())?;
+        let new_pin_enc = required(request.new_pin_enc.as_ref())?;
+        let param = required(request.pin_uv_auth_param.as_ref())?;
         let protocol = protocol(number)?;
         self.pin_usable()?;
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
@@ -402,7 +427,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             request.sub_command == SubCommand::GetPinUvAuthTokenUsingPinWithPermissions as u64;
         let number = required(request.protocol)?;
         let peer = required(request.key_agreement)?;
-        let pin_hash_enc = required(request.pin_hash_enc)?;
+        let pin_hash_enc = required(request.pin_hash_enc.as_ref())?;
         let permissions = if with_permissions {
             Some(required(request.permissions)?)
         } else {
@@ -473,13 +498,18 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if self.uv_retries(ui) == 0 {
             return Err(StatusCode::UvBlocked);
         }
-        // Checked before the keypad, so a request with an unusable key never asks for the PIN.
+        // Checked before any screen, so a request with an unusable key never asks the user.
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
-        let prompt = Prompt::Token {
-            permissions,
-            rp_id: request.rp_id.as_ref().map(RpId::shown),
-        };
-        match ui.verify_user(prompt, USER_ACTION_TIMEOUT_MS) {
+        // Step 9: consent to the requested permissions, then step 10: the device PIN. The keypad
+        // title on the Nano S Plus and Nano X is one short line, too small to carry the consent.
+        consent(ui.confirm(
+            Prompt::Token {
+                permissions,
+                rp_id: request.rp_id.as_ref().map(RpId::shown),
+            },
+            USER_ACTION_TIMEOUT_MS,
+        ))?;
+        match ui.verify_user(USER_ACTION_TIMEOUT_MS) {
             Verification::Verified => {}
             // Step 3.10: a failed verification is UV_BLOCKED once no attempt is left, which one
             // wrong entry here always leaves, else UV_INVALID.

@@ -329,6 +329,15 @@ fn retries(authenticator: &mut TestAuthenticator) -> (u64, bool) {
     )
 }
 
+/// A parsed request owns copies of newPinEnc and pinHashEnc, which with the key agreement key
+/// recover the PIN, so it wipes its buffers when dropped, on every path.
+#[test]
+fn a_request_wipes_its_members_when_dropped() {
+    fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    wiped_on_drop::<super::ClientPinRequest>();
+    wiped_on_drop::<super::Bytes<32>>();
+}
+
 /// getKeyAgreement returns the COSE_Key of §6.5.6 getPublicKey: {1: 2, 3: -25, -1: 1, -2: x,
 /// -3: y}, keys in canonical order, for each protocol its own key.
 #[test]
@@ -509,6 +518,27 @@ fn set_pin_refusals() {
         ]),
         [INVALID_PARAMETER]
     );
+    // A key agreement key without alg, and one with alg -7 instead of -25 (§6.5.6 ecdh parses
+    // the key as getPublicKey specifies it).
+    let point = &session.cose_key[11..];
+    let no_alg = [&[0xA4, 0x01, 0x02, 0x20, 0x01, 0x21, 0x58, 0x20][..], point].concat();
+    let es256 = [
+        &[0xA5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20][..],
+        point,
+    ]
+    .concat();
+    for key in [no_alg, es256] {
+        assert_eq!(
+            send(&[
+                (0x01, Value::Uint(2)),
+                (0x02, Value::Uint(0x03)),
+                (0x03, Value::Raw(key)),
+                (0x04, Value::Bytes(param.clone())),
+                (0x05, Value::Bytes(new_pin_enc.clone())),
+            ]),
+            [INVALID_PARAMETER]
+        );
+    }
     // A MAC over something else.
     assert_eq!(
         send(&[
@@ -662,15 +692,16 @@ fn the_last_try_blocks_the_pin() {
     assert_eq!(response, [0x00, 0xA1, 0x05, 0x00], "uvRetries 0");
 }
 
-/// §6.5.5.7.1: consent comes before the try is spent, so a refused, timed-out or cancelled
-/// consent costs nothing and answers OPERATION_DENIED, USER_ACTION_TIMEOUT or KEEPALIVE_CANCEL.
+/// §6.5.5.7.1: consent comes before the try is spent, so a consent not given costs nothing. A
+/// refusal or no answer is "not approved", OPERATION_DENIED (step 7 of §6.5.5.7.1 and
+/// §6.5.5.7.2); a request the host cancelled is KEEPALIVE_CANCEL (§11.2.9.1.5).
 #[test]
 fn consent_comes_before_the_try() {
     let mut authenticator = authenticator();
     assert_eq!(set_pin(&mut authenticator, Protocol::Two, b"1234"), OK);
     for (answer, status) in [
         (Answer::Rejected, OPERATION_DENIED),
-        (Answer::TimedOut, USER_ACTION_TIMEOUT),
+        (Answer::TimedOut, OPERATION_DENIED),
         (Answer::Cancelled, KEEPALIVE_CANCEL),
     ] {
         let mut ui = Scripted::new(answer);
@@ -798,6 +829,39 @@ fn a_pin_token_with_permissions_is_bound_to_its_rp() {
     assert!(authenticator.client_pin.user_verified(0));
 }
 
+/// The consent screen shows the whole RP ID: a control character, which would end the text at a
+/// NUL or push the rest away at a line break, is shown as `?`. The token stays bound to the RP ID
+/// as sent.
+#[test]
+fn control_characters_in_the_rp_id_are_shown() {
+    let mut authenticator = authenticator();
+    assert_eq!(set_pin(&mut authenticator, Protocol::Two, b"1234"), OK);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let (response, _) = pin_token(
+        &mut authenticator,
+        &mut ui,
+        Protocol::Two,
+        b"1234",
+        Some(0x02),
+        Some("example.com\u{0}\n.evil.test"),
+    );
+    assert_eq!(response[0], OK);
+    assert_eq!(
+        ui.asked,
+        [(
+            Asked::Token {
+                permissions: 0x02,
+                rp_id: Some("example.com??.evil.test".into())
+            },
+            USER_ACTION_TIMEOUT_MS
+        )]
+    );
+    let sent = authenticator
+        .crypto
+        .sha256(&[b"example.com\x00\n.evil.test"]);
+    assert!(authenticator.client_pin.permits_rp_id(&sent));
+}
+
 /// A token the platform does not use within the initial usage time limit stops verifying
 /// (§6.5.2.1).
 #[test]
@@ -912,8 +976,9 @@ fn uv_token(
     (response, session)
 }
 
-/// Built-in UV (§6.5.5.7.3): the device PIN entered on a keypad that names the request gives a
-/// token with user presence, no client PIN needed; the token is the device's.
+/// Built-in UV (§6.5.5.7.3): consent naming the permissions and the RP (step 9), then the device
+/// PIN on the keypad (step 10), gives a token with user presence, no client PIN needed; the token
+/// is the device's.
 #[test]
 fn built_in_uv_gives_a_token_with_presence() {
     let mut authenticator = authenticator();
@@ -926,13 +991,16 @@ fn built_in_uv_gives_a_token_with_presence() {
     assert_eq!(token, authenticator.client_pin.token(Protocol::Two)[..]);
     assert_eq!(
         ui.asked,
-        [(
-            Asked::Keypad {
-                permissions: 0x02,
-                rp_id: Some("example.com".into())
-            },
-            USER_ACTION_TIMEOUT_MS
-        )]
+        [
+            (
+                Asked::Token {
+                    permissions: 0x02,
+                    rp_id: Some("example.com".into())
+                },
+                USER_ACTION_TIMEOUT_MS
+            ),
+            (Asked::Keypad, USER_ACTION_TIMEOUT_MS)
+        ]
     );
     assert!(authenticator.client_pin.user_present(1_000));
     assert!(
@@ -947,25 +1015,54 @@ fn built_in_uv_gives_a_token_with_presence() {
     );
 }
 
-/// Built-in UV failures (§6.5.5.7.3 step 3.10): a wrong entry leaves no attempt, so it is
+/// Built-in UV failures (§6.5.5.7.3 step 11): a wrong entry leaves no attempt, so it is
 /// UV_BLOCKED; a keypad not offered is UV_BLOCKED before any screen; backing out is
 /// OPERATION_DENIED, a cancel KEEPALIVE_CANCEL, no entry USER_ACTION_TIMEOUT. No token results.
 #[test]
 fn built_in_uv_failures() {
-    for (verification, status, keypad) in [
-        (Verification::Invalid, UV_BLOCKED, true),
-        (Verification::Blocked, UV_BLOCKED, true),
-        (Verification::Rejected, OPERATION_DENIED, true),
-        (Verification::Cancelled, KEEPALIVE_CANCEL, true),
-        (Verification::TimedOut, USER_ACTION_TIMEOUT, true),
+    for (verification, status) in [
+        (Verification::Invalid, UV_BLOCKED),
+        (Verification::Blocked, UV_BLOCKED),
+        (Verification::Rejected, OPERATION_DENIED),
+        (Verification::Cancelled, KEEPALIVE_CANCEL),
+        (Verification::TimedOut, USER_ACTION_TIMEOUT),
     ] {
         let mut authenticator = authenticator();
         let mut ui = Scripted::new(Answer::Confirmed);
         ui.verification = verification;
         let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), None);
         assert_eq!(response, [status], "{verification:?}");
-        assert_eq!(ui.asked.len(), usize::from(keypad), "{verification:?}");
+        assert_eq!(
+            ui.asked.last(),
+            Some(&(Asked::Keypad, USER_ACTION_TIMEOUT_MS)),
+            "{verification:?}"
+        );
         assert!(!authenticator.client_pin.in_use(0), "{verification:?}");
+    }
+
+    // Consent not approved (§6.5.5.7.3 step 9) is OPERATION_DENIED and shows no keypad, so no
+    // device PIN try is at stake; a cancel ends the request as for any screen.
+    for (answer, status) in [
+        (Answer::Rejected, OPERATION_DENIED),
+        (Answer::TimedOut, OPERATION_DENIED),
+        (Answer::Cancelled, KEEPALIVE_CANCEL),
+    ] {
+        let mut authenticator = authenticator();
+        let mut ui = Scripted::new(answer);
+        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), None);
+        assert_eq!(response, [status], "{answer:?}");
+        assert_eq!(
+            ui.asked,
+            [(
+                Asked::Token {
+                    permissions: 0x01,
+                    rp_id: None
+                },
+                USER_ACTION_TIMEOUT_MS
+            )],
+            "{answer:?}"
+        );
+        assert!(!authenticator.client_pin.in_use(0), "{answer:?}");
     }
 
     let mut authenticator = authenticator();

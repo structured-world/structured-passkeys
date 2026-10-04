@@ -29,9 +29,10 @@ restores the tries; a refused consent spends none (CTAP2_ERR_OPERATION_DENIED); 
 which the old PIN is wrong. The consent screen is compared with its snapshot like the selection
 screen.
 
-    fido_check.py --uv        on a device: built-in user verification with the device PIN, which
-                              the person enters on the device keypad, then once with a wrong PIN,
-                              after which built-in verification is blocked until a correct entry
+    fido_check.py --uv        on a device: built-in user verification, where the person allows
+                              the token on the consent screen and then enters the device PIN on
+                              the keypad, then once with a wrong PIN, after which built-in
+                              verification is blocked until a correct entry
 """
 
 import argparse
@@ -431,7 +432,7 @@ def check_client_pin(device: CtapHidDevice, user, snapshot) -> None:
             user, True, TOKEN_TITLE, lambda p=protocol: token.append(pin_token(ctap, p, "1234")), shot
         )
         check(
-            status == CtapError.ERR.SUCCESS and len(token[0]) == 32,
+            status == CtapError.ERR.SUCCESS and [len(t) for t in token] == [32],
             f"clientPIN {name}: getPinToken after consent gives a 32-byte token",
         )
         status = answered(user, True, TOKEN_TITLE, lambda p=protocol: pin_token(ctap, p, "0000"))
@@ -474,14 +475,18 @@ def check_built_in_uv(device: CtapHidDevice) -> None:
         return ctap.client_pin(2, GET_UV_RETRIES)[UV_RETRIES]
 
     check(uv_retries() == 1, "built-in UV: one attempt offered while the device count is full")
-    print("   on the device, enter the device PIN", flush=True)
+    print(f"   on the device, choose {SELECTION_CONFIRM!r}, then enter the device PIN", flush=True)
     token: list[bytes] = []
     status = ctap_status(lambda: token.append(uv_token()))
     check(
-        status == CtapError.ERR.SUCCESS and len(token[0]) == 32,
+        status == CtapError.ERR.SUCCESS and [len(t) for t in token] == [32],
         f"built-in UV: the device PIN gives a token ({status!r})",
     )
-    print("   on the device, enter a WRONG device PIN once (one of the device's three tries)")
+    print(
+        f"   on the device, choose {SELECTION_CONFIRM!r}, then enter a WRONG device PIN once"
+        " (one of the device's three tries)",
+        flush=True,
+    )
     status = ctap_status(uv_token)
     check(status == CtapError.ERR.UV_BLOCKED, f"built-in UV: a wrong PIN blocks it ({status!r})")
     check(uv_retries() == 0, "built-in UV: no attempt offered while the device count is not full")

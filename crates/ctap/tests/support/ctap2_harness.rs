@@ -33,7 +33,7 @@ impl Ui for Fuzzed {
         }
     }
 
-    fn verify_user(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Verification {
+    fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
         match (self.0 >> 2) & 0x07 {
             0 => Verification::Verified,
             1 => Verification::Invalid,

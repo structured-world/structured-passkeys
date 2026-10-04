@@ -21,7 +21,7 @@
 //!     fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
 //!         Answer::Confirmed
 //!     }
-//!     fn verify_user(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Verification {
+//!     fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
 //!         Verification::Blocked
 //!     }
 //!     fn uv_retries(&mut self) -> u8 {
@@ -289,8 +289,9 @@ pub struct Settings {
     pub max_msg_size: MaxMsgSize,
 }
 
-/// A parsed request, owning everything its execution needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
+/// material, which exists once and is wiped when the request is dropped.
+#[derive(Debug, PartialEq, Eq)]
 #[expect(
     clippy::large_enum_variant,
     reason = "a command is moved once, from parsing to execution; boxing it would put every \
