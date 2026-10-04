@@ -152,6 +152,14 @@ fn apdu(applet: &mut Applet<SIZE>, model: &mut Model, data: &mut &[u8], op: u8) 
         Outcome::Reply(reply) => {
             let (part, sw) = (reply.data.to_vec(), reply.sw);
             assert!(part.len() <= most, "no more data than Ne");
+            if sw.0 & 0xFF00 == 0x6C00 {
+                // ISO/IEC 7816-4 5.6: wrong Le, only for a SELECT of the applet whose Le cannot
+                // take the version string; nothing is selected.
+                assert_eq!(sw.0, 0x6C00 | VERSION.len() as u16);
+                assert_eq!((cla, ins, p1, p2, body), (0x00, 0xA4, 0x04, 0x00, &AID[..]));
+                assert!(most < VERSION.len(), "6CXX only for a short Le");
+                return;
+            }
             assert!(
                 STATUS_WORDS.contains(&sw.0) || sw.0 & 0xFF00 == 0x6100,
                 "unknown status word {:#06x}",

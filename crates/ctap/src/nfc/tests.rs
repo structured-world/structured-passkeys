@@ -225,6 +225,93 @@ fn a_poll_inside_a_chain_drops_it() {
     }
 }
 
+/// The parts of a chained NFCCTAP_MSG may carry the P1 of the whole message: python-fido2 sends
+/// every part with P1 0x80 when it polls (`90 10 80 00`), and the request it assembles runs with
+/// status updates.
+#[test]
+fn chained_parts_may_announce_status_updates() {
+    let mut applet = selected();
+    assert_eq!(
+        answer(&mut applet, &apdu(0x90, 0x10, 0x80, 0x00, &[0x0B, 0x01])),
+        Some((vec![], 0x9000))
+    );
+    assert_eq!(
+        answer(&mut applet, &apdu(0x80, 0x10, 0x80, 0x00, &[0x02])),
+        None
+    );
+    assert_eq!(applet.request(), Some(&[0x0B, 0x01, 0x02][..]));
+    assert!(applet.wait_for_user(true).is_some());
+}
+
+/// GET RESPONSE and NFCCTAP_GETRESPONSE carry no data field (ISO/IEC 7816-4 7.6.1, §11.3.7.2);
+/// one with data is refused with 6700 and moves nothing: a running request is not cancelled, a
+/// ready response or the rest of one is not given out.
+#[test]
+fn response_retrieval_with_data_is_refused() {
+    let mut applet = selected();
+    applet.command(&apdu(0x80, 0x10, 0x80, 0x00, &[0x0B]));
+    applet.wait_for_user(true);
+    let cancel = apdu(0x80, 0x11, 0x11, 0x00, &[0x00]);
+    assert_eq!(answer(&mut applet, &cancel), Some((vec![], 0x6700)));
+    assert!(!applet.cancelled());
+    assert_eq!(applet.respond(&[0x00, 0x42]), None);
+    let poll = apdu(0x80, 0x11, 0x00, 0x00, &[0x00]);
+    assert_eq!(answer(&mut applet, &poll), Some((vec![], 0x6700)));
+    let poll = apdu(0x80, 0x11, 0x00, 0x00, &[]);
+    assert_eq!(answer(&mut applet, &poll), Some((vec![0x00, 0x42], 0x9000)));
+
+    let mut applet = selected();
+    applet.command(&msg(&[0x01]));
+    let full = response(600);
+    applet.respond(&full).expect("unanswered");
+    for cla in [0x00, 0x80] {
+        assert_eq!(
+            answer(&mut applet, &apdu(cla, 0xC0, 0x00, 0x00, &[0x00])),
+            Some((vec![], 0x6700)),
+            "{cla:02x}"
+        );
+    }
+    assert_eq!(
+        answer(&mut applet, &apdu(0x00, 0xC0, 0x00, 0x00, &[])),
+        Some((full[256..512].to_vec(), 0x6158))
+    );
+}
+
+/// A class the applet does not know is 6E00 (ISO/IEC 7816-4 5.6) in every state, before any error
+/// of the state: before selection and while a request runs.
+#[test]
+fn an_unknown_class_is_refused_in_every_state() {
+    let management = apdu(0xE0, 0x01, 0x00, 0x00, &[]);
+    let mut applet = applet();
+    assert_eq!(answer(&mut applet, &management), Some((vec![], 0x6E00)));
+    let mut applet = selected();
+    applet.command(&apdu(0x80, 0x10, 0x80, 0x00, &[0x0B]));
+    applet.wait_for_user(true);
+    assert_eq!(answer(&mut applet, &management), Some((vec![], 0x6E00)));
+    assert!(!applet.cancelled());
+}
+
+/// SELECT with an Le below the eight bytes of the version gets 6C08 (ISO/IEC 7816-4 5.6: wrong Le,
+/// SW2 the exact length) and selects nothing; Le 08 or more, or none, selects.
+#[test]
+fn select_respects_le() {
+    let mut short_le = applet();
+    let short = Apdu {
+        ne: Some(1),
+        ..select(&AID)
+    };
+    assert_eq!(answer(&mut short_le, &short), Some((vec![], 0x6C08)));
+    assert!(!short_le.selected());
+    for ne in [Some(8), None] {
+        let mut enough = applet();
+        let exact = Apdu { ne, ..select(&AID) };
+        assert!(
+            matches!(enough.command(&exact), Outcome::Selected(reply) if reply.data == VERSION),
+            "{ne:?}"
+        );
+    }
+}
+
 /// A SELECT that selects nothing (another AID, or parameters other than by name) between the
 /// parts of a chain ends it too (ISO/IEC 7816-4 5.4.2), so the next part is not appended to the
 /// stale prefix.

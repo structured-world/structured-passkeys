@@ -91,6 +91,12 @@ impl StatusWord {
     /// Class not supported (6E00).
     pub const CLA_NOT_SUPPORTED: Self = Self(0x6E00);
 
+    /// `6CXX`: wrong Le field; XX is the exact number of response data bytes available
+    /// (ISO/IEC 7816-4 5.6). `available` is at most 255.
+    const fn wrong_le(available: u8) -> Self {
+        Self(0x6C00 | available as u16)
+    }
+
     /// `61XX`: more response data waits for GET RESPONSE (ISO/IEC 7816-4 5.3.4). XX is the
     /// number of bytes left, or 00 for 256 and more.
     const fn more(remaining: usize) -> Self {
@@ -279,7 +285,7 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         if self.state == State::Deselected {
             // §11.3.4: CTAP commands are ignored until the applet is selected again; the
             // command still gets an answer, since every APDU does.
-            return Outcome::Reply(Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED));
+            return Outcome::Reply(refused(apdu, StatusWord::CONDITIONS_NOT_SATISFIED));
         }
         // A request being run takes only NFCCTAP_GETRESPONSE, deselection and selection.
         if let State::Running { .. } = self.state {
@@ -325,6 +331,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             // application is 6A82, and the FIDO applet's state is not touched by the probe.
             return Outcome::Reply(Reply::status(StatusWord::NOT_FOUND));
         }
+        // ISO/IEC 7816-4 5.6: an Le below the version string is 6CXX with its exact length, and
+        // the command is not executed; the reader repeats it with that Le.
+        if apdu.frame().ne < VERSION.len() {
+            return Outcome::Reply(Reply::status(StatusWord::wrong_le(VERSION.len() as u8)));
+        }
         self.drop_exchange();
         self.state = State::Idle;
         Outcome::Selected(Reply {
@@ -352,7 +363,9 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
     /// NFCCTAP_MSG (§11.3.7.1), either whole or as one part of a chain (§11.3.6).
     fn message<'a>(&'a mut self, apdu: &Apdu<'_>) -> Outcome<'a> {
         // §11.3.7.1: P1 bit 0x80 announces NFCCTAP_GETRESPONSE support, the rest of P1 and P2
-        // are RFU and MUST be zero.
+        // are RFU and MUST be zero. The parts of a chain are one NFCCTAP_MSG and may all carry
+        // its P1 (python-fido2 sends `90 10 80 00`), so bit 0x80 is accepted on every part; the
+        // last part's P1 decides.
         if apdu.p1 & !P1_GETRESPONSE != 0 || apdu.p2 != 0 {
             self.abandon_chain();
             return Outcome::Reply(Reply::status(StatusWord::WRONG_P1_P2));
@@ -395,8 +408,8 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             // platforms (python-fido2) send 0x11 to cancel the request, which ends it like
             // CTAPHID_CANCEL (§11.2.9.1.5) rather than leaving it to time out.
             (CLA_FIDO, INS_NFC_GETRESPONSE) => {
-                if !getresponse_parameters(apdu) {
-                    return Reply::status(StatusWord::WRONG_P1_P2);
+                if let Some(refusal) = retrieval_refusal(apdu, true) {
+                    return refusal;
                 }
                 let State::Running {
                     deferred: true,
@@ -418,14 +431,14 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             // The platform ends CTAP: the request is cancelled with the applet.
             (CLA_FIDO, INS_CONTROL) => self.control(apdu),
             // One request at a time: the platform waits for the response of this one.
-            _ => Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED),
+            _ => refused(apdu, StatusWord::CONDITIONS_NOT_SATISFIED),
         }
     }
 
     /// NFCCTAP_GETRESPONSE (§11.3.7.2) once the response is ready.
     fn deferred_response<'a>(&'a mut self, apdu: &Apdu<'_>) -> Reply<'a> {
-        if !getresponse_parameters(apdu) {
-            return Reply::status(StatusWord::WRONG_P1_P2);
+        if let Some(refusal) = retrieval_refusal(apdu, true) {
+            return refusal;
         }
         let State::Ready { len } = self.state else {
             return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
@@ -435,10 +448,8 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
 
     /// GET RESPONSE: the next part of a chained response.
     fn next_part<'a>(&'a mut self, apdu: &Apdu<'_>) -> Reply<'a> {
-        // ISO/IEC 7816-4 7.6.1: P1-P2 are 0000; other values are refused before the response
-        // advances.
-        if apdu.p1 != 0 || apdu.p2 != 0 {
-            return Reply::status(StatusWord::WRONG_P1_P2);
+        if let Some(refusal) = retrieval_refusal(apdu, false) {
+            return refusal;
         }
         let State::Sending { len, offset } = self.state else {
             return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
@@ -551,11 +562,27 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
     }
 }
 
-/// Whether the parameters of an NFCCTAP_GETRESPONSE are acceptable: §11.3.7.2 makes P1 and P2
-/// RFU, zero; P1 0x11 is the cancel platforms send. Anything else is refused before the exchange
-/// moves.
-const fn getresponse_parameters(apdu: &Apdu<'_>) -> bool {
-    apdu.p2 == 0 && (apdu.p1 == 0 || apdu.p1 == P1_CANCEL)
+/// The refusal of a malformed GET RESPONSE or NFCCTAP_GETRESPONSE, given before the exchange
+/// moves. Both have P1-P2 0000 (ISO/IEC 7816-4 7.6.1; §11.3.7.2 makes them RFU) and no data field;
+/// `cancel` admits the NFCCTAP_GETRESPONSE P1 0x11 with which platforms cancel.
+const fn retrieval_refusal(apdu: &Apdu<'_>, cancel: bool) -> Option<Reply<'static>> {
+    if apdu.p2 != 0 || !(apdu.p1 == 0 || cancel && apdu.p1 == P1_CANCEL) {
+        return Some(Reply::status(StatusWord::WRONG_P1_P2));
+    }
+    if !apdu.data.is_empty() {
+        return Some(Reply::status(StatusWord::WRONG_LENGTH));
+    }
+    None
+}
+
+/// `sw`, the refusal a command gets from the applet's state, unless its class is not one the
+/// applet knows: that is 6E00 in every state (ISO/IEC 7816-4 5.6).
+const fn refused(apdu: &Apdu<'_>, sw: StatusWord) -> Reply<'static> {
+    if matches!(apdu.cla, CLA_ISO | CLA_FIDO | CLA_CHAINING) {
+        Reply::status(sw)
+    } else {
+        Reply::status(StatusWord::CLA_NOT_SUPPORTED)
+    }
 }
 
 /// The status data of a status update: one byte, the keepalive status of §11.2.9.1.7.
