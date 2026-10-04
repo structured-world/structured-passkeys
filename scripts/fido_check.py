@@ -67,6 +67,7 @@ import sys
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fido2.ctap import CtapError
@@ -346,24 +347,12 @@ def check_selection_answers(device: CtapHidDevice, user, snapshot) -> None:
     ctap = Ctap2(device)
     for confirm, expected in ((False, CtapError.ERR.OPERATION_DENIED), (True, CtapError.ERR.SUCCESS)):
 
-        # The answer runs in the timer's thread, where an exception (a failed snapshot check
-        # raises SystemExit) would end only that thread: it is kept and raised here instead.
-        failure: list[BaseException] = []
-
         def answer(confirm: bool = confirm) -> None:
-            try:
-                if snapshot is not None and confirm:
-                    snapshot()
-                user.answer(confirm)
-            except BaseException as error:
-                failure.append(error)
+            if snapshot is not None and confirm:
+                snapshot()
+            user.answer(confirm)
 
-        timer = threading.Timer(1.0, answer)
-        timer.start()
-        status = selection(ctap)
-        timer.join()
-        if failure:
-            raise failure[0]
+        status = while_answering(1.0, answer, lambda: selection(ctap))
         check(status == expected, f"selection: {'confirm' if confirm else 'refuse'} answers {status!r}")
 
 
@@ -403,13 +392,33 @@ def check(condition: bool, message: str) -> None:
     print(f"ok: {message}")
 
 
+def ctap_result(call) -> tuple[int, object]:
+    """Runs `call` and returns its CTAP status with what it returned, None after an error."""
+    try:
+        return CtapError.ERR.SUCCESS, call()
+    except CtapError as error:
+        return error.code, None
+
+
 def ctap_status(call) -> int:
     """Runs `call` and returns its CTAP status: success, or the error it raised."""
-    try:
-        call()
-        return CtapError.ERR.SUCCESS
-    except CtapError as error:
-        return error.code
+    return ctap_result(call)[0]
+
+
+def while_answering(delay_s: float, answer, call):
+    """Runs `call` while `answer` runs `delay_s` later in another thread, and returns what `call`
+    returned. An exception in `answer` (a failed check raises SystemExit) is kept by its future and
+    raised here once both are done, instead of ending only the other thread."""
+
+    def delayed() -> None:
+        time.sleep(delay_s)
+        answer()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        answering = pool.submit(delayed)
+        returned = call()
+        answering.result()
+    return returned
 
 
 def padded_pin(pin: str) -> bytes:
@@ -483,27 +492,16 @@ def answered(
     delay_s: float = 1.0,
 ) -> int:
     """Runs `call` while the user answers the screen titled `title` with one of `labels`, `delay_s`
-    after the call starts; returns its CTAP status. The answer runs in a timer's thread; an
-    exception there is kept and raised here."""
-    failure: list[BaseException] = []
+    after the call starts; returns its CTAP status."""
 
     def answer() -> None:
-        try:
-            if isinstance(user, SpeculosUser):
-                wait_for_screen(title)
-            if snapshot is not None:
-                snapshot()
-            user.answer(confirm, labels)
-        except BaseException as error:
-            failure.append(error)
+        if isinstance(user, SpeculosUser):
+            wait_for_screen(title)
+        if snapshot is not None:
+            snapshot()
+        user.answer(confirm, labels)
 
-    timer = threading.Timer(delay_s, answer)
-    timer.start()
-    status = ctap_status(call)
-    timer.join()
-    if failure:
-        raise failure[0]
-    return status
+    return while_answering(delay_s, answer, lambda: ctap_status(call))
 
 
 def check_client_pin(device: CtapHidDevice, user, snapshot) -> None:
@@ -614,31 +612,19 @@ def check_built_in_uv(device: CtapHidDevice, user, snapshot) -> None:
 
 def pressed(user, steps: list[tuple[str, str, object]], call) -> tuple[int, object]:
     """Runs `call` while the user goes through `steps`, each a screen title, the option to choose
-    on it and a snapshot check or None; returns its CTAP status and result. The answers run in a
-    timer's thread; an exception there is kept and raised here."""
-    failure: list[BaseException] = []
-    result: list[object] = []
+    on it and a snapshot check or None; returns its CTAP status and result."""
 
     def answer() -> None:
-        try:
-            if not isinstance(user, SpeculosUser):
-                user.follow([(title, label) for title, label, _ in steps])
-                return
-            for title, label, snapshot in steps:
-                wait_for_screen(title)
-                if snapshot is not None:
-                    snapshot()
-                user.press(label)
-        except BaseException as error:
-            failure.append(error)
+        if not isinstance(user, SpeculosUser):
+            user.follow([(title, label) for title, label, _ in steps])
+            return
+        for title, label, snapshot in steps:
+            wait_for_screen(title)
+            if snapshot is not None:
+                snapshot()
+            user.press(label)
 
-    timer = threading.Timer(1.0, answer)
-    timer.start()
-    status = ctap_status(lambda: result.append(call()))
-    timer.join()
-    if failure:
-        raise failure[0]
-    return status, result[0] if result else None
+    return while_answering(1.0, answer, lambda: ctap_result(call))
 
 
 def check_credentials(device: CtapHidDevice, user, snapshot) -> None:
