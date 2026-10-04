@@ -163,6 +163,8 @@ case "$mode" in
         # directory already gone met a concurrent stop of the same run (a retry
         # while this one still ran), which removed it: the host is clean. A
         # directory still there with this token, or with none left, failed.
+        # Run names carry 64 random bits, so no other run takes this path between
+        # the owner check and the removal unless CHECK_RUN_ID names it on purpose.
         if [[ $status -eq 0 ]] && owned; then
             if ! { find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
                 rm -f "$dir/owner" && rmdir "$dir"; } 2>/dev/null &&
