@@ -11,7 +11,7 @@ use crate::crypto::{Crypto, KEY_LEN, NONCE_LEN};
 use crate::keys::KeyRing;
 use crate::soft::SoftCrypto;
 
-/// Opens on a device that was never reset (epoch 0), which opens every epoch.
+/// Opens on a device that was never reset (reset ID 0), which opens every reset ID.
 fn open(
     crypto: &SoftCrypto,
     keys: &KeyRing,
@@ -21,15 +21,16 @@ fn open(
     super::open(crypto, keys, rp_id, id, 0)
 }
 
-/// A reset revokes what it leaves behind: an ID of epoch 2 opens on a device at epoch 2 and
-/// is refused at epoch 3, whatever its key origin; a device whose NVM was wiped back to epoch 0
-/// opens it again.
+/// A reset revokes what it leaves behind (CTAP 2.2 §6.6): an ID created under reset ID 2 opens
+/// on a device at 2 and is refused under any other nonzero reset ID, whatever its key origin,
+/// including one that a counter would have ranked lower (NVM wiped back to 0, then one reset);
+/// a device whose NVM was wiped back to 0 opens it again.
 #[test]
 fn a_reset_revokes_older_ids() {
     let (mut crypto, keys) = platform();
     for credential in [
         Credential {
-            epoch: 2,
+            reset_id: 2,
             ..seed_credential()
         },
         slot_credential(),
@@ -39,10 +40,13 @@ fn a_reset_revokes_older_ids() {
             super::open(&crypto, &keys, RP, &id, 2).as_ref(),
             Ok(&credential)
         );
-        assert_eq!(
-            super::open(&crypto, &keys, RP, &id, 3),
-            Err(OpenError::Revoked)
-        );
+        for other in [1, 3, u32::MAX] {
+            assert_eq!(
+                super::open(&crypto, &keys, RP, &id, other),
+                Err(OpenError::Revoked),
+                "reset ID {other}"
+            );
+        }
         assert_eq!(super::open(&crypto, &keys, RP, &id, 0), Ok(credential));
     }
 }
@@ -68,7 +72,7 @@ fn seed_credential() -> Credential {
         alg: ES256,
         cred_protect: CredProtect::Optional,
         user: None,
-        epoch: 0,
+        reset_id: 0,
     }
 }
 
@@ -85,7 +89,7 @@ fn slot_credential() -> Credential {
             name: Some("alice".into()),
             display_name: Some("Alice A".into()),
         }),
-        epoch: 2,
+        reset_id: 2,
     }
 }
 
@@ -399,7 +403,7 @@ fn the_largest_credential_fits_the_reported_maximum() {
             name: Some("n".repeat(MAX_NAME_LEN)),
             display_name: Some("d".repeat(MAX_NAME_LEN)),
         }),
-        epoch: u32::MAX,
+        reset_id: u32::MAX,
     };
     let (mut crypto, keys) = platform();
     let id = seal(&mut crypto, &keys, RP, &credential).expect("fits");

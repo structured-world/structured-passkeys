@@ -235,8 +235,8 @@ fn unimplemented_commands_are_invalid_command() {
 }
 
 /// authenticatorReset (§6.6) within the window after the application opens: the user confirms
-/// on the device, and the store forgets the PIN and every credential and raises the epoch, which
-/// stays raised across a reopening. Refusal, timeout and cancel leave everything as it was.
+/// on the device, and the store forgets the PIN and every credential and draws a new reset ID,
+/// which stays across a reopening. Refusal, timeout and cancel leave everything as it was.
 #[test]
 fn reset_asks_the_user_and_erases_everything() {
     for (answer, status) in [
@@ -250,7 +250,7 @@ fn reset_asks_the_user_and_erases_everything() {
         let length = authenticator.process(&[0x07], &mut ui, &mut response);
         assert_eq!(response[..length], [status], "{answer:?}");
         assert!(authenticator.store.config().pin.is_some(), "{answer:?}");
-        assert_eq!(authenticator.store.config().epoch, 0, "{answer:?}");
+        assert_eq!(authenticator.store.config().reset_id, 0, "{answer:?}");
     }
 
     let mut authenticator = with_pin();
@@ -264,7 +264,7 @@ fn reset_asks_the_user_and_erases_everything() {
     let config = authenticator.store.config();
     assert!(config.pin.is_none());
     assert_eq!(config.pin_retries, PIN_RETRIES);
-    assert_eq!(config.epoch, 1);
+    assert_ne!(config.reset_id, 0);
     assert_ne!(
         *authenticator.client_pin.token(Protocol::Two),
         token,
@@ -272,9 +272,9 @@ fn reset_asks_the_user_and_erases_everything() {
     );
     let reopened = authenticator.reopen();
     assert_eq!(
-        reopened.store.config().epoch,
-        1,
-        "the epoch survives a reopening"
+        reopened.store.config().reset_id,
+        config.reset_id,
+        "the reset ID survives a reopening"
     );
 }
 
