@@ -31,8 +31,8 @@ ledger_device_sdk::define_comm!(COMM, COMM_SIZE);
 pub const MESSAGE_SIZE: usize = MIN_MESSAGE_SIZE as usize;
 
 /// The SDK's APDU buffer: a packet type byte, then an extended APDU carrying a whole request (four
-/// header bytes, a three-byte Lc, the message, a three-byte Le), or a response part and its status
-/// word. The C SDK's IO buffer is set to the same size in `.cargo/config.toml`.
+/// header bytes, a three-byte Lc, the message, a two-byte Le; 1034 bytes in all), or a response
+/// part and its status word. The C SDK's IO buffer is set to the same size in `.cargo/config.toml`.
 pub const COMM_SIZE: usize = MESSAGE_SIZE + 16;
 
 /// The SDK's APDU channel with the buffer above.
