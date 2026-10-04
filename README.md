@@ -29,6 +29,10 @@ security key's own mechanics onto the device:
   application opens.
 - **Consent on the screen.** Every token the platform asks for is shown first with what it allows
   and for which site; the person allows or refuses it on the device.
+- **The NFC tap is presence.** On Stax, Flex and Nano Gen5, holding the unlocked device with the
+  application open to a phone selects the FIDO applet, and that tap counts as user presence for
+  two minutes, so nothing has to be pressed while the device rests on the phone. Consent screens
+  still show over NFC; the phone polls while the person answers on the device.
 
 ## Layout
 

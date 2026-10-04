@@ -40,6 +40,13 @@ application runs inside a Ledger wallet, where the operating system owns all thr
   - getInfo reports the options of a feature (`clientPin`, `pinUvAuthToken`, `uv`, `rk`) together
     with the commands that use it, so a platform never starts a flow that ends in a command the
     application does not have yet.
+  - The NFC tap is user presence although the device has a screen (CTAP 2.2 grants it to
+    authenticators without another gesture): a prompt answered while the device rests on a phone
+    makes NFC unusable. The tap is the selection of the FIDO applet with the application open, as
+    no field event reaches the application, and counts for 120 seconds or until NFCCTAP_CONTROL
+    ends CTAP. Consent screens and the reset confirmation still show over NFC.
+  - Every transport takes the same 1024-byte messages, the CTAP minimum, so getInfo reports one
+    `maxMsgSize` whichever transport carries it; the HID buffer is no larger than the NFC one.
 - A new mapping is a decision about the product, not a review fix: it comes with its reason in
   the code and is added to this list.
 
