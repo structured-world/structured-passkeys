@@ -462,6 +462,11 @@ pub fn request_ended() -> bool {
     with_hid(|hid| hid.cancelled || !hid.still_running()).unwrap_or(true)
 }
 
+/// The device clock: milliseconds since the application started, advanced by [`tick`].
+pub fn now_ms() -> u64 {
+    with_hid(|hid| hid.now_ms).unwrap_or(0)
+}
+
 /// Advances the transport clock by one ticker interval: times out stalled messages, schedules
 /// keepalives and sends what is due. Called by the main loop on every ticker event.
 pub fn tick() {

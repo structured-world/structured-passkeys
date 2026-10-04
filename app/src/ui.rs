@@ -12,11 +12,10 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
 use ledger_device_sdk::sys::{
-    BOLOS_TRUE, DEFAULT_PIN_RETRIES, nbgl_icon_details_t, nbgl_useCaseChoice, nbgl_useCaseKeypad,
-    os_global_pin_check, os_global_pin_retries,
+    BOLOS_TRUE, nbgl_icon_details_t, nbgl_useCaseChoice, os_global_pin_is_validated,
 };
-use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
-use zeroize::Zeroize;
+use structured_passkeys_ctap::pin::Permissions;
+use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
 
 use crate::hid;
 
@@ -27,32 +26,58 @@ static OUTCOME: AtomicU8 = AtomicU8::new(PENDING);
 const PENDING: u8 = 0;
 const CONFIRMED: u8 = 1;
 const REJECTED: u8 = 2;
-const PIN_ENTERED: u8 = 3;
 
-/// Longest device PIN: Ledger PINs have 4 to 8 digits.
-const PIN_MAX_DIGITS: u8 = 8;
-const PIN_MIN_DIGITS: u8 = 4;
+/// Room for a composed screen text: the longest consent sentence with a 64-byte RP ID.
+const TEXT_LEN: usize = 160;
 
-/// The digits entered on the keypad, from its callback until `os_global_pin_check` has read
-/// them; wiped right after, and before the keypad is shown.
-struct PinDigits {
-    digits: core::cell::UnsafeCell<[u8; PIN_MAX_DIGITS as usize]>,
-    len: AtomicU8,
+/// A NUL-terminated text composed for a screen. It lives in the frame of the call that shows the
+/// screen and waits for it, so it outlives the screen without taking RAM between screens, which
+/// the Nano X does not have to spare. Longer text is cut at a character boundary.
+struct Text([u8; TEXT_LEN]);
+
+impl Text {
+    /// The concatenation of `parts`.
+    fn new(parts: &[&str]) -> Self {
+        let mut bytes = [0u8; TEXT_LEN];
+        let mut length = 0;
+        'parts: for part in parts {
+            for character in part.chars() {
+                let width = character.len_utf8();
+                // One byte stays for the terminating NUL.
+                if length + width >= TEXT_LEN {
+                    break 'parts;
+                }
+                character.encode_utf8(&mut bytes[length..length + width]);
+                length += width;
+            }
+        }
+        Self(bytes)
+    }
+
+    /// The C string, valid while the text lives.
+    fn as_ptr(&self) -> *const c_char {
+        self.0.as_ptr().cast()
+    }
 }
 
-// SAFETY: one thread; the keypad callback runs inside the wait loop, never alongside it.
-unsafe impl Sync for PinDigits {}
-
-static PIN: PinDigits = PinDigits {
-    digits: core::cell::UnsafeCell::new([0; PIN_MAX_DIGITS as usize]),
-    len: AtomicU8::new(0),
-};
-
-impl PinDigits {
-    fn wipe(&self) {
-        // SAFETY: one thread, and no callback is running while the application code runs.
-        unsafe { (*self.digits.get()).zeroize() };
-        self.len.store(0, Ordering::Relaxed);
+/// What a token with `permissions` lets the platform do, for the consent screen: exactly the
+/// requested permissions, since the consent is to them (CTAP 2.2 §6.5.5.7.2 step 7).
+fn purposes(permissions: Permissions) -> &'static str {
+    let bits = permissions.bits();
+    let create = bits & Permissions::MAKE_CREDENTIAL.bits() != 0;
+    let sign_in = bits & Permissions::GET_ASSERTION.bits() != 0;
+    let others = bits & !(Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits());
+    match (create, sign_in, others) {
+        (false, true, 0) => "sign in with a passkey",
+        (true, false, 0) => "create a passkey",
+        (true, true, 0) => "sign in and create passkeys",
+        (false, false, bits) if bits == Permissions::CREDENTIAL_MANAGEMENT.bits() => {
+            "list and delete your passkeys"
+        }
+        (false, false, bits) if bits == Permissions::AUTHENTICATOR_CONFIG.bits() => {
+            "change the security key's settings"
+        }
+        _ => "sign in, manage passkeys and change settings",
     }
 }
 
@@ -61,23 +86,6 @@ unsafe extern "C" fn choice_callback(confirm: bool) {
         if confirm { CONFIRMED } else { REJECTED },
         Ordering::Relaxed,
     );
-}
-
-unsafe extern "C" fn pin_callback(digits: *const u8, len: u8) {
-    let len = len.min(PIN_MAX_DIGITS);
-    if !digits.is_null() {
-        // SAFETY: NBGL passes `len` entered digits; the buffer holds the most a PIN has, and
-        // nothing else touches it while the keypad is shown.
-        unsafe {
-            core::ptr::copy_nonoverlapping(digits, (*PIN.digits.get()).as_mut_ptr(), len.into());
-        }
-    }
-    PIN.len.store(len, Ordering::Relaxed);
-    OUTCOME.store(PIN_ENTERED, Ordering::Relaxed);
-}
-
-unsafe extern "C" fn back_callback() {
-    OUTCOME.store(REJECTED, Ordering::Relaxed);
 }
 
 /// How the wait for a screen ended.
@@ -127,24 +135,9 @@ impl<'a> DeviceUi<'a> {
             if waited_ms > u64::from(timeout_ms) {
                 break Wait::TimedOut;
             }
-            match self.comm.next_command_or_event() {
-                CommandOrEvent::Event(DecodedEventType::Ticker) => {
-                    hid::tick();
-                    waited_ms = waited_ms
-                        .checked_add(hid::TICK_MS)
-                        .expect("a wait of 30 seconds is far from the u64 range");
-                }
-                // The management channel waits until the user has answered: ISO/IEC 7816-4
-                // 5.6, SW 6901 "command not accepted".
-                CommandOrEvent::Command(command) => {
-                    match command.reply(&[], StatusWords::CmdNotAccepted) {
-                        // An empty reply cannot overflow, and one that failed to leave the
-                        // device has no one to report to: the host times out.
-                        Ok(()) | Err(CommError::Overflow | CommError::IoError) => {}
-                    }
-                }
-                CommandOrEvent::Event(_) => {}
-            }
+            waited_ms = waited_ms
+                .checked_add(self.take_event())
+                .expect("a wait of 30 seconds is far from the u64 range");
         };
         // Only an answered screen leaves work after it, which the keepalives then report as
         // processing; a cancelled or timed-out request is answered at once, and a keepalive in
@@ -156,34 +149,72 @@ impl<'a> DeviceUi<'a> {
         ended
     }
 
+    /// Takes one event for the shown screen and the FIDO interface; returns the milliseconds it
+    /// moved the clock.
+    fn take_event(&mut self) -> u64 {
+        match self.comm.next_command_or_event() {
+            CommandOrEvent::Event(DecodedEventType::Ticker) => {
+                hid::tick();
+                hid::TICK_MS
+            }
+            // The management channel waits until the screen is gone: ISO/IEC 7816-4 5.6,
+            // SW 6901 "command not accepted".
+            CommandOrEvent::Command(command) => {
+                match command.reply(&[], StatusWords::CmdNotAccepted) {
+                    // An empty reply cannot overflow, and one that failed to leave the device
+                    // has no one to report to: the host times out.
+                    Ok(()) | Err(CommError::Overflow | CommError::IoError) => {}
+                }
+                0
+            }
+            CommandOrEvent::Event(_) => 0,
+        }
+    }
+
     fn icon(&self) -> nbgl_icon_details_t {
         self.glyph.into()
     }
 }
 
 impl Ui for DeviceUi<'_> {
-    fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer {
-        let (message, sub_message, confirm, reject): (&[u8], &[u8], &[u8], &[u8]) = match prompt {
+    fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
+        // Kept in this frame until the screen is gone.
+        let composed;
+        let (message, sub_message): (*const c_char, *const c_char) = match prompt {
             // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
             // why it names none.
             Prompt::Selection => (
-                b"Allow security key access?\0",
-                b"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.\0",
-                b"Allow\0",
-                b"Don't allow\0",
+                c"Allow security key access?".as_ptr(),
+                c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
             ),
+            // The platform asks for a pinUvAuthToken, with the client PIN or the device unlock;
+            // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
+            // §6.5.5.7.3 step 9).
+            Prompt::Token { permissions, rp_id } => {
+                composed = Text::new(&[
+                    "Your browser or system asks to ",
+                    purposes(permissions),
+                    match rp_id {
+                        Some(_) => " on ",
+                        None => " on any website",
+                    },
+                    rp_id.unwrap_or_default(),
+                    ".",
+                ]);
+                (c"Allow security key use?".as_ptr(), composed.as_ptr())
+            }
         };
         OUTCOME.store(PENDING, Ordering::Relaxed);
         let icon = self.icon();
-        // SAFETY: the strings are NUL-terminated statics and `icon` outlives the screen, which
-        // the wait below ends before this function returns.
+        // SAFETY: the strings are NUL-terminated, static or composed in this frame, and they and
+        // `icon` outlive the screen, which the wait below ends before this function returns.
         unsafe {
             nbgl_useCaseChoice(
                 &icon,
-                message.as_ptr().cast::<c_char>(),
-                sub_message.as_ptr().cast::<c_char>(),
-                confirm.as_ptr().cast::<c_char>(),
-                reject.as_ptr().cast::<c_char>(),
+                message,
+                sub_message,
+                c"Allow".as_ptr(),
+                c"Don't allow".as_ptr(),
                 Some(choice_callback),
             );
         }
@@ -195,46 +226,15 @@ impl Ui for DeviceUi<'_> {
         }
     }
 
-    fn verify_user(&mut self, timeout_ms: u32) -> Verification {
-        // The device's own count: three wrong entries wipe it. The keypad is offered only while
-        // the count is full, so this application spends at most one try before a correct
-        // entry, here or at unlock, restores it.
+    fn device_unlocked(&mut self) -> bool {
+        // The device PIN the person entered to unlock the device is the built-in user
+        // verification; the SDK's own I/O layer asks the same to refuse requests while locked,
+        // so the call needs no application flag.
         // SAFETY: a syscall without arguments.
-        if unsafe { os_global_pin_retries() } < DEFAULT_PIN_RETRIES {
-            return Verification::Blocked;
-        }
-        PIN.wipe();
-        OUTCOME.store(PENDING, Ordering::Relaxed);
-        // SAFETY: the title is a NUL-terminated static; the callbacks only write the statics
-        // above, and the wait below ends the keypad before this function returns.
-        unsafe {
-            nbgl_useCaseKeypad(
-                c"Enter your device PIN".as_ptr(),
-                PIN_MIN_DIGITS,
-                PIN_MAX_DIGITS,
-                true,
-                true,
-                Some(pin_callback),
-                Some(back_callback),
-            );
-        }
-        let verification = match self.wait(timeout_ms) {
-            Wait::Answered(PIN_ENTERED) => {
-                let len = PIN.len.load(Ordering::Relaxed);
-                // SAFETY: the keypad is gone, so nothing writes the digits while the syscall
-                // reads `len` of them.
-                let valid = unsafe { os_global_pin_check((*PIN.digits.get()).as_mut_ptr(), len) };
-                if u32::from(valid) == BOLOS_TRUE {
-                    Verification::Verified
-                } else {
-                    Verification::Invalid
-                }
-            }
-            Wait::Answered(_) => Verification::Rejected,
-            Wait::Cancelled => Verification::Cancelled,
-            Wait::TimedOut => Verification::TimedOut,
-        };
-        PIN.wipe();
-        verification
+        u32::from(unsafe { os_global_pin_is_validated() }) == BOLOS_TRUE
+    }
+
+    fn now_ms(&self) -> u64 {
+        hid::now_ms()
     }
 }

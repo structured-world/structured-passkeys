@@ -289,7 +289,7 @@ fn is_zero(record: &[u8]) -> bool {
 /// the end starts at the neighbouring boundary, so the stored RP ID stays text: credential
 /// management returns it as a CBOR text string, which must be UTF-8 (RFC 8949 §3.1, major type 3).
 /// Web RP IDs are ASCII domains, where this is the procedure exactly.
-fn stored_rp_id(rp_id: &str) -> ([u8; MAX_RP_ID_LEN], usize) {
+pub(crate) fn stored_rp_id(rp_id: &str) -> ([u8; MAX_RP_ID_LEN], usize) {
     let mut stored = [0u8; MAX_RP_ID_LEN];
     let bytes = rp_id.as_bytes();
     if bytes.len() <= MAX_RP_ID_LEN {

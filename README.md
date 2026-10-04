@@ -13,6 +13,23 @@ A FIDO2 / passkey authenticator application for Ledger devices, written in Rust.
 
 **Status:** implementation in progress.
 
+## FIDO2 on a Ledger device
+
+CTAP describes a dedicated security key that owns its power, its PIN and its storage. A Ledger
+device is a wallet running applications, so this application follows CTAP to the letter wherever
+the platform sees the result (messages, status codes, getInfo, the order of the steps) and maps the
+security key's own mechanics onto the device:
+
+- **User verification is the device unlock.** The person entered the device PIN to unlock the
+  device, and a locked device runs no request, so the application never asks for a PIN again;
+  built-in user verification succeeds while the operating system holds the PIN validated. The
+  application needs no PIN permission and can never spend one of the device's PIN tries.
+- **Opening the application is the power cycle.** State that CTAP resets at power-up (PIN/UV key
+  agreement keys, tokens, the three-mismatch block of the client PIN) starts over when the
+  application opens.
+- **Consent on the screen.** Every token the platform asks for is shown first with what it allows
+  and for which site; the person allows or refuses it on the device.
+
 ## Layout
 
 | Path | Crate | Role |
