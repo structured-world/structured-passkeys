@@ -225,6 +225,62 @@ fn a_poll_inside_a_chain_drops_it() {
     }
 }
 
+/// A SELECT that selects nothing (another AID, or parameters other than by name) between the
+/// parts of a chain ends it too (ISO/IEC 7816-4 5.4.2), so the next part is not appended to the
+/// stale prefix.
+#[test]
+fn a_failed_select_inside_a_chain_drops_it() {
+    for probe in [
+        select(&[0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01]),
+        apdu(0x00, 0xA4, 0x00, 0x00, &AID),
+    ] {
+        let mut applet = selected();
+        applet.command(&apdu(0x90, 0x10, 0x00, 0x00, &[0x01, 0x02]));
+        applet.command(&probe);
+        applet.command(&msg(&[0x04]));
+        assert_eq!(applet.request(), Some(&[0x04][..]), "{probe:?}");
+    }
+}
+
+/// GET RESPONSE has P1 and P2 00 (ISO/IEC 7816-4 7.6.1); other values are refused with 6A86 and
+/// consume nothing: the next well-formed GET RESPONSE reads the part that was due.
+#[test]
+fn get_response_parameters_are_checked() {
+    let mut applet = selected();
+    applet.command(&msg(&[0x01]));
+    let full = response(600);
+    applet.respond(&full).expect("unanswered");
+    for (p1, p2) in [(0x01, 0x00), (0x00, 0x01)] {
+        for cla in [0x00, 0x80] {
+            assert_eq!(
+                answer(&mut applet, &apdu(cla, 0xC0, p1, p2, &[])),
+                Some((vec![], 0x6A86)),
+                "{cla:02x} {p1:02x} {p2:02x}"
+            );
+        }
+    }
+    assert_eq!(
+        answer(&mut applet, &apdu(0x00, 0xC0, 0x00, 0x00, &[])),
+        Some((full[256..512].to_vec(), 0x6158))
+    );
+}
+
+/// §11.3.4: NFCCTAP_CONTROL is CLA, INS, P1 and P2 alone; one with a data field is malformed,
+/// refused with 6700, and ends nothing: the applet stays selected and a running request runs on.
+#[test]
+fn control_with_data_is_refused() {
+    let mut applet = selected();
+    applet.command(&apdu(0x80, 0x10, 0x80, 0x00, &[0x0B]));
+    applet.wait_for_user(true);
+    let end = apdu(0x80, 0x12, 0x01, 0x00, &[0x00]);
+    assert_eq!(answer(&mut applet, &end), Some((vec![], 0x6700)));
+    assert!(applet.selected());
+    assert!(!applet.cancelled());
+    assert_eq!(applet.respond(&[0x00]), None);
+    let poll = apdu(0x80, 0x11, 0x00, 0x00, &[]);
+    assert_eq!(answer(&mut applet, &poll), Some((vec![0x00], 0x9000)));
+}
+
 /// §11.3.7.2: P1 and P2 of NFCCTAP_GETRESPONSE are RFU and MUST be zero (P1 0x11 is taken as the
 /// cancel platforms send). Other values are refused with 6A86, and the exchange stays where it
 /// was: a waiting request is not cancelled, a ready response is not given out.

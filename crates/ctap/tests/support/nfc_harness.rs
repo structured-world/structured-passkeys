@@ -158,9 +158,14 @@ fn apdu(applet: &mut Applet<SIZE>, model: &mut Model, data: &mut &[u8], op: u8) 
                 sw.0
             );
             if (cla, ins, p1) == (0x80, 0x12, 0x01) && p2 == 0 && model.selected {
-                assert_eq!(sw, StatusWord::OK);
-                model.selected = false;
-                model.running = false;
+                // §11.3.4: END CTAP_MSG has no data field; one with data ends nothing.
+                if body.is_empty() {
+                    assert_eq!(sw, StatusWord::OK);
+                    model.selected = false;
+                    model.running = false;
+                } else {
+                    assert_eq!(sw, StatusWord::WRONG_LENGTH);
+                }
             }
             if !model.selected {
                 assert!(part.is_empty(), "nothing is answered before selection");

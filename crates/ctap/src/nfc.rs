@@ -265,6 +265,12 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         if self.state == State::Idle {
             self.wipe();
         }
+        // A chain is a run of consecutive parts (ISO/IEC 7816-4 5.4.2): any other command, a
+        // poll or a SELECT that selects nothing included, ends it, so the next part never lands
+        // after a stale prefix.
+        if apdu.ins != INS_MSG || !matches!(apdu.cla, CLA_FIDO | CLA_CHAINING) {
+            self.abandon_chain();
+        }
         // SELECT is accepted in every state; selecting the FIDO applet again starts over
         // (§11.3.3: the client selects before any other command).
         if apdu.cla == CLA_ISO && apdu.ins == INS_SELECT {
@@ -278,11 +284,6 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         // A request being run takes only NFCCTAP_GETRESPONSE, deselection and selection.
         if let State::Running { .. } = self.state {
             return Outcome::Reply(self.while_running(apdu));
-        }
-        // A chain is a run of consecutive parts (ISO/IEC 7816-4 5.4.2): any other command, a
-        // poll included, ends it, so the next part never lands after a stale prefix.
-        if apdu.ins != INS_MSG || !matches!(apdu.cla, CLA_FIDO | CLA_CHAINING) {
-            self.abandon_chain();
         }
         // The rest of a chained response is read with GET RESPONSE (ISO/IEC 7816-4 5.3.4), in
         // either class; any other command drops it, so a response is never read out of order.
@@ -337,6 +338,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         self.abandon_chain();
         if apdu.p1 != CONTROL_END || apdu.p2 != 0x00 {
             return Reply::status(StatusWord::WRONG_P1_P2);
+        }
+        // §11.3.4: the command is CLA, INS, P1 and P2 alone; one with data is malformed and
+        // ends nothing.
+        if !apdu.data.is_empty() {
+            return Reply::status(StatusWord::WRONG_LENGTH);
         }
         self.drop_exchange();
         self.state = State::Deselected;
@@ -429,6 +435,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
 
     /// GET RESPONSE: the next part of a chained response.
     fn next_part<'a>(&'a mut self, apdu: &Apdu<'_>) -> Reply<'a> {
+        // ISO/IEC 7816-4 7.6.1: P1-P2 are 0000; other values are refused before the response
+        // advances.
+        if apdu.p1 != 0 || apdu.p2 != 0 {
+            return Reply::status(StatusWord::WRONG_P1_P2);
+        }
         let State::Sending { len, offset } = self.state else {
             return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
         };
