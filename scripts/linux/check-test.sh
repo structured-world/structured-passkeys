@@ -35,10 +35,12 @@ root=$(git rev-parse --show-toplevel)
 tmp=$(mktemp -d)
 check=""
 # A stop the concurrent-stop case holds in the fake find, the directory it
-# waits in, and the run directory it works on.
+# waits in, and the run directory it works on; the late-launch case's run
+# directory, which lives outside $tmp.
 held_stop=""
 hold=""
 twice=""
+late=""
 # A check still running is stopped before the fake host it uses goes: without
 # its fake ssh it could not clean up its run. A held stop is released and
 # reaped first, since removing $tmp would leave it waiting for good.
@@ -56,6 +58,7 @@ finish() {
         wait "$check" 2>/dev/null || true
     fi
     [[ -n "$twice" ]] && rm -rf "$twice"
+    [[ -n "$late" ]] && rm -rf "$late"
     rm -rf "$tmp"
     exit "$code"
 }
