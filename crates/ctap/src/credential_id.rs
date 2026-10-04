@@ -125,7 +125,7 @@ pub struct User {
 
 /// Everything a credential ID carries. Plaintext keys: 1 origin (0 device-only, 1
 /// seed-recoverable), 2 alg, 3 cs (seed-recoverable, or device-only under `K_dev`), 4 slot, 5
-/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 epoch.
+/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 reset ID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credential {
     /// Where the private key comes from.
@@ -136,8 +136,9 @@ pub struct Credential {
     pub cred_protect: CredProtect,
     /// The user of a discoverable credential; `None` for a non-discoverable one.
     pub user: Option<User>,
-    /// Reset epoch at creation.
-    pub epoch: u32,
+    /// The device's reset ID at creation: 0 before any reset, otherwise the random value the
+    /// last reset drew.
+    pub reset_id: u32,
 }
 
 /// Why a credential ID does not open.
@@ -151,6 +152,8 @@ pub enum OpenError {
     Authentication,
     /// The authenticated plaintext is not a credential of this format.
     Plaintext,
+    /// Created under another reset ID than the device's: a reset since revoked it.
+    Revoked,
 }
 
 /// Why a credential is refused when sealing.
@@ -198,7 +201,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
     let names = user.map_or(0, |user| {
         usize::from(user.name.is_some()) + usize::from(user.display_name.is_some())
     });
-    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, epoch.
+    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, reset ID.
     let key_fields = match credential.key {
         KeySource::Seed(_) | KeySource::Device(_) => 1,
         KeySource::Slot { .. } => 2,
@@ -239,7 +242,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
         }
         encoder
             .unsigned(11)?
-            .unsigned(u64::from(credential.epoch))?;
+            .unsigned(u64::from(credential.reset_id))?;
         Ok(())
     };
     write(&mut encoder).map_err(|_| SealError::TooLong)?;
@@ -292,13 +295,32 @@ pub fn seal<C: Crypto>(
     Ok(id)
 }
 
-/// Opens a credential ID presented for `rp_id`.
+/// Opens a credential ID presented for `rp_id` on a device whose reset ID is `reset_id`. While it
+/// is nonzero, only an ID created under it opens: a reset invalidates every credential (CTAP 2.2
+/// §6.6), and a seed-recoverable one would still derive its key from the recovery phrase, so the
+/// reset ID is what refuses it. At 0 (never reset, or NVM wiped without a restore) every ID opens,
+/// so the credentials the phrase reproduces work again after a reinstall.
 ///
 /// # Errors
 ///
-/// [`OpenError`] when the ID was not sealed by this device for this RP, or is not of this
-/// format.
+/// [`OpenError`] when the ID was not sealed by this device for this RP, is not of this format,
+/// or was revoked by a reset ([`OpenError::Revoked`]).
 pub fn open<C: Crypto>(
+    crypto: &C,
+    keys: &KeyRing,
+    rp_id: &str,
+    id: &[u8],
+    reset_id: u32,
+) -> Result<Credential, OpenError> {
+    let credential = open_any_reset(crypto, keys, rp_id, id)?;
+    if reset_id != 0 && credential.reset_id != reset_id {
+        return Err(OpenError::Revoked);
+    }
+    Ok(credential)
+}
+
+/// Opens a credential ID whatever its reset ID.
+fn open_any_reset<C: Crypto>(
     crypto: &C,
     keys: &KeyRing,
     rp_id: &str,
@@ -443,7 +465,7 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
         if next != Some(11) {
             return Err(NOT_A_CREDENTIAL);
         }
-        let epoch = u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
+        let reset_id = u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
         if entries.next_key()?.is_some() {
             return Err(NOT_A_CREDENTIAL);
         }
@@ -452,7 +474,7 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             alg,
             cred_protect,
             user,
-            epoch,
+            reset_id,
         })
     })?;
     decoder.finish()?;

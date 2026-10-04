@@ -610,6 +610,12 @@ impl ClientPin {
         self.token = TokenState::INITIAL;
     }
 
+    /// authenticatorReset (CTAP 2.2 §6.6): new key agreement keys and tokens for both protocols,
+    /// the token state back to its initial values, and no mismatches counted, as at power-up.
+    pub fn reset<C: Crypto + ?Sized>(&mut self, crypto: &mut C) {
+        *self = Self::new(crypto);
+    }
+
     /// Whether PIN operations are blocked until a power cycle: three consecutive mismatches
     /// (§6.5.5.6 step 5.7.1.2.2). getPINRetries reports it as `powerCycleState`.
     pub const fn power_cycle_required(&self) -> bool {

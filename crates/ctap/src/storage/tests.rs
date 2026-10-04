@@ -67,7 +67,7 @@ fn slot_key(source: &KeySource) -> (u16, [u8; SLOT_TAG_LEN]) {
 /// Everything a caller can observe: configuration, entries newest first, live keys.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
-    epoch: u32,
+    reset_id: u32,
     always_uv: bool,
     pin: Option<[u8; 16]>,
     pin_retries: u8,
@@ -90,7 +90,7 @@ fn snapshot(store: &Store<MemoryStorage>) -> Snapshot {
         })
         .collect();
     Snapshot {
-        epoch: config.epoch,
+        reset_id: config.reset_id,
         always_uv: config.always_uv,
         pin: config.pin.as_ref().map(|pin| pin.0),
         pin_retries: config.pin_retries,
@@ -138,7 +138,7 @@ fn fresh_nvm_is_formatted() {
     let store = Store::open(MemoryStorage::new(4, 2));
     assert_eq!(store.storage.config()[0], LAYOUT_VERSION);
     let config = store.config();
-    assert_eq!(config.epoch, 0);
+    assert_eq!(config.reset_id, 0);
     assert!(!config.always_uv);
     assert!(config.pin.is_none());
     assert_eq!(config.pin_retries, PIN_RETRIES);
@@ -176,7 +176,7 @@ fn another_layout_is_wiped_even_when_interrupted() {
     storage.power_on();
     let store = Store::open(storage);
     assert_eq!(store.storage.config()[0], LAYOUT_VERSION);
-    assert_eq!(store.config().epoch, 0);
+    assert_eq!(store.config().reset_id, 0);
     assert_eq!(store.entries().count(), 0);
     assert_eq!(store.remaining_keys(), 1);
     assert_no_residue(&store);
@@ -188,14 +188,13 @@ fn another_layout_is_wiped_even_when_interrupted() {
 fn the_configuration_round_trips() {
     let mut store = Store::open(MemoryStorage::new(1, 1));
     store.write_config(&Config {
-        epoch: 7,
+        reset_id: 0,
         always_uv: true,
         pin: Some(PinVerifier::new([0x42; 16])),
         pin_retries: 5,
     });
     let store = Store::open(store.into_storage());
     let config = store.config();
-    assert_eq!(config.epoch, 7);
     assert!(config.always_uv);
     assert_eq!(config.pin_retries, 5);
     let pin = config.pin.expect("a PIN is set");
@@ -204,22 +203,28 @@ fn the_configuration_round_trips() {
     assert_eq!(format!("{pin:?}"), "PinVerifier(<redacted>)");
 }
 
-/// A configuration write built from a stale or constructed `Config` keeps the larger stored
-/// epoch: lowering it would let credential IDs issued before a reset pass the epoch check again.
-/// The rest of the configuration is written as given.
+/// A configuration write built from a stale or constructed `Config` keeps the stored reset ID,
+/// whatever it carries: only a reset changes it, and bringing back a replaced one, or 0, would
+/// open the credential IDs that reset revoked. The rest of the configuration is written as given.
 #[test]
-fn a_configuration_write_never_lowers_the_epoch() {
+fn a_configuration_write_keeps_the_reset_id() {
+    let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(1, 1));
-    store.write_config(&Config::after_reset(5));
-    store.write_config(&Config {
-        epoch: 2,
-        always_uv: true,
-        pin: Some(PinVerifier::new([0x42; 16])),
-        pin_retries: 4,
-    });
+    store
+        .reset(&mut crypto)
+        .expect("counters far from wrapping");
+    let reset_id = store.config().reset_id;
+    for stale in [0, reset_id.wrapping_add(1)] {
+        store.write_config(&Config {
+            reset_id: stale,
+            always_uv: true,
+            pin: Some(PinVerifier::new([0x42; 16])),
+            pin_retries: 4,
+        });
+    }
     let store = Store::open(store.into_storage());
     let config = store.config();
-    assert_eq!(config.epoch, 5);
+    assert_eq!(config.reset_id, reset_id);
     assert!(config.always_uv);
     assert_eq!(config.pin_retries, 4);
     assert!(config.pin.expect("a PIN is set").matches(&[0x42; 16]));
@@ -418,7 +423,7 @@ fn reset_erases_the_device_key() {
     let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(1, 2));
     let before = store.device_key_or_create(&mut crypto);
-    store.reset().expect("an epoch left");
+    store.reset(&mut crypto).expect("a generation left");
     assert!(store.device_key().is_none());
     let store_after = Store::open(store.into_storage());
     assert!(store_after.device_key().is_none(), "also after a reopen");
@@ -536,7 +541,7 @@ fn a_stale_release_keeps_a_newer_reservations_key() {
     store
         .store_key(&mut crypto, &stale, &device_key(1))
         .expect("a key slot");
-    store.reset().expect("an epoch left");
+    store.reset(&mut crypto).expect("a generation left");
     let fresh = store
         .reserve(&RP_A, "example.com", same_user("bob"))
         .expect("room");
@@ -687,14 +692,14 @@ fn a_released_reservation_changes_nothing() {
 }
 
 /// Reset empties the index and the key slots, erases the device key, clears the PIN and
-/// alwaysUv, restores the retries and increments the epoch; a reservation made before it is
+/// alwaysUv, restores the retries and draws a nonzero reset ID; a reservation made before it is
 /// refused.
 #[test]
-fn reset_empties_everything_and_raises_the_epoch() {
+fn reset_empties_everything_and_draws_a_reset_id() {
     let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(2, 3));
     store.write_config(&Config {
-        epoch: 3,
+        reset_id: 0,
         always_uv: true,
         pin: Some(PinVerifier::new([7; 16])),
         pin_retries: 2,
@@ -712,10 +717,12 @@ fn reset_empties_everything_and_raises_the_epoch() {
     let stale = store
         .reserve(&RP_B, "example.org", same_user("bob"))
         .expect("room");
-    store.reset().expect("counters far from wrapping");
+    store
+        .reset(&mut crypto)
+        .expect("counters far from wrapping");
     assert!(store.device_key().is_none());
     let config = store.config();
-    assert_eq!(config.epoch, 4);
+    assert_ne!(config.reset_id, 0);
     assert!(!config.always_uv);
     assert!(config.pin.is_none());
     assert_eq!(config.pin_retries, PIN_RETRIES);
@@ -729,14 +736,24 @@ fn reset_empties_everything_and_raises_the_epoch() {
     assert_eq!(store.commit(stale, b"bob:1"), Err(StoreError::Stale));
 }
 
-/// A reset at the largest epoch is refused rather than wrapping to 0, which would reopen
-/// revoked credential IDs.
+/// Every reset draws a reset ID that is neither 0, which would open every credential ID, nor the
+/// one before it, which would keep the IDs created since then open; it stays across a reopen.
 #[test]
-fn reset_never_wraps_the_epoch() {
+fn every_reset_draws_a_new_reset_id() {
+    let mut crypto = crypto();
     let mut store = Store::open(MemoryStorage::new(1, 1));
-    store.write_config(&Config::after_reset(u32::MAX));
-    assert_eq!(store.reset(), Err(StoreError::Exhausted));
-    assert_eq!(store.config().epoch, u32::MAX);
+    let mut previous = store.config().reset_id;
+    for _ in 0..64 {
+        store
+            .reset(&mut crypto)
+            .expect("counters far from wrapping");
+        let drawn = store.config().reset_id;
+        assert_ne!(drawn, 0);
+        assert_ne!(drawn, previous);
+        previous = drawn;
+    }
+    let store = Store::open(store.into_storage());
+    assert_eq!(store.config().reset_id, previous);
 }
 
 /// A slot past the index is no entry, and removing an id that names one does nothing, instead
@@ -764,7 +781,9 @@ fn entry_ids_are_never_reused() {
     let (second, _) = add(&mut store, &mut crypto, &RP_A, "bob", "1", None).expect("room");
     assert_eq!(second.slot, first.slot);
     assert_ne!(second, first, "a reopen does not rewind the sequence");
-    store.reset().expect("counters far from wrapping");
+    store
+        .reset(&mut crypto)
+        .expect("counters far from wrapping");
     let (third, _) = add(&mut store, &mut crypto, &RP_A, "carol", "1", None).expect("room");
     assert!(
         third.sequence > second.sequence,
@@ -853,12 +872,13 @@ fn power_loss_leaves_old_or_new(
     }
 }
 
-/// Two discoverable credentials of RP A (one device-only), one of RP B, the device key and a
-/// PIN.
+/// After a reset (a nonzero reset ID): two discoverable credentials of RP A (one device-only),
+/// one of RP B, the device key and a PIN.
 fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
     let mut store = Store::open(MemoryStorage::new(4, 4));
+    store.reset(crypto).expect("counters far from wrapping");
     store.write_config(&Config {
-        epoch: 1,
+        reset_id: 0,
         always_uv: true,
         pin: Some(PinVerifier::new([9; 16])),
         pin_retries: 6,
@@ -910,11 +930,12 @@ fn power_loss_while_removing_a_device_credential() {
     });
 }
 
-/// Reset writes the configuration of the next generation, then wipes every slot.
+/// Reset writes the configuration of the next generation with a new reset ID, then wipes every
+/// slot.
 #[test]
 fn power_loss_while_resetting() {
-    power_loss_leaves_old_or_new(populated, |store, _| {
-        store.reset().expect("counters far from wrapping");
+    power_loss_leaves_old_or_new(populated, |store, crypto| {
+        store.reset(crypto).expect("counters far from wrapping");
     });
 }
 

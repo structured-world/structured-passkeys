@@ -33,6 +33,10 @@ application runs inside a Ledger wallet, where the operating system owns all thr
   - The power cycle of CTAP is opening the application.
   - authenticatorReset keeps the 10-second window after the application opens, which CTAP 2.2
     §6.6 requires only without a display, so a reset never reaches a device sitting open.
+  - A reset revokes the credentials the recovery phrase derives through a random reset ID kept in
+    the application's storage, since their keys cannot be erased. That storage is the application's
+    data, so wiping it or reinstalling the application without restoring its backup brings those
+    credentials back; the reset screen says so.
   - getInfo reports the options of a feature (`clientPin`, `pinUvAuthToken`, `uv`, `rk`) together
     with the commands that use it, so a platform never starts a flow that ends in a command the
     application does not have yet.

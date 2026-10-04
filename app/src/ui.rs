@@ -180,6 +180,7 @@ impl Ui for DeviceUi<'_> {
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
         // Kept in this frame until the screen is gone.
         let composed;
+        let (mut confirm, mut reject) = (c"Allow".as_ptr(), c"Don't allow".as_ptr());
         let (message, sub_message): (*const c_char, *const c_char) = match prompt {
             // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
             // why it names none.
@@ -187,6 +188,16 @@ impl Ui for DeviceUi<'_> {
                 c"Allow security key access?".as_ptr(),
                 c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
             ),
+            // What a reset erases, and that passkeys from the recovery phrase are only revoked
+            // while this application's data lasts: reinstalling it without restoring a backup
+            // brings them back.
+            Prompt::Reset => {
+                (confirm, reject) = (c"Reset".as_ptr(), c"Cancel".as_ptr());
+                (
+                    c"Reset the security key?".as_ptr(),
+                    c"Erases the passkeys kept only on this device, the security key PIN and its settings, and stops passkeys from your recovery phrase working. Those come back if the app is reinstalled without restoring its backup.".as_ptr(),
+                )
+            }
             // The platform asks for a pinUvAuthToken, with the client PIN or the device unlock;
             // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
             // §6.5.5.7.3 step 9).
@@ -213,8 +224,8 @@ impl Ui for DeviceUi<'_> {
                 &icon,
                 message,
                 sub_message,
-                c"Allow".as_ptr(),
-                c"Don't allow".as_ptr(),
+                confirm,
+                reject,
                 Some(choice_callback),
             );
         }
