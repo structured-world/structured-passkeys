@@ -31,8 +31,12 @@ screen.
 
 Built-in user verification (§6.5.5.7.3), which is the device unlock, in Speculos and on a device:
 getUVRetries offers one attempt; getPinUvAuthTokenUsingUvWithPermissions gives a token after the
-consent choice alone, no PIN asked, and a refused consent gives none (CTAP2_ERR_OPERATION_DENIED).
-Its consent screen, which names the RP, is compared with its snapshot.
+consent choice alone, no PIN asked, and in Speculos a refused consent gives none
+(CTAP2_ERR_OPERATION_DENIED). Its consent screen, which names the RP, is compared with its snapshot.
+
+The screens to answer come first and those to leave alone last, so at a device the person
+answers: selection "Don't allow", selection "Allow", token consent "Allow", then nothing while
+a selection is cancelled and the next one times out.
 """
 
 import argparse
@@ -261,27 +265,11 @@ def selection(ctap: Ctap2, cancel: threading.Event | None = None) -> int:
         return error.code
 
 
-def check_selection(device: CtapHidDevice, keepalives: KeepaliveLog, user, snapshot) -> None:
+def check_selection_answers(device: CtapHidDevice, user, snapshot) -> None:
+    """authenticatorSelection refused, then confirmed; the screen is compared with its snapshot
+    while it waits for the confirmation."""
     ctap = Ctap2(device)
-
-    # Cancel: the host gives up after a second of keepalives.
-    keepalives.clear()
-    cancel = threading.Event()
-    threading.Timer(1.0, cancel.set).start()
-    status = selection(ctap, cancel)
-    check(status == CtapError.ERR.KEEPALIVE_CANCEL, f"selection: CANCEL ends it ({status!r})")
-    gaps = keepalives.gaps_ms()
-    check(
-        len(gaps) >= 5 and max(gaps) <= KEEPALIVE_GAP_MS + KEEPALIVE_SLACK_MS,
-        f"selection: keepalives every {max(gaps, default=0):.0f} ms at most over {len(gaps)} gaps",
-    )
-    check(
-        keepalives.statuses() == {STATUS_UPNEEDED},
-        f"selection: keepalive status {sorted(keepalives.statuses())} is UPNEEDED",
-    )
-
-    # Confirm and refuse; the screen is compared with its snapshot while it waits.
-    for confirm, expected in ((True, CtapError.ERR.SUCCESS), (False, CtapError.ERR.OPERATION_DENIED)):
+    for confirm, expected in ((False, CtapError.ERR.OPERATION_DENIED), (True, CtapError.ERR.SUCCESS)):
 
         # The answer runs in the timer's thread, where an exception (a failed snapshot check
         # raises SystemExit) would end only that thread: it is kept and raised here instead.
@@ -303,7 +291,27 @@ def check_selection(device: CtapHidDevice, keepalives: KeepaliveLog, user, snaps
             raise failure[0]
         check(status == expected, f"selection: {'confirm' if confirm else 'refuse'} answers {status!r}")
 
-    # No answer.
+
+def check_selection_unanswered(device: CtapHidDevice, keepalives: KeepaliveLog) -> None:
+    """authenticatorSelection left unanswered: the host cancels it after a second of keepalives,
+    and the next one times out."""
+    ctap = Ctap2(device)
+
+    keepalives.clear()
+    cancel = threading.Event()
+    threading.Timer(1.0, cancel.set).start()
+    status = selection(ctap, cancel)
+    check(status == CtapError.ERR.KEEPALIVE_CANCEL, f"selection: CANCEL ends it ({status!r})")
+    gaps = keepalives.gaps_ms()
+    check(
+        len(gaps) >= 5 and max(gaps) <= KEEPALIVE_GAP_MS + KEEPALIVE_SLACK_MS,
+        f"selection: keepalives every {max(gaps, default=0):.0f} ms at most over {len(gaps)} gaps",
+    )
+    check(
+        keepalives.statuses() == {STATUS_UPNEEDED},
+        f"selection: keepalive status {sorted(keepalives.statuses())} is UPNEEDED",
+    )
+
     started = time.monotonic()
     status = selection(ctap)
     waited = time.monotonic() - started
@@ -480,11 +488,14 @@ def check_built_in_uv(device: CtapHidDevice, user, snapshot) -> None:
         status == CtapError.ERR.SUCCESS and [len(t) for t in token] == [32],
         f"built-in UV: consent gives a 32-byte token, no PIN asked ({status!r})",
     )
-    status = answered(user, False, TOKEN_TITLE, uv_token)
-    check(
-        status == CtapError.ERR.OPERATION_DENIED,
-        f"built-in UV: a refused consent gives no token ({status!r})",
-    )
+    # Refusing is the same consent screen as for the client PIN, which a device run does not
+    # repeat; Speculos answers it itself.
+    if isinstance(user, SpeculosUser):
+        status = answered(user, False, TOKEN_TITLE, uv_token)
+        check(
+            status == CtapError.ERR.OPERATION_DENIED,
+            f"built-in UV: a refused consent gives no token ({status!r})",
+        )
 
 
 def snapshot_check(model: str, directory: Path, golden: bool, name: str, title: str):
@@ -546,11 +557,14 @@ def main() -> None:
         def snapshot(name: str, title: str):
             return None
 
-    check_selection(device, keepalives, user, snapshot("selection", SELECTION_TITLE))
+    # The screens the person answers come first, in the order refuse, allow, allow; the ones
+    # left unanswered (cancel, timeout) last, so no answer is given to the wrong screen.
+    check_selection_answers(device, user, snapshot("selection", SELECTION_TITLE))
+    check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
     if args.speculos:
         # Speculos starts with empty NVM, so the PIN can be set; a device keeps its PIN.
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
-    check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
+    check_selection_unanswered(device, keepalives)
     device.close()
 
 
