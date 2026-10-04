@@ -15,7 +15,7 @@ publish = false
 # `AtomicStorage::settle` erases the copy an update retired; they come from this fork of the
 # Ledger Rust SDK until the published crate has them.
 # `sys` exposes the C SDK calls the application makes directly: the NBGL use cases its screens
-# start without the SDK's blocking wait, and the device PIN check.
+# start without the SDK's blocking wait, and whether the device is unlocked.
 ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "f7c289a5da04fdbbb9da1eaf45252cc44e948952", features = ["io_new", "nano_nbgl", "app_io_stack", "sys"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 zeroize = { version = "1.9.0", default-features = false }
@@ -25,9 +25,8 @@ zeroize = { version = "1.9.0", default-features = false }
 [package.metadata.ledger]
 name = "Structured Passkeys"
 curve = ["secp256r1"]
-# APPLICATION_FLAG_GLOBAL_PIN: built-in user verification has the operating system check the
-# device PIN the user re-enters in the ceremony.
-flags = "0x40"
+# No application flags: built-in user verification is the device unlock, which needs none.
+flags = "0"
 path = ["5722689'/5262163'"]
 nanosplus = { icon = "icons/key_14x14.png" }
 nanox = { icon = "icons/key_14x14.png" }

@@ -1,8 +1,8 @@
-//! HKDF against the RFC 5869 Appendix A vectors and the P-256 private-key range check at its
-//! boundaries. Expected bytes are copied from the specifications. Also the software platform's
-//! redacted Debug output.
+//! HKDF against the RFC 5869 Appendix A vectors, AES-256-CBC against SP 800-38A, P-256 ECDH
+//! against RFC 5903, and the P-256 private-key range check at its boundaries. Expected bytes are
+//! copied from the specifications. Also the software platform's redacted Debug output.
 
-use super::{KEY_LEN, hkdf_sha256, is_p256_private_key};
+use super::{Crypto, CryptoError, KEY_LEN, PUBLIC_KEY_LEN, hkdf_sha256, is_p256_private_key};
 use crate::soft::SoftCrypto;
 
 fn crypto() -> SoftCrypto {
@@ -66,6 +66,100 @@ fn p256_private_keys_are_between_zero_and_the_order() {
     let mut high = [0u8; KEY_LEN];
     high[0] = 0x7F;
     assert!(is_p256_private_key(&high), "0x7f00..00");
+}
+
+/// SP 800-38A F.2.5 and F.2.6, CBC-AES256: encryption and decryption of the four-block example,
+/// in place, chained from the IV.
+#[test]
+fn aes256_cbc_matches_sp800_38a() {
+    let key: [u8; KEY_LEN] =
+        hex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+            .try_into()
+            .expect("32 bytes");
+    let iv: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f")
+        .try_into()
+        .expect("16 bytes");
+    let plaintext = hex(concat!(
+        "6bc1bee22e409f96e93d7e117393172a",
+        "ae2d8a571e03ac9c9eb76fac45af8e51",
+        "30c81c46a35ce411e5fbc1191a0a52ef",
+        "f69f2445df4f9b17ad2b417be66c3710",
+    ));
+    let ciphertext = hex(concat!(
+        "f58c4c04d6e5f1ba779eabfb5f7bfbd6",
+        "9cfc4e967edb808d679f777bc6702c7d",
+        "39f23369a9d9bacfa530e26304231461",
+        "b2eb05e2c39be9fcda6c19078c6a9d1b",
+    ));
+    let mut data = plaintext.clone();
+    assert_eq!(crypto().aes256_cbc_encrypt(&key, &iv, &mut data), Ok(()));
+    assert_eq!(data, ciphertext);
+    assert_eq!(crypto().aes256_cbc_decrypt(&key, &iv, &mut data), Ok(()));
+    assert_eq!(data, plaintext);
+}
+
+/// AES-CBC without padding takes whole blocks only, and leaves partial input untouched.
+#[test]
+fn aes256_cbc_refuses_partial_blocks() {
+    let mut data = [7u8; 17];
+    assert_eq!(
+        crypto().aes256_cbc_encrypt(&[0; KEY_LEN], &[0; 16], &mut data),
+        Err(CryptoError::Length)
+    );
+    assert_eq!(
+        crypto().aes256_cbc_decrypt(&[0; KEY_LEN], &[0; 16], &mut data),
+        Err(CryptoError::Length)
+    );
+    assert_eq!(data, [7u8; 17]);
+}
+
+/// RFC 5903 §8.1, the 256-bit random ECP group: each side's ECDH of its private key with the
+/// other's public point gives the shared x-coordinate, and each public point is its scalar times
+/// the base point.
+#[test]
+fn p256_ecdh_matches_rfc5903() {
+    let i: [u8; KEY_LEN] = hex("c88f01f510d9ac3f70a292daa2316de544e9aab8afe84049c62a9c57862d1433")
+        .try_into()
+        .expect("32 bytes");
+    let r: [u8; KEY_LEN] = hex("c6ef9c5d78ae012a011164acb397ce2088685d8f06bf9be0b283ab46476bee53")
+        .try_into()
+        .expect("32 bytes");
+    let gi: [u8; PUBLIC_KEY_LEN] = hex(concat!(
+        "04",
+        "dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c3772581180",
+        "5271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3",
+    ))
+    .try_into()
+    .expect("65 bytes");
+    let gr: [u8; PUBLIC_KEY_LEN] = hex(concat!(
+        "04",
+        "d12dfb5289c8d4f81208b70270398c342296970a0bccb74c736fc7554494bf63",
+        "56fbf3ca366cc23e8157854c13c58d6aac23f046ada30f8353e74f33039872ab",
+    ))
+    .try_into()
+    .expect("65 bytes");
+    let shared = hex("d6840f6b42f6edafd13116e0e12565202fef8e9ece7dce03812464d04b9442de");
+
+    assert_eq!(crypto().p256_public_key(&i), Ok(gi));
+    assert_eq!(crypto().p256_public_key(&r), Ok(gr));
+    assert_eq!(
+        crypto().p256_ecdh(&i, &gr).map(|z| z.to_vec()),
+        Ok(shared.clone())
+    );
+    assert_eq!(crypto().p256_ecdh(&r, &gi).map(|z| z.to_vec()), Ok(shared));
+}
+
+/// ECDH refuses a peer point that is not on the curve: y changed by one bit.
+#[test]
+fn p256_ecdh_refuses_a_point_off_the_curve() {
+    let mut scalar = [0u8; KEY_LEN];
+    scalar[KEY_LEN - 1] = 1;
+    let mut point = crypto().p256_public_key(&scalar).expect("a valid scalar");
+    point[PUBLIC_KEY_LEN - 1] ^= 1;
+    assert_eq!(
+        crypto().p256_ecdh(&scalar, &point).map(|z| z.to_vec()),
+        Err(CryptoError::InvalidPoint)
+    );
 }
 
 /// The software platform's node derives every key and its seed predicts every nonce: Debug

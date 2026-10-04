@@ -4,6 +4,7 @@
 #![no_std]
 #![no_main]
 
+mod crypto;
 mod hid;
 mod storage;
 mod ui;
@@ -48,14 +49,15 @@ extern "C" fn sample_main(_arg0: u32) {
     hid::start();
     let comm = io::init_comm(&COMM);
     comm.set_expected_cla(CLA);
-    let mut authenticator = Authenticator::new(hid::SETTINGS);
     // SAFETY: `sample_main` runs once and is the only place that refers to the buffer.
     let response = unsafe { &mut *RESPONSE.get() };
 
     // Opening the store formats a fresh install and finishes a reset or a replacement that a
-    // power loss interrupted.
+    // power loss interrupted. The authenticator initializes the PIN/UV auth protocols as at
+    // power-up: opening the application is the power cycle of CTAP 2.2.
     // SAFETY: the only place that takes the NVM regions.
-    Store::open(unsafe { storage::NvmStorage::take() });
+    let store = Store::open(unsafe { storage::NvmStorage::take() });
+    let mut authenticator = Authenticator::new(hid::SETTINGS, crypto::DeviceCrypto, store);
 
     // The home screen carries the version page and the quit action.
     let home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH);

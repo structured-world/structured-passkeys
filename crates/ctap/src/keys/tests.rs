@@ -77,8 +77,8 @@ impl Crypto for RejectFirstCounter {
     fn random(&mut self, out: &mut [u8]) {
         self.0.random(out);
     }
-    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN] {
-        self.0.sha256(parts)
+    fn sha256_into(&self, parts: &[&[u8]], out: &mut [u8; KEY_LEN]) {
+        self.0.sha256_into(parts, out);
     }
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {
         if parts == [&b"es256"[..], &[0u8][..], &[1u8][..]] {
@@ -104,6 +104,29 @@ impl Crypto for RejectFirstCounter {
         tag: &[u8; TAG_LEN],
     ) -> Result<(), CryptoError> {
         self.0.aes256_gcm_open(key, nonce, aad, data, tag)
+    }
+    fn aes256_cbc_encrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; 16],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        self.0.aes256_cbc_encrypt(key, iv, data)
+    }
+    fn aes256_cbc_decrypt(
+        &self,
+        key: &[u8; KEY_LEN],
+        iv: &[u8; 16],
+        data: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        self.0.aes256_cbc_decrypt(key, iv, data)
+    }
+    fn p256_ecdh(
+        &self,
+        private_key: &[u8; KEY_LEN],
+        peer: &[u8; PUBLIC_KEY_LEN],
+    ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+        self.0.p256_ecdh(private_key, peer)
     }
     fn p256_public_key(
         &self,

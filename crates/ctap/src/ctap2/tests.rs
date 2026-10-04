@@ -6,7 +6,12 @@ use super::{
     UnknownCommand,
 };
 use crate::cbor::{self, validate};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui, Verification};
+use crate::crypto::KEY_LEN;
+use crate::soft::SoftCrypto;
+use crate::storage::{MemoryStorage, Store};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+
+pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
 
 fn settings() -> Settings {
     Settings {
@@ -14,34 +19,89 @@ fn settings() -> Settings {
     }
 }
 
-/// A user who gives `answer` to every confirmation, recording what was asked.
-struct Scripted {
-    answer: Answer,
-    asked: Vec<(Prompt, u32)>,
+/// An authenticator on fresh NVM with the software platform.
+pub(super) fn authenticator() -> TestAuthenticator {
+    Authenticator::new(
+        settings(),
+        SoftCrypto::new([0x11; KEY_LEN], [0x22; KEY_LEN]),
+        Store::open(MemoryStorage::new(4, 4)),
+    )
+}
+
+impl TestAuthenticator {
+    /// The application closed and opened again: NVM stays, everything in RAM starts over, as
+    /// after a power cycle.
+    pub(super) fn reopen(self) -> Self {
+        Authenticator::new(
+            self.settings,
+            self.crypto,
+            Store::open(self.store.into_storage()),
+        )
+    }
+}
+
+/// A screen the scripted user was shown, with the RP ID copied out of the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Asked {
+    /// authenticatorSelection.
+    Selection,
+    /// Consent to a token with these permission bits and permissions RP ID.
+    Token {
+        permissions: u8,
+        rp_id: Option<String>,
+    },
+}
+
+impl Asked {
+    fn from_prompt(prompt: Prompt<'_>) -> Self {
+        match prompt {
+            Prompt::Selection => Asked::Selection,
+            Prompt::Token { permissions, rp_id } => Asked::Token {
+                permissions: permissions.bits(),
+                rp_id: rp_id.map(String::from),
+            },
+        }
+    }
+}
+
+/// A user who gives `answer` to every confirmation, recording what was shown with its timeout,
+/// on a device whose PIN the operating system holds validated while `unlocked`; the clock is
+/// `now_ms`.
+pub(super) struct Scripted {
+    pub(super) answer: Answer,
+    pub(super) unlocked: bool,
+    pub(super) now_ms: u64,
+    pub(super) asked: Vec<(Asked, u32)>,
 }
 
 impl Scripted {
-    fn new(answer: Answer) -> Self {
+    pub(super) fn new(answer: Answer) -> Self {
         Self {
             answer,
+            unlocked: true,
+            now_ms: 0,
             asked: Vec::new(),
         }
     }
 }
 
 impl Ui for Scripted {
-    fn confirm(&mut self, prompt: Prompt, timeout_ms: u32) -> Answer {
-        self.asked.push((prompt, timeout_ms));
+    fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
+        self.asked.push((Asked::from_prompt(prompt), timeout_ms));
         self.answer
     }
 
-    fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
-        panic!("no command here asks for user verification")
+    fn device_unlocked(&mut self) -> bool {
+        self.unlocked
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.now_ms
     }
 }
 
 fn process_with(request: &[u8], ui: &mut Scripted) -> Vec<u8> {
-    let mut authenticator = Authenticator::new(settings());
+    let mut authenticator = authenticator();
     let mut response = [0u8; 256];
     let length = authenticator.process(request, ui, &mut response);
     response[..length].to_vec()
@@ -70,7 +130,7 @@ fn selection_answers_with_the_users_answer() {
         assert_eq!(process_with(&[0x0B], &mut ui), [status], "{answer:?}");
         assert_eq!(
             ui.asked,
-            [(Prompt::Selection, USER_ACTION_TIMEOUT_MS)],
+            [(Asked::Selection, USER_ACTION_TIMEOUT_MS)],
             "{answer:?}"
         );
     }
@@ -88,7 +148,7 @@ fn selection_with_parameters_is_invalid_length() {
 /// holds it and run once the transport is free again.
 #[test]
 fn parsing_names_the_command() {
-    let authenticator = Authenticator::new(settings());
+    let authenticator = authenticator();
     assert_eq!(authenticator.parse(&[0x04]), Ok(Command::GetInfo));
     assert_eq!(authenticator.parse(&[0x0B]), Ok(Command::Selection));
     assert_eq!(authenticator.parse(&[]), Err(StatusCode::InvalidLength));
@@ -98,14 +158,15 @@ fn parsing_names_the_command() {
     );
 }
 
-/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024} in canonical order: the
-/// required versions and aaguid, and the transport's maxMsgSize (§6.4).
+/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024, 6: [2, 1]} in canonical
+/// order: the required versions and aaguid, the transport's maxMsgSize and the PIN/UV auth
+/// protocols, two first (§6.4).
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA3, 0x01, 0x80, 0x03, 0x50];
+    let mut expected = vec![0x00, 0xA4, 0x01, 0x80, 0x03, 0x50];
     expected.extend_from_slice(&AAGUID);
-    expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00]);
+    expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00, 0x06, 0x82, 0x02, 0x01]);
     assert_eq!(response, expected);
     assert_eq!(validate(&response[1..]), Ok(()), "canonical CBOR");
 }
@@ -139,7 +200,7 @@ fn an_empty_request_is_invalid_length() {
 #[test]
 fn unimplemented_commands_are_invalid_command() {
     for code in [
-        0x01, 0x02, 0x03, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
+        0x01, 0x02, 0x03, 0x05, 0x07, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
     ] {
         assert_eq!(process(&[code, 0xA0]), [0x01], "command {code:#04x}");
     }
@@ -148,7 +209,7 @@ fn unimplemented_commands_are_invalid_command() {
 /// A response that does not fit is CTAP1_ERR_OTHER, and an empty buffer gets nothing.
 #[test]
 fn a_response_that_does_not_fit_is_other() {
-    let mut authenticator = Authenticator::new(settings());
+    let mut authenticator = authenticator();
     let mut ui = Scripted::new(Answer::Confirmed);
     let mut small = [0u8; 8];
     assert_eq!(authenticator.process(&[0x04], &mut ui, &mut small), 1);

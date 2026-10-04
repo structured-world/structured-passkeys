@@ -12,21 +12,24 @@ publish = false
 zeroize = { version = "1.9.0", default-features = false }
 # Software implementation of the crypto platform for host tests and fuzzing (`soft`). `zeroize`
 # wipes the AES key schedule, the HMAC key state and hash states over secrets on drop; p256
-# signing keys always zeroize.
+# signing keys always zeroize. `aes` is the block cipher AES-GCM already uses, for AES-CBC.
+aes = { version = "0.9.3", default-features = false, features = ["zeroize"], optional = true }
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "zeroize"], optional = true }
 hmac = { version = "0.13.0", default-features = false, features = ["zeroize"], optional = true }
-p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "arithmetic"], optional = true }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "ecdh", "arithmetic"], optional = true }
 sha2 = { version = "0.11.0", default-features = false, features = ["zeroize"], optional = true }
 
 [dev-dependencies]
 structured-passkeys-ctap = { path = ".", features = ["soft"] }
+# The platform side of the PIN/UV auth protocols in tests, computed apart from the code under test.
+hkdf = { version = "0.13.0", default-features = false }
 
 [features]
 default = ["std"]
 # Host users; the device build uses `--no-default-features`.
 std = []
 # The software `Crypto` of `soft`, for host tests and fuzzing; never in the device build.
-soft = ["dep:aes-gcm", "dep:hmac", "dep:p256", "dep:sha2"]
+soft = ["dep:aes", "dep:aes-gcm", "dep:hmac", "dep:p256", "dep:sha2"]
 
 [lints]
 workspace = true

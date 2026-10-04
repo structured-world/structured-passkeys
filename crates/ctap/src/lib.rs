@@ -7,8 +7,9 @@
 //! - [`cbor`]: the CTAP2 canonical CBOR encoding.
 //! - [`ctap2`]: CTAP2 command dispatch, status codes and authenticatorGetInfo.
 //! - [`crypto`]: the cryptographic platform the device implements, and HKDF on top of it.
+//! - [`pin`]: the PIN/UV auth protocols and the pinUvAuthToken state.
 //! - [`storage`]: the NVM regions the device implements, and the consistent state on top of them.
-//! - [`ui`]: the screens a ceremony waits on.
+//! - [`ui`]: the screens and the clock a ceremony waits on.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -21,6 +22,7 @@ pub mod crypto;
 pub mod ctap2;
 pub mod ctaphid;
 pub mod keys;
+pub mod pin;
 #[cfg(feature = "soft")]
 pub mod soft;
 pub mod storage;

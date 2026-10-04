@@ -35,3 +35,10 @@ path = "fuzz_targets/credential_id.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ctap2"
+path = "fuzz_targets/ctap2.rs"
+test = false
+doc = false
+bench = false
