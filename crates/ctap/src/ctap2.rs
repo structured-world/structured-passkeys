@@ -339,6 +339,14 @@ pub const NFC_PRESENCE_MS: u64 = 120_000;
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
 /// material, which exists once and is wiped when the request is dropped.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(
+    target_pointer_width = "32",
+    expect(
+        clippy::large_enum_variant,
+        reason = "a command is moved once, from parsing to execution; boxing it would put every \
+                  request on the device's 8 KiB heap instead"
+    )
+)]
 pub enum Command {
     /// authenticatorMakeCredential (§6.1).
     MakeCredential(MakeCredentialRequest),
