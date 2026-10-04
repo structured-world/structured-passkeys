@@ -73,8 +73,16 @@ pub trait Crypto {
     /// Fills `out` from the true random number generator.
     fn random(&mut self, out: &mut [u8]);
 
-    /// SHA-256 of the concatenation of `parts`.
-    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN];
+    /// SHA-256 of the concatenation of `parts`, written to `out`. A digest of secrets (a PIN, an
+    /// ECDH output) goes straight into the caller's [`Zeroizing`] storage, leaving no copy behind.
+    fn sha256_into(&self, parts: &[&[u8]], out: &mut [u8; KEY_LEN]);
+
+    /// SHA-256 of the concatenation of `parts`, for public input such as an RP ID or signed data.
+    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN] {
+        let mut digest = [0u8; KEY_LEN];
+        self.sha256_into(parts, &mut digest);
+        digest
+    }
 
     /// HMAC-SHA-256 under `key` of the concatenation of `parts` (RFC 2104).
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]>;

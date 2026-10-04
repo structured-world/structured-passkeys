@@ -77,8 +77,8 @@ impl Crypto for RejectFirstCounter {
     fn random(&mut self, out: &mut [u8]) {
         self.0.random(out);
     }
-    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN] {
-        self.0.sha256(parts)
+    fn sha256_into(&self, parts: &[&[u8]], out: &mut [u8; KEY_LEN]) {
+        self.0.sha256_into(parts, out);
     }
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {
         if parts == [&b"es256"[..], &[0u8][..], &[1u8][..]] {

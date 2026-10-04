@@ -59,7 +59,8 @@ impl Crypto for SoftCrypto {
     fn random(&mut self, out: &mut [u8]) {
         for chunk in out.chunks_mut(KEY_LEN) {
             // The block may become secret material (credential seeds, nonces).
-            let block = Zeroizing::new(self.sha256(&[&self.seed, &self.counter.to_be_bytes()]));
+            let mut block = Zeroizing::new([0u8; KEY_LEN]);
+            self.sha256_into(&[&self.seed, &self.counter.to_be_bytes()], &mut block);
             chunk.copy_from_slice(&block[..chunk.len()]);
             self.counter = self
                 .counter
@@ -68,12 +69,12 @@ impl Crypto for SoftCrypto {
         }
     }
 
-    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN] {
+    fn sha256_into(&self, parts: &[&[u8]], out: &mut [u8; KEY_LEN]) {
         let mut hash = Sha256::new();
         for part in parts {
             hash.update(part);
         }
-        hash.finalize().into()
+        Digest::finalize_into(hash, out.into());
     }
 
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {

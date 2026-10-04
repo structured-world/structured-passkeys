@@ -210,7 +210,8 @@ impl SharedSecret {
     pub fn new<C: Crypto + ?Sized>(crypto: &C, protocol: Protocol, z: &[u8; KEY_LEN]) -> Self {
         match protocol {
             Protocol::One => {
-                let key = Zeroizing::new(crypto.sha256(&[z]));
+                let mut key = Zeroizing::new([0u8; KEY_LEN]);
+                crypto.sha256_into(&[z], &mut key);
                 Self {
                     protocol,
                     hmac_key: key.clone(),

@@ -269,10 +269,10 @@ fn oversized_mac<C: Crypto>(
     ))
 }
 
-/// The status for a newPinEnc too long for any padded PIN, once its MAC verified: a ciphertext
-/// `decrypt` refuses is CTAP2_ERR_PIN_AUTH_INVALID, any other decrypts to more than 64 bytes,
-/// CTAP1_ERR_INVALID_PARAMETER (§6.5.5.5 steps 6 and 7).
-const fn oversized_new_pin(protocol: Protocol, len: usize) -> StatusCode {
+/// The status for a newPinEnc that does not decrypt to a padded PIN, once its MAC verified: a
+/// length `decrypt` refuses is CTAP2_ERR_PIN_AUTH_INVALID, any other decrypts to other than 64
+/// bytes, CTAP1_ERR_INVALID_PARAMETER (§6.5.5.5 steps 6 and 7).
+const fn new_pin_length_error(protocol: Protocol, len: usize) -> StatusCode {
     if protocol.decrypts(len) {
         StatusCode::InvalidParameter
     } else {
@@ -476,7 +476,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             if request.oversized_mac != Some(true) {
                 return Err(StatusCode::PinAuthInvalid);
             }
-            return Err(oversized_new_pin(protocol, new_pin_enc.received_len()));
+            return Err(new_pin_length_error(protocol, new_pin_enc.received_len()));
         };
         if !secret.verify(
             &self.crypto,
@@ -519,7 +519,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // 5.8) like any other wrong PIN.
         self.check_pin_hash(&secret, pin_hash_enc.get().unwrap_or_default())?;
         let Some(new_pin_enc) = new_pin_enc.get() else {
-            return Err(oversized_new_pin(protocol, new_pin_enc.received_len()));
+            return Err(new_pin_length_error(protocol, new_pin_enc.received_len()));
         };
         let verifier = self.new_pin_verifier(&secret, new_pin_enc)?;
         let mut config = self.store.config();
@@ -720,18 +720,13 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let mut padded = Zeroizing::new([0u8; PADDED_PIN_LEN]);
         let length = secret
             .decrypt(&self.crypto, new_pin_enc, &mut padded[..])
-            .map_err(|_| match new_pin_enc.len() {
-                // Too long to be a padded PIN at all: step 5.7's length error.
-                len if len > secret.protocol().ciphertext_len(PADDED_PIN_LEN) => {
-                    StatusCode::InvalidParameter
-                }
-                _ => StatusCode::PinAuthInvalid,
-            })?;
+            .map_err(|_| new_pin_length_error(secret.protocol(), new_pin_enc.len()))?;
         if length != PADDED_PIN_LEN {
             return Err(StatusCode::InvalidParameter);
         }
         let pin = new_pin(&padded).ok_or(StatusCode::PinPolicyViolation)?;
-        let hash = Zeroizing::new(self.crypto.sha256(&[pin]));
+        let mut hash = Zeroizing::new([0u8; KEY_LEN]);
+        self.crypto.sha256_into(&[pin], &mut hash);
         let mut verifier = [0u8; PIN_VERIFIER_LEN];
         verifier.copy_from_slice(&hash[..PIN_VERIFIER_LEN]);
         let stored = PinVerifier::new(verifier);
