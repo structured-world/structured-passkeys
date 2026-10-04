@@ -71,8 +71,9 @@ application runs inside a Ledger wallet, where the operating system owns all thr
 - Each test states what it checks. Expected values come from specification vectors or an independent
   computation, never from the code under test.
 - A bug fix starts with a test that fails without the fix.
-- A fuzz harness asserts the protocol's MUST and MUST NOT rules, not only the absence of panics. Its
-  minimized corpus is committed and replayed by the test suite on stable.
+- A fuzz harness asserts the protocol's MUST and MUST NOT rules, not only the absence of panics. The
+  gate runs every target for a while (`scripts/fuzz.sh`); its corpus is generated there and never
+  committed. An input that breaks a rule becomes a named regression test, not a corpus file.
 - `cargo nextest run` for Rust tests; `cargo test --doc` for doc tests.
 
 ## Scripts and CI

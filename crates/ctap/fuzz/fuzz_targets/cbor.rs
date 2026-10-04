@@ -4,7 +4,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../tests/support/cbor_harness.rs"]
+#[path = "../harness/cbor.rs"]
 mod harness;
 
 fuzz_target!(|data: &[u8]| harness::run(data));
