@@ -2,8 +2,8 @@
 //! written out byte by byte, never produced by the code under test.
 
 use super::{
-    AAGUID, Authenticator, Command, CommandCode, MaxMsgSize, RESET_WINDOW_MS, Settings, StatusCode,
-    TooSmall, UnknownCommand,
+    AAGUID, Authenticator, Command, CommandCode, Link, MaxMsgSize, NFC_PRESENCE_MS,
+    RESET_WINDOW_MS, Settings, StatusCode, TooSmall, Transports, UnknownCommand,
 };
 use crate::cbor::{self, validate};
 use crate::crypto::KEY_LEN;
@@ -14,16 +14,22 @@ use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
 
-fn settings() -> Settings {
+fn settings(transports: Transports) -> Settings {
     Settings {
         max_msg_size: MaxMsgSize::try_from(1024).expect("at least 1024"),
+        transports,
     }
 }
 
-/// An authenticator on fresh NVM with the software platform.
+/// An authenticator on fresh NVM with the software platform, offering USB.
 pub(super) fn authenticator() -> TestAuthenticator {
+    authenticator_with(Transports::Usb)
+}
+
+/// An authenticator on fresh NVM with the software platform, offering `transports`.
+fn authenticator_with(transports: Transports) -> TestAuthenticator {
     Authenticator::new(
-        settings(),
+        settings(transports),
         SoftCrypto::new([0x11; KEY_LEN], [0x22; KEY_LEN]),
         Store::open(MemoryStorage::new(4, 4)),
     )
@@ -107,7 +113,7 @@ impl Ui for Scripted {
 fn process_with(request: &[u8], ui: &mut Scripted) -> Vec<u8> {
     let mut authenticator = authenticator();
     let mut response = [0u8; 256];
-    let length = authenticator.process(request, ui, &mut response);
+    let length = authenticator.process(request, Link::Usb, ui, &mut response);
     response[..length].to_vec()
 }
 
@@ -141,6 +147,61 @@ fn selection_answers_with_the_users_answer() {
     assert_eq!(USER_ACTION_TIMEOUT_MS, 30_000);
 }
 
+/// Over NFC the tap is user presence (CTAP 2.2 Terminology, "Evidence of user interaction"): an
+/// authenticatorSelection within two minutes of it answers CTAP2_OK with no screen, and does not
+/// use the tap up. Without a tap, past the limit or after the platform ended CTAP, the device asks
+/// on its screen as over USB; over USB a tap never counts.
+#[test]
+fn selection_over_nfc_takes_the_tap() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    let mut ui = Scripted::new(Answer::Rejected);
+    let mut response = [0u8; 8];
+    let mut select = |authenticator: &mut TestAuthenticator, link, ui: &mut Scripted| {
+        let length = authenticator.process(&[0x0B], link, ui, &mut response);
+        response[..length].to_vec()
+    };
+    assert_eq!(
+        select(&mut authenticator, Link::Nfc, &mut ui),
+        [0x27],
+        "no tap yet"
+    );
+    assert_eq!(ui.asked.len(), 1);
+
+    ui.asked.clear();
+    ui.now_ms = 5_000;
+    authenticator.nfc_tap(ui.now_ms);
+    assert_eq!(select(&mut authenticator, Link::Nfc, &mut ui), [0x00]);
+    ui.now_ms += NFC_PRESENCE_MS;
+    assert_eq!(
+        select(&mut authenticator, Link::Nfc, &mut ui),
+        [0x00],
+        "not used up"
+    );
+    assert_eq!(ui.asked, [], "no screen while the tap counts");
+    assert_eq!(
+        select(&mut authenticator, Link::Usb, &mut ui),
+        [0x27],
+        "not over USB"
+    );
+    assert_eq!(ui.asked.len(), 1);
+
+    ui.asked.clear();
+    ui.now_ms += 1;
+    assert_eq!(
+        select(&mut authenticator, Link::Nfc, &mut ui),
+        [0x27],
+        "past two minutes"
+    );
+    authenticator.nfc_tap(ui.now_ms);
+    authenticator.nfc_ended();
+    assert_eq!(
+        select(&mut authenticator, Link::Nfc, &mut ui),
+        [0x27],
+        "deselected"
+    );
+    assert_eq!(ui.asked.len(), 2);
+}
+
 /// authenticatorSelection has no parameters: bytes after the command are an invalid length, and
 /// no screen is shown for it.
 #[test]
@@ -163,17 +224,34 @@ fn parsing_names_the_command() {
     );
 }
 
-/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024, 6: [2, 1]} in canonical
-/// order: the required versions and aaguid, the transport's maxMsgSize and the PIN/UV auth
-/// protocols, two first (§6.4).
+/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024, 6: [2, 1], 9: ["usb"]} in
+/// canonical order: the required versions and aaguid, maxMsgSize, the PIN/UV auth protocols,
+/// two first, and the transports (§6.4).
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA4, 0x01, 0x80, 0x03, 0x50];
+    let mut expected = vec![0x00, 0xA5, 0x01, 0x80, 0x03, 0x50];
     expected.extend_from_slice(&AAGUID);
     expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00, 0x06, 0x82, 0x02, 0x01]);
+    expected.extend_from_slice(&[0x09, 0x81, 0x63, b'u', b's', b'b']);
     assert_eq!(response, expected);
     assert_eq!(validate(&response[1..]), Ok(()), "canonical CBOR");
+}
+
+/// A device with NFC lists both transports, ["nfc", "usb"], whichever one getInfo arrives on:
+/// the AuthenticatorTransport names of WebAuthn L3 §5.8.4.
+#[test]
+fn get_info_lists_nfc_on_a_device_that_has_it() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    for link in [Link::Usb, Link::Nfc] {
+        let mut response = [0u8; 256];
+        let length = authenticator.process(&[0x04], link, &mut ui, &mut response);
+        let tail = [0x09, 0x82, 0x63, b'n', b'f', b'c', 0x63, b'u', b's', b'b'];
+        assert_eq!(response[1], 0xA5, "{link:?}");
+        assert!(response[..length].ends_with(&tail), "{link:?}");
+        assert_eq!(validate(&response[1..length]), Ok(()), "{link:?}");
+    }
 }
 
 /// The AAGUID is the fixed UUID 8f920f83-9da2-4861-94d7-7f3c9945d532 in network order.
@@ -224,7 +302,7 @@ fn reset_asks_the_user_and_erases_everything() {
         let mut authenticator = with_pin();
         let mut ui = Scripted::new(answer);
         let mut response = [0u8; 8];
-        let length = authenticator.process(&[0x07], &mut ui, &mut response);
+        let length = authenticator.process(&[0x07], Link::Usb, &mut ui, &mut response);
         assert_eq!(response[..length], [status], "{answer:?}");
         assert!(authenticator.store.config().pin.is_some(), "{answer:?}");
         assert_eq!(authenticator.store.config().reset_id, 0, "{answer:?}");
@@ -235,7 +313,7 @@ fn reset_asks_the_user_and_erases_everything() {
     ui.now_ms = RESET_WINDOW_MS;
     let token = *authenticator.client_pin.token(Protocol::Two);
     let mut response = [0u8; 8];
-    let length = authenticator.process(&[0x07], &mut ui, &mut response);
+    let length = authenticator.process(&[0x07], Link::Usb, &mut ui, &mut response);
     assert_eq!(response[..length], [0x00]);
     assert_eq!(ui.asked, [(Asked::Reset, USER_ACTION_TIMEOUT_MS)]);
     let config = authenticator.store.config();
@@ -262,7 +340,7 @@ fn reset_after_the_window_is_not_allowed() {
     let mut ui = Scripted::new(Answer::Confirmed);
     ui.now_ms = RESET_WINDOW_MS + 1;
     let mut response = [0u8; 8];
-    let length = authenticator.process(&[0x07], &mut ui, &mut response);
+    let length = authenticator.process(&[0x07], Link::Usb, &mut ui, &mut response);
     assert_eq!(response[..length], [0x30]);
     assert_eq!(ui.asked, []);
     assert!(authenticator.store.config().pin.is_some());
@@ -289,9 +367,15 @@ fn a_response_that_does_not_fit_is_other() {
     let mut authenticator = authenticator();
     let mut ui = Scripted::new(Answer::Confirmed);
     let mut small = [0u8; 8];
-    assert_eq!(authenticator.process(&[0x04], &mut ui, &mut small), 1);
+    assert_eq!(
+        authenticator.process(&[0x04], Link::Usb, &mut ui, &mut small),
+        1
+    );
     assert_eq!(small[0], 0x7F);
-    assert_eq!(authenticator.process(&[0x04], &mut ui, &mut []), 0);
+    assert_eq!(
+        authenticator.process(&[0x04], Link::Usb, &mut ui, &mut []),
+        0
+    );
 }
 
 /// §8: an authenticator accepts messages of at least 1024 bytes, so no smaller maxMsgSize can

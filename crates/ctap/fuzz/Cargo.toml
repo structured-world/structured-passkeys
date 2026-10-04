@@ -42,3 +42,10 @@ path = "fuzz_targets/ctap2.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nfc"
+path = "fuzz_targets/nfc.rs"
+test = false
+doc = false
+bench = false

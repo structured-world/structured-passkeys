@@ -33,6 +33,7 @@ pinned() {
 }
 pinned "version: 0.11.0" shellcheck --version
 pinned "1.7.12" actionlint -version
+pinned "cargo-fuzz 0.13.2" cargo fuzz --version
 
 run scripts/check-links.sh
 run shellcheck scripts/*.sh scripts/linux/*.sh
@@ -43,11 +44,12 @@ run cargo clippy "${host[@]}" --all-targets -- -D warnings
 run cargo nextest run "${host[@]}"
 run cargo test --doc "${host[@]}"
 run cargo build --locked -p structured-passkeys-ctap --target thumbv7em-none-eabihf --no-default-features
-# Fuzz targets are their own workspace and run with nightly; here they only have to compile and
-# lint cleanly, while their corpus is replayed by the tests above.
+# Fuzz targets are their own workspace: they lint on stable, then each runs for a while on
+# nightly, growing a corpus that is generated, never committed (scripts/fuzz.sh).
 fuzz=(--manifest-path crates/ctap/fuzz/Cargo.toml)
 run cargo fmt "${fuzz[@]}" --check
 run cargo clippy --locked "${fuzz[@]}" --all-targets -- -D warnings
+run scripts/fuzz.sh
 
 # Every device build then runs in Speculos (scripts/speculos-check.sh).
 case "$(uname -s)" in

@@ -4,6 +4,7 @@
 //! feature (on by default) is for host users such as tests and tools.
 //!
 //! - [`ctaphid`]: the USB HID transport (framing, reassembly, channels).
+//! - [`nfc`]: the NFC transport (ISO/IEC 7816-4 applet, chaining, status updates).
 //! - [`cbor`]: the CTAP2 canonical CBOR encoding.
 //! - [`ctap2`]: CTAP2 command dispatch, status codes and authenticatorGetInfo.
 //! - [`crypto`]: the cryptographic platform the device implements, and HKDF on top of it.
@@ -22,6 +23,7 @@ pub mod crypto;
 pub mod ctap2;
 pub mod ctaphid;
 pub mod keys;
+pub mod nfc;
 pub mod pin;
 #[cfg(feature = "soft")]
 pub mod soft;

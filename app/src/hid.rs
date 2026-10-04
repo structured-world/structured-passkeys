@@ -15,11 +15,12 @@ use core::cell::{Cell, RefCell, UnsafeCell};
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 
-use structured_passkeys_ctap::ctap2::{MaxMsgSize, Settings};
 use structured_passkeys_ctap::ctaphid::{
-    DeviceInfo, Event, KeepaliveStatus, MAX_MESSAGE_SIZE, REPORT_SIZE, Report, Transport,
+    DeviceInfo, Event, KeepaliveStatus, REPORT_SIZE, Report, Transport,
 };
 use zeroize::Zeroize;
+
+use crate::MESSAGE_SIZE;
 
 /// Interval of the OS ticker events the main loop forwards to [`tick`]; the transport clock
 /// advances by this much per tick. The ticker is the device's only clock: keepalives, which
@@ -229,21 +230,11 @@ const fn version_part(text: &str) -> u8 {
     value as u8
 }
 
-/// The request buffer, also reported as `maxMsgSize`: the largest message the framing allows,
-/// so a PING of any length round-trips.
-const MESSAGE_SIZE: u16 = MAX_MESSAGE_SIZE as u16;
-
-/// The device settings getInfo reports.
-pub const SETTINGS: Settings = Settings {
-    max_msg_size: match MaxMsgSize::new(MESSAGE_SIZE) {
-        Ok(size) => size,
-        Err(_) => panic!("the framing maximum is above the 1024-byte minimum"),
-    },
-};
-
 /// Everything the class keeps between callbacks.
 struct Hid {
-    transport: Transport<MAX_MESSAGE_SIZE, &'static mut [u8; MAX_MESSAGE_SIZE]>,
+    /// Requests of up to [`MESSAGE_SIZE`] bytes; a longer one is refused with ERR_INVALID_LEN at
+    /// its initialization packet, and a PING echoes at most that much.
+    transport: Transport<MESSAGE_SIZE, &'static mut [u8; MESSAGE_SIZE]>,
     /// The transport handed out a request the main loop has not taken yet.
     pending: bool,
     /// Channel of the request the main loop is running.
@@ -283,7 +274,7 @@ impl<const N: usize> Buffer<N> {
     }
 }
 
-static MESSAGE: Buffer<MAX_MESSAGE_SIZE> = Buffer::new();
+static MESSAGE: Buffer<MESSAGE_SIZE> = Buffer::new();
 
 /// The class state, uninitialized until [`start`]. The application is single-threaded and the
 /// stack calls the class only from `os_io_rx_evt`, which nothing here calls while holding the
@@ -420,6 +411,27 @@ pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
         hid.transport.request().map(parse)
     })
     .flatten()
+}
+
+/// Refuses the request the transport handed out while a request from another transport runs: it
+/// is answered at once with CTAP1_ERR_CHANNEL_BUSY (CTAP 2.2 §8.2: "Client SHOULD retry the
+/// request after a short delay"), as the NFC applet answers in the other direction, rather than
+/// run after the other one with its CANCEL unheard meanwhile.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+pub fn refuse_request() {
+    with_hid(|hid| {
+        if core::mem::take(&mut hid.pending)
+            && hid
+                .transport
+                .respond(
+                    &[structured_passkeys_ctap::ctap2::StatusCode::ChannelBusy as u8],
+                    hid.now_ms,
+                )
+                .is_ok()
+        {
+            hid.pump();
+        }
+    });
 }
 
 impl Hid {

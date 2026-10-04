@@ -11,8 +11,9 @@
                               reports
 
 Checks: INIT allocates a channel and reports CTAPHID protocol 2 with CBOR and without MSG; PING
-echoes 1-byte and 7609-byte payloads (the largest CTAPHID message); getInfo parses with strict
-CBOR checks and reports the application AAGUID and a 7609-byte maxMsgSize.
+echoes 1-byte and 1024-byte payloads, and a 1025-byte one is ERR_INVALID_LEN (the message size of
+every transport); getInfo parses with strict CBOR checks and reports the application AAGUID, a
+1024-byte maxMsgSize and the transports of the model (nfc and usb on Stax, Flex and Nano Gen5).
 
 authenticatorSelection (CTAP 2.2 §6.9), a request waiting for the user: while it waits, keepalives
 with status UPNEEDED arrive about every 100 ms (§11.2.9.1.7); CTAPHID_CANCEL ends it with
@@ -68,8 +69,10 @@ LEDGER_VENDOR_ID = 0x2C97
 SPECULOS_APDU_PORT = 9999
 SPECULOS_API = "http://127.0.0.1:5000"
 AAGUID = bytes.fromhex("8f920f839da2486194d77f3c9945d532")
-MAX_MESSAGE = 7609
+MAX_MESSAGE = 1024
 REPORT = 64
+# The Speculos models without NFC.
+NANO_MODELS = ("nanosp", "nanox")
 # CTAPHID_KEEPALIVE (§11.2.9.2.1) and its status "user presence needed".
 KEEPALIVE = 0x80 | 0x3B
 STATUS_UPNEEDED = 2
@@ -245,7 +248,7 @@ class SpeculosUser:
     and reject choices."""
 
     def __init__(self, model: str):
-        self.nano = model in ("nanosp", "nanox")
+        self.nano = model in NANO_MODELS
 
     def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
         wanted = labels[0] if confirm else labels[1]
@@ -615,10 +618,18 @@ def main() -> None:
     for length in (1, MAX_MESSAGE):
         payload = os.urandom(length)
         check(device.ping(payload) == payload, f"PING echoes {length} bytes")
+    status = ctap_status(lambda: device.ping(os.urandom(MAX_MESSAGE + 1)))
+    check(
+        status == CtapError.ERR.INVALID_LENGTH,
+        f"PING of {MAX_MESSAGE + 1} bytes is ERR_INVALID_LEN ({status!r})",
+    )
 
     info = Ctap2(device).info
     check(bytes(info.aaguid) == AAGUID, f"getInfo: AAGUID {bytes(info.aaguid).hex()}")
     check(info.max_msg_size == MAX_MESSAGE, f"getInfo: maxMsgSize {info.max_msg_size}")
+    if args.model is not None:
+        transports = ["usb"] if args.model in NANO_MODELS else ["nfc", "usb"]
+        check(sorted(info.transports) == transports, f"getInfo: transports {info.transports}")
 
     # The screens the person answers come first, in the order refuse, allow, allow; the ones
     # left unanswered (cancel, timeout) last, so no answer is given to the wrong screen.
