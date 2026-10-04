@@ -23,6 +23,7 @@
 #     the cleanup, and a cleanup that cannot remove the containers keeps
 #     failing across a dropped connection;
 #   - a stop that carries another run's owner token touches nothing;
+#   - a run launched after its stop began exits without starting;
 #   - a stop that finds its run directory removed by a concurrent stop of the
 #     same run succeeds;
 #   - a process group whose only member is a zombie counts as stopped;
@@ -143,7 +144,10 @@ esac
 EOF
 # find: with FAKE_FIND_HOLD (a directory) it marks itself held there and waits
 # for a release file before running, so a test can finish a second stop inside
-# a first one's removal; without it, the real find.
+# a first one's removal; without it, the real find, wherever this host's PATH
+# has it.
+FAKE_REAL_FIND=$(command -v find)
+export FAKE_REAL_FIND
 cat >"$tmp/bin/find" <<'EOF'
 #!/usr/bin/env bash
 if [[ -n "${FAKE_FIND_HOLD:-}" ]]; then
@@ -152,7 +156,7 @@ if [[ -n "${FAKE_FIND_HOLD:-}" ]]; then
         sleep 0.1
     done
 fi
-exec /usr/bin/find "$@"
+exec "$FAKE_REAL_FIND" "$@"
 EOF
 chmod +x "$tmp/bin/ssh" "$tmp/bin/docker" "$tmp/bin/find"
 export PATH="$tmp/bin:$PATH"
@@ -341,16 +345,42 @@ cp "$repo/scripts/linux/remote.sh" "$foreign/remote.sh"
 echo later-run >"$foreign/owner"
 # A stand-in for the later run: its command line names it as remote.sh run does.
 setsid bash -c 'sleep 30; : '"$foreign/remote.sh run $foreign "'x' >/dev/null 2>&1 &
+launched=$!
 # Killed by this test below: no job report for it.
 disown
-sleep 0.5
-stand_in=$(pgrep -f "$foreign/remote.sh run $foreign " | head -n 1)
-echo "$stand_in" >"$foreign/pid"
-bash "$foreign/remote.sh" stop "$foreign" earlier-run || true
-kill -0 "$stand_in" 2>/dev/null || fail "foreign: a stop with another token stopped the run"
-[[ -f "$foreign/owner" ]] || fail "foreign: a stop with another token removed the run directory"
-kill -KILL -- "-$stand_in" 2>/dev/null || true
+stand_in=""
+# Sets `stand_in` once the stand-in runs under its command line.
+find_stand_in() {
+    stand_in=$(pgrep -f "$foreign/remote.sh run $foreign " | head -n 1) || return 1
+    [[ -n "$stand_in" ]]
+}
+if wait_for 10 find_stand_in; then
+    echo "$stand_in" >"$foreign/pid"
+    bash "$foreign/remote.sh" stop "$foreign" earlier-run || true
+    kill -0 "$stand_in" 2>/dev/null || fail "foreign: a stop with another token stopped the run"
+    [[ -f "$foreign/owner" ]] || fail "foreign: a stop with another token removed the run directory"
+    kill -KILL -- "-$stand_in" 2>/dev/null || true
+else
+    fail "foreign: the stand-in never started"
+    kill -KILL -- "-$launched" 2>/dev/null || kill -KILL "$launched" 2>/dev/null || true
+fi
 rm -rf "$foreign"
+
+# A stop that meets a launch which has not taken the process id file yet: the
+# stop takes it first, so the late run exits at once instead of starting after
+# the stop declared it gone. The containers stay unknown here, so the stop keeps
+# the directory and the late run has somewhere to start.
+late="/tmp/structured-passkeys-check-test-late-$$"
+mkdir -m 700 "$late"
+cp "$repo/scripts/linux/remote.sh" "$late/remote.sh"
+echo this-run >"$late/owner"
+FAKE_DOCKER_PS_FAIL=1 bash "$late/remote.sh" stop "$late" this-run 2>/dev/null &&
+    fail "late: a stop with its containers unknown passed"
+bash "$late/remote.sh" run "$late" ref device >/dev/null 2>&1 || true
+if [[ -e "$late/src" || -e "$late/status" ]]; then
+    fail "late: a run launched after the stop started"
+fi
+rm -rf "$late"
 
 # Two stops of one run, as a retry after a dropped connection leaves the first
 # still going: the one that finds the directory already removed by the other

@@ -18,7 +18,8 @@
 #
 # `state` prints `starting` (not launched yet), `running`, `done <status>` or
 # `lost` (ended without a status). `stop` stops a live run and its containers,
-# then removes <run dir>; it fails when anything could not be removed. It acts
+# then removes <run dir>; a run launched after the stop began does not start;
+# the stop fails when anything could not be removed. It acts
 # only while <run dir>/owner holds the token it was given, checked again before
 # every step that destroys something: a stop delayed past its retry may meet a
 # later run under the same name, which it leaves alone.
@@ -98,6 +99,14 @@ case "$mode" in
         }
         owned || exit 0
         status=0
+        # A launch may be under way without its process id file yet. The stop
+        # takes that file first, the way a run takes it (a hard link fails on an
+        # existing name), so a run arriving later exits at once instead of
+        # starting after this stop found nothing running. The file it leaves
+        # names no process.
+        echo stopped >"$dir/pid.stop.$$" &&
+            ln "$dir/pid.stop.$$" "$dir/pid" 2>/dev/null
+        rm -f "$dir/pid.stop.$$"
         if run_running; then
             # The run leads its process group (setsid), which its docker clients are in.
             group=$(cat "$dir/pid")

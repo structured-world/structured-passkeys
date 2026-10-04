@@ -122,6 +122,11 @@ cleanup() {
         # Only a directory this run owns goes; remote.sh runs with bash explicitly,
         # since the account's login shell may be any POSIX shell.
         # The staging directory carries this run's token and holds nothing else.
+        # A setup attempt cut off on this side may still run on the host after
+        # this and rename a new staging directory into place; what it leaves is
+        # an empty directory holding only the token, no snapshot or run, which
+        # the host's /tmp ageing removes. Fencing it would need a marker that
+        # outlives the directory, itself a leftover.
         if ! remote "rm -rf $staging; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
             elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir $owner;
             else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
