@@ -8,7 +8,11 @@
     <uses-permission android:name="android.permission.NFC" />
     <uses-feature android:name="android.hardware.nfc" android:required="true" />
 
-    <application android:label="Passkeys NFC probe">
+    <!-- No network and no data of its own: nothing to send in clear text or to back up. -->
+    <application
+        android:label="Passkeys NFC probe"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
