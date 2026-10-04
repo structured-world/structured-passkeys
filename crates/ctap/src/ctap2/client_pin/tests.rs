@@ -26,6 +26,7 @@ const PIN_NOT_SET: u8 = 0x35;
 const PIN_POLICY_VIOLATION: u8 = 0x37;
 const UV_BLOCKED: u8 = 0x3C;
 const INVALID_SUBCOMMAND: u8 = 0x3E;
+const UV_INVALID: u8 = 0x3F;
 const UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 /// A member value of a request.
@@ -579,6 +580,82 @@ fn set_pin_refusals() {
     assert!(authenticator.store.config().pin.is_none());
 }
 
+/// Members longer than any ciphertext of a padded PIN or PIN hash are authenticated first, in the
+/// order of §6.5.5.5 and §6.5.5.6: a wrong MAC is PIN_AUTH_INVALID whatever the length. With the
+/// right MAC, setPIN decrypts (an error is PIN_AUTH_INVALID) and finds no 64-byte padded PIN
+/// (INVALID_PARAMETER); changePIN spends a try on a PIN hash that cannot match (PIN_INVALID).
+#[test]
+fn oversized_members_are_authenticated_first() {
+    let mut authenticator = authenticator();
+    let session = Session::start(&mut authenticator, Protocol::Two);
+    // 16-byte IV and 80 bytes of ciphertext: longer than a padded PIN's 64.
+    let long = session.encrypt(&[0x31; 80]);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut set = |new_pin_enc: &[u8], param: Vec<u8>| {
+        run(
+            &mut authenticator,
+            &mut ui,
+            &request(&[
+                (0x01, Value::Uint(2)),
+                (0x02, Value::Uint(0x03)),
+                (0x03, session.key_agreement()),
+                (0x04, Value::Bytes(param)),
+                (0x05, Value::Bytes(new_pin_enc.to_vec())),
+            ]),
+        )
+    };
+    assert_eq!(
+        set(&long, session.authenticate(&[b"other"])),
+        [PIN_AUTH_INVALID]
+    );
+    assert_eq!(
+        set(&long, session.authenticate(&[&long])),
+        [INVALID_PARAMETER]
+    );
+    let misaligned = &long[..long.len() - 3];
+    assert_eq!(
+        set(misaligned, session.authenticate(&[misaligned])),
+        [PIN_AUTH_INVALID]
+    );
+    assert!(authenticator.store.config().pin.is_none());
+
+    assert_eq!(set_pin(&mut authenticator, Protocol::Two, b"1234"), OK);
+    let session = Session::start(&mut authenticator, Protocol::Two);
+    // A 32-byte plaintext: longer than the 16-byte PIN hash.
+    let pin_hash_enc = session.encrypt(&[0x42; 32]);
+    let new_pin_enc = session.encrypt(&padded(b"98765"));
+    let mut change = |authenticator: &mut TestAuthenticator, param: Vec<u8>| {
+        run(
+            authenticator,
+            &mut ui,
+            &request(&[
+                (0x01, Value::Uint(2)),
+                (0x02, Value::Uint(0x04)),
+                (0x03, session.key_agreement()),
+                (0x04, Value::Bytes(param)),
+                (0x05, Value::Bytes(new_pin_enc.clone())),
+                (0x06, Value::Bytes(pin_hash_enc.clone())),
+            ]),
+        )
+    };
+    assert_eq!(
+        change(&mut authenticator, session.authenticate(&[b"other"])),
+        [PIN_AUTH_INVALID]
+    );
+    assert_eq!(
+        retries(&mut authenticator),
+        (8, false),
+        "no try for a wrong MAC"
+    );
+    let param = session.authenticate(&[&new_pin_enc, &pin_hash_enc]);
+    assert_eq!(change(&mut authenticator, param), [PIN_INVALID]);
+    assert_eq!(
+        retries(&mut authenticator),
+        (7, false),
+        "a try for a PIN hash that cannot match"
+    );
+}
+
 /// A wrong PIN spends a try (§6.5.5.7.1: decremented before the check) and is PIN_INVALID; the
 /// key agreement key is regenerated. The third mismatch in a row is PIN_AUTH_BLOCKED, and from
 /// then on PIN entries are refused without spending a try until a power cycle; getPINRetries
@@ -1016,21 +1093,22 @@ fn built_in_uv_gives_a_token_with_presence() {
 }
 
 /// Built-in UV failures (§6.5.5.7.3 step 11): a wrong entry leaves no attempt, so it is
-/// UV_BLOCKED; a keypad not offered is UV_BLOCKED before any screen; backing out is
-/// OPERATION_DENIED, a cancel KEEPALIVE_CANCEL, no entry USER_ACTION_TIMEOUT. No token results.
+/// UV_BLOCKED; a keypad not offered is UV_BLOCKED before any screen; backing out of the keypad
+/// is a failed verification with the attempt still offered, UV_INVALID; a cancel
+/// KEEPALIVE_CANCEL, no entry USER_ACTION_TIMEOUT. No token results.
 #[test]
 fn built_in_uv_failures() {
     for (verification, status) in [
         (Verification::Invalid, UV_BLOCKED),
         (Verification::Blocked, UV_BLOCKED),
-        (Verification::Rejected, OPERATION_DENIED),
+        (Verification::Rejected, UV_INVALID),
         (Verification::Cancelled, KEEPALIVE_CANCEL),
         (Verification::TimedOut, USER_ACTION_TIMEOUT),
     ] {
         let mut authenticator = authenticator();
         let mut ui = Scripted::new(Answer::Confirmed);
         ui.verification = verification;
-        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), None);
+        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), Some("example.com"));
         assert_eq!(response, [status], "{verification:?}");
         assert_eq!(
             ui.asked.last(),
@@ -1049,14 +1127,14 @@ fn built_in_uv_failures() {
     ] {
         let mut authenticator = authenticator();
         let mut ui = Scripted::new(answer);
-        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), None);
+        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), Some("example.com"));
         assert_eq!(response, [status], "{answer:?}");
         assert_eq!(
             ui.asked,
             [(
                 Asked::Token {
                     permissions: 0x01,
-                    rp_id: None
+                    rp_id: Some("example.com".into())
                 },
                 USER_ACTION_TIMEOUT_MS
             )],
@@ -1068,9 +1146,42 @@ fn built_in_uv_failures() {
     let mut authenticator = authenticator();
     let mut ui = Scripted::new(Answer::Confirmed);
     ui.uv_retries = 0;
-    let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), None);
+    let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), Some("example.com"));
     assert_eq!(response, [UV_BLOCKED]);
     assert_eq!(ui.asked, [], "no keypad when no attempt is offered");
+}
+
+/// mc and ga need a permissions RP ID (CTAP 2.2 §6.5.5.7, the RP ID column "Required"): without
+/// one the request misses a mandatory parameter, before any screen and without spending a try.
+/// Only getPinToken's default permissions are bound by their first use.
+#[test]
+fn rp_scoped_permissions_need_an_rp_id() {
+    let mut authenticator = authenticator();
+    assert_eq!(set_pin(&mut authenticator, Protocol::Two, b"1234"), OK);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    for permissions in [0x01, 0x02, 0x03] {
+        let (response, _) = pin_token(
+            &mut authenticator,
+            &mut ui,
+            Protocol::Two,
+            b"1234",
+            Some(permissions),
+            None,
+        );
+        assert_eq!(
+            response,
+            [MISSING_PARAMETER],
+            "client PIN, {permissions:#x}"
+        );
+        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(permissions), None);
+        assert_eq!(
+            response,
+            [MISSING_PARAMETER],
+            "built-in UV, {permissions:#x}"
+        );
+    }
+    assert_eq!(ui.asked, []);
+    assert_eq!(retries(&mut authenticator), (8, false));
 }
 
 /// Built-in UV requires permissions (MISSING_PARAMETER), refuses 0 (INVALID_PARAMETER) and acfg

@@ -62,15 +62,13 @@ impl SubCommand {
     }
 }
 
-/// A byte string member copied out of the request, up to `N` bytes. A longer one keeps no bytes
-/// and is only known to be too long: no member this command takes is longer than its buffer for
-/// a well-formed request. The bytes can be PIN material, so they are wiped on drop and never
-/// copied implicitly.
+/// A byte string member copied out of the request, up to `N` bytes. A longer one keeps no bytes,
+/// only its length: no member this command takes is longer than its buffer for a well-formed
+/// request. The bytes can be PIN material, so they are wiped on drop and never copied implicitly.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Bytes<const N: usize> {
     bytes: [u8; N],
-    /// The length, or `None` for a value longer than `N`.
-    len: Option<usize>,
+    len: usize,
 }
 
 impl<const N: usize> Drop for Bytes<N> {
@@ -84,16 +82,23 @@ impl<const N: usize> ZeroizeOnDrop for Bytes<N> {}
 impl<const N: usize> Bytes<N> {
     fn new(value: &[u8]) -> Self {
         let mut bytes = [0u8; N];
-        let len = bytes.get_mut(..value.len()).map(|target| {
+        if let Some(target) = bytes.get_mut(..value.len()) {
             target.copy_from_slice(value);
-            value.len()
-        });
-        Self { bytes, len }
+        }
+        Self {
+            bytes,
+            len: value.len(),
+        }
     }
 
     /// The bytes, or `None` for a value that did not fit.
     pub fn get(&self) -> Option<&[u8]> {
-        self.len.map(|len| &self.bytes[..len])
+        self.bytes.get(..self.len)
+    }
+
+    /// The length of the value as received, also of one that did not fit.
+    pub const fn received_len(&self) -> usize {
+        self.len
     }
 }
 
@@ -133,14 +138,29 @@ pub struct ClientPinRequest {
     pin_hash_enc: Option<Bytes<KEY_LEN>>,
     permissions: Option<u64>,
     rp_id: Option<RpId>,
+    /// For a setPIN or changePIN whose newPinEnc or pinHashEnc did not fit its buffer: whether
+    /// pinUvAuthParam authenticates the members as received, checked while they could still be
+    /// read. `None` when nothing was too long or the check could not run (no usable protocol, key
+    /// agreement key or shared secret, which execution refuses before it gets to the MAC).
+    oversized_mac: Option<bool>,
 }
 
 // Every member holding request bytes is a `Bytes`, which wipes itself on drop.
 impl ZeroizeOnDrop for ClientPinRequest {}
 
+/// The members a setPIN or changePIN MAC covers, borrowed from the request so that one too long
+/// for its buffer can still be authenticated.
+#[derive(Default)]
+struct Received<'a> {
+    pin_uv_auth_param: Option<&'a [u8]>,
+    new_pin_enc: Option<&'a [u8]>,
+    pin_hash_enc: Option<&'a [u8]>,
+}
+
 /// Parses the CBOR parameters of authenticatorClientPIN (§6.5.5). Unknown members are ignored
 /// (§8); `subCommand` is the one member every subcommand needs.
 pub(super) fn parse<C: Crypto>(
+    client_pin: &ClientPin,
     crypto: &C,
     parameters: &[u8],
 ) -> Result<ClientPinRequest, StatusCode> {
@@ -155,7 +175,9 @@ pub(super) fn parse<C: Crypto>(
             pin_hash_enc: None,
             permissions: None,
             rp_id: None,
+            oversized_mac: None,
         };
+        let mut received = Received::default();
         let mut sub_command = None;
         while let Some(key) = entries.next_key()? {
             let value = entries.value();
@@ -163,9 +185,21 @@ pub(super) fn parse<C: Crypto>(
                 Key::Int(0x01) => request.protocol = Some(value.unsigned()?),
                 Key::Int(0x02) => sub_command = Some(value.unsigned()?),
                 Key::Int(0x03) => request.key_agreement = Some(peer_key(value)?),
-                Key::Int(0x04) => request.pin_uv_auth_param = Some(Bytes::new(value.bytes()?)),
-                Key::Int(0x05) => request.new_pin_enc = Some(Bytes::new(value.bytes()?)),
-                Key::Int(0x06) => request.pin_hash_enc = Some(Bytes::new(value.bytes()?)),
+                Key::Int(0x04) => {
+                    let bytes = value.bytes()?;
+                    received.pin_uv_auth_param = Some(bytes);
+                    request.pin_uv_auth_param = Some(Bytes::new(bytes));
+                }
+                Key::Int(0x05) => {
+                    let bytes = value.bytes()?;
+                    received.new_pin_enc = Some(bytes);
+                    request.new_pin_enc = Some(Bytes::new(bytes));
+                }
+                Key::Int(0x06) => {
+                    let bytes = value.bytes()?;
+                    received.pin_hash_enc = Some(bytes);
+                    request.pin_hash_enc = Some(Bytes::new(bytes));
+                }
                 Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
                 Key::Int(0x0A) => {
                     let rp_id = value.text()?;
@@ -186,12 +220,64 @@ pub(super) fn parse<C: Crypto>(
                 _ => value.skip()?,
             }
         }
-        Ok((request, sub_command))
+        Ok((request, sub_command, received))
     });
-    let (mut request, sub_command) = request.map_err(StatusCode::from)?;
+    let (mut request, sub_command, received) = request.map_err(StatusCode::from)?;
     decoder.finish().map_err(StatusCode::from)?;
     request.sub_command = sub_command.ok_or(StatusCode::MissingParameter)?;
+    request.oversized_mac = oversized_mac(client_pin, crypto, &request, &received);
     Ok(request)
+}
+
+/// Whether pinUvAuthParam authenticates a setPIN or changePIN whose newPinEnc or pinHashEnc is too
+/// long for its buffer. §6.5.5.5 step 5 and §6.5.5.6 step 5.5 verify the MAC over the members as
+/// sent before anything looks at their length, so the check runs here, where they can be read.
+fn oversized_mac<C: Crypto>(
+    client_pin: &ClientPin,
+    crypto: &C,
+    request: &ClientPinRequest,
+    received: &Received<'_>,
+) -> Option<bool> {
+    let too_long = |member: &Option<Bytes<MAX_CIPHERTEXT_LEN>>| {
+        member.as_ref().is_some_and(|bytes| bytes.get().is_none())
+    };
+    let new_pin_enc = received.new_pin_enc?;
+    let message: &[&[u8]] = match SubCommand::from_number(request.sub_command)? {
+        SubCommand::SetPin if too_long(&request.new_pin_enc) => &[new_pin_enc],
+        SubCommand::ChangePin => {
+            let pin_hash_enc = received.pin_hash_enc?;
+            let hash_too_long = request
+                .pin_hash_enc
+                .as_ref()
+                .is_some_and(|bytes| bytes.get().is_none());
+            if !too_long(&request.new_pin_enc) && !hash_too_long {
+                return None;
+            }
+            &[new_pin_enc, pin_hash_enc]
+        }
+        _ => return None,
+    };
+    let protocol = Protocol::from_number(request.protocol?)?;
+    let PeerKey::Point(point) = request.key_agreement? else {
+        return None;
+    };
+    let secret = client_pin.shared_secret(crypto, protocol, &point).ok()?;
+    Some(secret.verify(
+        crypto,
+        message,
+        received.pin_uv_auth_param.unwrap_or_default(),
+    ))
+}
+
+/// The status for a newPinEnc too long for any padded PIN, once its MAC verified: a ciphertext
+/// `decrypt` refuses is CTAP2_ERR_PIN_AUTH_INVALID, any other decrypts to more than 64 bytes,
+/// CTAP1_ERR_INVALID_PARAMETER (§6.5.5.5 steps 6 and 7).
+const fn oversized_new_pin(protocol: Protocol, len: usize) -> StatusCode {
+    if protocol.decrypts(len) {
+        StatusCode::InvalidParameter
+    } else {
+        StatusCode::PinAuthInvalid
+    }
 }
 
 /// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key, parsed as §6.5.6 ecdh
@@ -254,6 +340,19 @@ fn write_cose_key(encoder: &mut Encoder<'_>, point: &[u8; PUBLIC_KEY_LEN]) -> Re
 /// counterparts).
 fn required<T>(member: Option<T>) -> Result<T, StatusCode> {
     member.ok_or(StatusCode::MissingParameter)
+}
+
+/// The permissions RP ID is a mandatory parameter when the requested `bits` include mc or ga
+/// (CTAP 2.2 §6.5.5.7, RP ID "Required" for both), so its absence is
+/// CTAP2_ERR_MISSING_PARAMETER (§6.5.5.7.2 and §6.5.5.7.3 step 1). Only getPinToken's default
+/// permissions are bound by their first use.
+fn rp_id_present(bits: u64, request: &ClientPinRequest) -> Result<(), StatusCode> {
+    let rp_scoped =
+        u64::from(Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits());
+    if bits & rp_scoped != 0 && request.rp_id.is_none() {
+        return Err(StatusCode::MissingParameter);
+    }
+    Ok(())
 }
 
 /// The selected protocol, or CTAP1_ERR_INVALID_PARAMETER for one not supported (§6.5.5.4 step 4).
@@ -365,16 +464,22 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return Err(StatusCode::PinAuthInvalid);
         }
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
-        // A newPinEnc longer than a padded PIN's ciphertext cannot decrypt to 64 bytes.
-        let new_pin_enc = new_pin_enc.get().ok_or(StatusCode::InvalidParameter)?;
+        // A newPinEnc longer than a padded PIN's ciphertext was authenticated while parsing;
+        // with a valid MAC it fails decryption or decrypts to more than 64 bytes.
+        let Some(new_pin_enc_bytes) = new_pin_enc.get() else {
+            if request.oversized_mac != Some(true) {
+                return Err(StatusCode::PinAuthInvalid);
+            }
+            return Err(oversized_new_pin(protocol, new_pin_enc.received_len()));
+        };
         if !secret.verify(
             &self.crypto,
-            &[new_pin_enc],
+            &[new_pin_enc_bytes],
             param.get().unwrap_or_default(),
         ) {
             return Err(StatusCode::PinAuthInvalid);
         }
-        let verifier = self.new_pin_verifier(&secret, new_pin_enc)?;
+        let verifier = self.new_pin_verifier(&secret, new_pin_enc_bytes)?;
         let mut config = self.store.config();
         config.pin = Some(verifier);
         config.pin_retries = PIN_RETRIES;
@@ -392,20 +497,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let protocol = protocol(number)?;
         self.pin_usable()?;
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
-        // Either member longer than its buffer fails the MAC check below in a real exchange; it
-        // is refused as that check would refuse it.
-        let (Some(new_pin_enc), Some(pin_hash_enc)) = (new_pin_enc.get(), pin_hash_enc.get())
-        else {
-            return Err(StatusCode::PinAuthInvalid);
+        // A member longer than its buffer was authenticated while parsing.
+        let authenticated = match (new_pin_enc.get(), pin_hash_enc.get()) {
+            (Some(new_pin_enc), Some(pin_hash_enc)) => secret.verify(
+                &self.crypto,
+                &[new_pin_enc, pin_hash_enc],
+                param.get().unwrap_or_default(),
+            ),
+            _ => request.oversized_mac == Some(true),
         };
-        if !secret.verify(
-            &self.crypto,
-            &[new_pin_enc, pin_hash_enc],
-            param.get().unwrap_or_default(),
-        ) {
+        if !authenticated {
             return Err(StatusCode::PinAuthInvalid);
         }
-        self.check_pin_hash(&secret, pin_hash_enc)?;
+        // A pinHashEnc too long for a PIN hash is a mismatch: it spends the try (steps 5.6 to
+        // 5.8) like any other wrong PIN.
+        self.check_pin_hash(&secret, pin_hash_enc.get().unwrap_or_default())?;
+        let Some(new_pin_enc) = new_pin_enc.get() else {
+            return Err(oversized_new_pin(protocol, new_pin_enc.received_len()));
+        };
         let verifier = self.new_pin_verifier(&secret, new_pin_enc)?;
         let mut config = self.store.config();
         config.pin = Some(verifier);
@@ -429,7 +538,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let peer = required(request.key_agreement)?;
         let pin_hash_enc = required(request.pin_hash_enc.as_ref())?;
         let permissions = if with_permissions {
-            Some(required(request.permissions)?)
+            let bits = required(request.permissions)?;
+            rp_id_present(bits, request)?;
+            Some(bits)
         } else {
             None
         };
@@ -487,6 +598,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let number = required(request.protocol)?;
         let peer = required(request.key_agreement)?;
         let bits = required(request.permissions)?;
+        rp_id_present(bits, request)?;
         let protocol = protocol(number)?;
         if bits == 0 {
             return Err(StatusCode::InvalidParameter);
@@ -511,9 +623,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         ))?;
         match ui.verify_user(USER_ACTION_TIMEOUT_MS) {
             Verification::Verified => {}
-            // Step 3.10: a failed verification is UV_BLOCKED once no attempt is left, which one
-            // wrong entry here always leaves, else UV_INVALID.
-            Verification::Invalid => {
+            // Step 11: a failed verification other than a timeout, a wrong entry or backing out
+            // of the keypad after the consent, is UV_BLOCKED once no attempt is left (which one
+            // wrong entry here always leaves), else UV_INVALID.
+            Verification::Invalid | Verification::Rejected => {
                 return Err(if self.uv_retries(ui) == 0 {
                     StatusCode::UvBlocked
                 } else {
@@ -521,7 +634,6 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 });
             }
             Verification::Blocked => return Err(StatusCode::UvBlocked),
-            Verification::Rejected => return Err(StatusCode::OperationDenied),
             Verification::Cancelled => return Err(StatusCode::KeepaliveCancel),
             Verification::TimedOut => return Err(StatusCode::UserActionTimeout),
         }
