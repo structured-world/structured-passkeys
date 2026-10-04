@@ -260,8 +260,8 @@ impl Ui for DeviceUi<'_> {
 
     fn verify_user(&mut self, timeout_ms: u32) -> Verification {
         // The device's own count: three wrong entries wipe it. The keypad is offered only while
-        // the count is full, so this application spends at most one try before a correct
-        // entry, here or at unlock, restores it.
+        // the count is full, so this application spends at most one try before a correct entry
+        // at unlock restores it.
         if self.uv_retries() == 0 {
             return Verification::Blocked;
         }
@@ -301,6 +301,11 @@ impl Ui for DeviceUi<'_> {
     }
 
     fn uv_retries(&mut self) -> u8 {
+        // Derived from the device PIN's count, not kept here, so a correct client PIN does not
+        // reset it as CTAP 2.2 §6.5.2.3 has a correct PIN reset uvRetries: the client PIN proves
+        // nothing about the device PIN, and offering the keypad again would let built-in UV spend
+        // a second of the three tries before the device wipes itself. Built-in UV comes back when
+        // a correct device PIN at unlock refills the count.
         // SAFETY: a syscall without arguments.
         let retries = unsafe { os_global_pin_retries() };
         u8::from(retries >= DEFAULT_PIN_RETRIES)

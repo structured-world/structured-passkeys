@@ -77,6 +77,15 @@ impl Protocol {
             Protocol::Two => AES_BLOCK_LEN + plaintext_len,
         }
     }
+
+    /// Whether `decrypt` takes a ciphertext of `len` bytes rather than returning an error: whole
+    /// AES blocks (§6.5.6), after a 16-byte IV for protocol two (§6.5.7).
+    pub const fn decrypts(self, len: usize) -> bool {
+        match self {
+            Protocol::One => len.is_multiple_of(AES_BLOCK_LEN),
+            Protocol::Two => len >= AES_BLOCK_LEN && len.is_multiple_of(AES_BLOCK_LEN),
+        }
+    }
 }
 
 /// pinUvAuthToken permissions (§6.5.5.7), a set of their bits.

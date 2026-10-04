@@ -365,7 +365,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 })
             }
             Ok(CommandCode::ClientPin) => {
-                client_pin::parse(&self.crypto, parameters).map(Command::ClientPin)
+                client_pin::parse(&self.client_pin, &self.crypto, parameters)
+                    .map(Command::ClientPin)
             }
             // §8.1: a command code the authenticator does not implement is
             // CTAP1_ERR_INVALID_COMMAND.
