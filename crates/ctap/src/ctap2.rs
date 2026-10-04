@@ -61,7 +61,7 @@ pub use make_credential::{MakeCredentialRequest, UserEntity};
 
 use crate::cbor::{self, Encoder, Full};
 use crate::crypto::Crypto;
-use crate::pin::{ClientPin, Protocol};
+use crate::pin::{ClientPin, MIN_PIN_CODE_POINTS, Protocol};
 use crate::storage::{Storage, Store};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
@@ -336,6 +336,26 @@ pub enum Link {
 /// CTAP 2.2 (Terminology, "Evidence of user interaction"), two minutes.
 pub const NFC_PRESENCE_MS: u64 = 120_000;
 
+/// A selection of the FIDO applet in an NFC field, the tap that is user presence over NFC.
+///
+/// # Examples
+///
+/// ```
+/// use structured_passkeys_ctap::ctap2::NfcTap;
+///
+/// // Two selections in the same tick of a coarse clock are still two taps.
+/// let first = NfcTap { at_ms: 1_000, selection: 7 };
+/// let second = NfcTap { at_ms: 1_000, selection: 8 };
+/// assert_ne!(first, second);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfcTap {
+    /// When the applet was selected, on the device clock.
+    pub at_ms: u64,
+    /// The selection's number, which tells taps apart when the clock is too coarse to.
+    pub selection: u32,
+}
+
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
 /// material, which exists once and is wiped when the request is dropped.
 #[derive(Debug, PartialEq, Eq)]
@@ -378,11 +398,12 @@ pub struct Authenticator<C, S> {
     crypto: C,
     store: Store<S>,
     client_pin: ClientPin,
-    /// When the device was last placed in an NFC field with the applet selected, the tap that
-    /// establishes user presence over NFC; `None` once the platform ended CTAP.
-    nfc_tap_ms: Option<u64>,
-    /// The tap a credential operation used up: a tap counts for one registration or assertion.
-    nfc_tap_used: Option<u64>,
+    /// The last selection of the applet in an NFC field, the tap that establishes user presence
+    /// over NFC; `None` once the platform ended CTAP.
+    nfc_tap: Option<NfcTap>,
+    /// The selection a credential operation used up: a tap counts for one registration or
+    /// assertion.
+    nfc_tap_used: Option<u32>,
     /// What authenticatorGetNextAssertion continues from; any other command discards it (§6.3:
     /// a stateful command continues only the command right before it).
     next_assertions: Option<get_assertion::NextAssertions>,
@@ -399,27 +420,27 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             crypto,
             store,
             client_pin,
-            nfc_tap_ms: None,
+            nfc_tap: None,
             nfc_tap_used: None,
             next_assertions: None,
         }
     }
 
-    /// The NFC tap at `now_ms`: the device entered a reader's field and the platform selected the
-    /// FIDO applet. It establishes user presence over NFC for [`NFC_PRESENCE_MS`].
-    pub const fn nfc_tap(&mut self, now_ms: u64) {
-        self.nfc_tap_ms = Some(now_ms);
+    /// The NFC tap `tap`: the device entered a reader's field and the platform selected the FIDO
+    /// applet. It establishes user presence over NFC for [`NFC_PRESENCE_MS`].
+    pub const fn nfc_tap(&mut self, tap: NfcTap) {
+        self.nfc_tap = Some(tap);
     }
 
     /// The platform deselected the applet: the tap no longer counts as presence.
     pub const fn nfc_ended(&mut self) {
-        self.nfc_tap_ms = None;
+        self.nfc_tap = None;
     }
 
     /// Whether an NFC tap still counts as user presence at `now_ms`.
     fn nfc_present(&self, now_ms: u64) -> bool {
-        self.nfc_tap_ms
-            .and_then(|tap_ms| now_ms.checked_sub(tap_ms))
+        self.nfc_tap
+            .and_then(|tap| now_ms.checked_sub(tap.at_ms))
             .is_some_and(|age_ms| age_ms <= NFC_PRESENCE_MS)
     }
 
@@ -595,12 +616,13 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     ///
     /// Options: `rk` and `up`; `uv`, since built-in user verification is the device unlock and
     /// always present; `clientPin`, true once a client PIN is set (§6.4 option IDs); and
-    /// `pinUvAuthToken`, the token commands being implemented.
+    /// `pinUvAuthToken`, the token commands being implemented. With clientPin comes minPINLength,
+    /// which "MUST be present if the authenticator supports authenticatorClientPIN".
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         let transports = self.settings.transports.names();
         let pin_set = self.store.config().pin.is_some();
         encoder
-            .map(6)?
+            .map(7)?
             // versions (0x01), required.
             .unsigned(0x01)?
             .array(0)?
@@ -634,6 +656,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         for name in transports {
             encoder.text(name)?;
         }
+        // minPINLength (0x0D): the fixed minimum; no command here changes it.
+        encoder
+            .unsigned(0x0D)?
+            // 4 code points, far below u64.
+            .unsigned(MIN_PIN_CODE_POINTS as u64)?;
         Ok(())
     }
 }

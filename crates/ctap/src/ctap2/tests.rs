@@ -2,7 +2,7 @@
 //! written out byte by byte, never produced by the code under test.
 
 use super::{
-    AAGUID, Authenticator, Command, CommandCode, Link, MaxMsgSize, NFC_PRESENCE_MS,
+    AAGUID, Authenticator, Command, CommandCode, Link, MaxMsgSize, NFC_PRESENCE_MS, NfcTap,
     RESET_WINDOW_MS, Settings, StatusCode, TooSmall, Transports, UnknownCommand,
 };
 use crate::cbor::{self, validate};
@@ -244,7 +244,10 @@ fn selection_over_nfc_takes_the_tap() {
 
     ui.asked.clear();
     ui.now_ms = 5_000;
-    authenticator.nfc_tap(ui.now_ms);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: ui.now_ms,
+        selection: 0,
+    });
     assert_eq!(select(&mut authenticator, Link::Nfc, &mut ui), [0x00]);
     ui.now_ms += NFC_PRESENCE_MS;
     assert_eq!(
@@ -267,7 +270,10 @@ fn selection_over_nfc_takes_the_tap() {
         [0x27],
         "past two minutes"
     );
-    authenticator.nfc_tap(ui.now_ms);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: ui.now_ms,
+        selection: 1,
+    });
     authenticator.nfc_ended();
     assert_eq!(
         select(&mut authenticator, Link::Nfc, &mut ui),
@@ -313,16 +319,18 @@ const OPTIONS_WITHOUT_PIN: [u8; 41] = [
 ];
 
 /// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9:
-/// ["usb"]} in canonical order: the required versions and aaguid, the options, maxMsgSize, the
-/// PIN/UV auth protocols, two first, and the transports (§6.4).
+/// ["usb"], 13: 4} in canonical order: the required versions and aaguid, the options, maxMsgSize,
+/// the PIN/UV auth protocols, two first, the transports, and minPINLength, which "MUST be present
+/// if the authenticator supports authenticatorClientPIN" (§6.4), at the 4 code points of §6.5.1.
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA6, 0x01, 0x80, 0x03, 0x50];
+    let mut expected = vec![0x00, 0xA7, 0x01, 0x80, 0x03, 0x50];
     expected.extend_from_slice(&AAGUID);
     expected.extend_from_slice(&OPTIONS_WITHOUT_PIN);
     expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00, 0x06, 0x82, 0x02, 0x01]);
     expected.extend_from_slice(&[0x09, 0x81, 0x63, b'u', b's', b'b']);
+    expected.extend_from_slice(&[0x0D, 0x04]);
     assert_eq!(response, expected);
     assert_eq!(validate(&response[1..]), Ok(()), "canonical CBOR");
 }
@@ -336,8 +344,10 @@ fn get_info_lists_nfc_on_a_device_that_has_it() {
     for link in [Link::Usb, Link::Nfc] {
         let mut response = [0u8; 256];
         let length = authenticator.process(&[0x04], link, &mut ui, &mut response);
-        let tail = [0x09, 0x82, 0x63, b'n', b'f', b'c', 0x63, b'u', b's', b'b'];
-        assert_eq!(response[1], 0xA6, "{link:?}");
+        let tail = [
+            0x09, 0x82, 0x63, b'n', b'f', b'c', 0x63, b'u', b's', b'b', 0x0D, 0x04,
+        ];
+        assert_eq!(response[1], 0xA7, "{link:?}");
         assert!(response[..length].ends_with(&tail), "{link:?}");
         assert_eq!(validate(&response[1..length]), Ok(()), "{link:?}");
     }

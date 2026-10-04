@@ -10,7 +10,7 @@ use super::super::client_pin::tests::{Value, command, encoded, run, set_pin, uv_
 use super::super::tests::{
     Asked, Scripted, Shown, TestAuthenticator, authenticator, authenticator_with,
 };
-use super::super::{AAGUID, Link, Transports};
+use super::super::{AAGUID, Link, NfcTap, Transports};
 use crate::cbor::{Decoder, Key};
 use crate::credential_id::Origin;
 use crate::pin::Protocol;
@@ -422,8 +422,8 @@ fn required_members_are_missing_parameters() {
 }
 
 /// §6.1.2 step 9: this authenticator has no enterprise attestation, so a request for it is
-/// CTAP1_ERR_INVALID_PARAMETER. A discoverable credential stores a user handle of 1 to 64 bytes
-/// (WebAuthn L3 §5.4.3); another length is refused before any screen.
+/// CTAP1_ERR_INVALID_PARAMETER. A discoverable credential stores a user handle of at most 64
+/// bytes (WebAuthn L3 §5.4.3); a longer one is refused before any screen.
 #[test]
 fn invalid_parameters_ask_nothing() {
     let mut authenticator = authenticator();
@@ -434,19 +434,82 @@ fn invalid_parameters_ask_nothing() {
         run(&mut authenticator, &mut ui, &command(0x01, &members)),
         [INVALID_PARAMETER]
     );
-    for id in [&[][..], &[0x55; 65][..]] {
-        let request = command(
-            0x01,
-            &registration(RP_ID, id, &[("rk", true), ("uv", true)]),
-        );
-        assert_eq!(
-            run(&mut authenticator, &mut ui, &request),
-            [INVALID_PARAMETER],
-            "user ID of {} bytes",
-            id.len()
-        );
-    }
+    let request = command(
+        0x01,
+        &registration(RP_ID, &[0x55; 65], &[("rk", true), ("uv", true)]),
+    );
+    assert_eq!(
+        run(&mut authenticator, &mut ui, &request),
+        [INVALID_PARAMETER]
+    );
     assert_eq!(ui.asked, []);
+}
+
+/// An empty user handle is a valid account identifier (CTAP 2.2 §6.1, user: "while an empty
+/// account identifier is valid, it has known interoperability hurdles in practice"): a
+/// discoverable credential is created with it and an assertion returns it.
+#[test]
+fn an_empty_user_handle_is_valid() {
+    let mut authenticator = authenticator();
+    let made = register(&mut authenticator, RP_ID, b"", true, None);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let request = command(
+        0x02,
+        &[
+            (0x01, Value::Text(RP_ID)),
+            (0x02, Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+        ],
+    );
+    let response = run(&mut authenticator, &mut ui, &request);
+    assert_eq!(response[0], OK);
+    let mut decoder = Decoder::new(&response[1..]);
+    let (id, user_id) = decoder
+        .map(|entries| {
+            let mut id = Vec::new();
+            let mut user_id = None;
+            while let Some(key) = entries.next_key()? {
+                let value = entries.value();
+                match key {
+                    Key::Int(1) => {
+                        id = value.map(|members| {
+                            let mut id = Vec::new();
+                            while let Some(key) = members.next_key()? {
+                                let member = members.value();
+                                if key == Key::Text("id") {
+                                    id = member.bytes()?.to_vec();
+                                } else {
+                                    member.skip()?;
+                                }
+                            }
+                            Ok(id)
+                        })?;
+                    }
+                    Key::Int(4) => {
+                        user_id = Some(value.map(|members| {
+                            let mut user_id = None;
+                            while let Some(key) = members.next_key()? {
+                                let member = members.value();
+                                if key == Key::Text("id") {
+                                    user_id = Some(member.bytes()?.to_vec());
+                                } else {
+                                    member.skip()?;
+                                }
+                            }
+                            Ok(user_id)
+                        })?);
+                    }
+                    _ => value.skip()?,
+                }
+            }
+            Ok((id, user_id))
+        })
+        .expect("a response map");
+    assert_eq!(id, made.id);
+    assert_eq!(
+        user_id,
+        Some(Some(Vec::new())),
+        "the empty handle comes back"
+    );
 }
 
 /// A registration with a pinUvAuthParam (§6.1.2 step 11.1): a token with the mc permission for
@@ -610,6 +673,53 @@ fn the_exclude_list_needs_presence() {
     );
 }
 
+/// A replacement whose response does not fit the caller's buffer stores nothing: the credential
+/// it would replace keeps its index entry and its device-only key and still signs, since the
+/// relying party never received the new one.
+#[test]
+fn a_failed_response_keeps_the_replaced_credential() {
+    let mut authenticator = authenticator();
+    let old = register(
+        &mut authenticator,
+        RP_ID,
+        b"user-1",
+        true,
+        Some(Origin::DeviceOnly),
+    );
+    let mut ui = Scripted::new(Answer::Confirmed);
+    ui.origin = Some(Origin::DeviceOnly);
+    let request = command(
+        0x01,
+        &registration(RP_ID, b"user-1", &[("rk", true), ("uv", true)]),
+    );
+    let mut short = [0u8; 16];
+    authenticator.process(&request, Link::Usb, &mut ui, &mut short);
+    assert_ne!(short[0], OK, "the response cannot fit 16 bytes");
+    let entries: Vec<_> = authenticator
+        .store()
+        .entries()
+        .map(|entry| entry.credential_id.to_vec())
+        .collect();
+    assert_eq!(
+        entries,
+        core::slice::from_ref(&old.id),
+        "the old entry stays"
+    );
+    let assertion = command(
+        0x02,
+        &[
+            (0x01, Value::Text(RP_ID)),
+            (0x02, Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+            (0x03, descriptors(&[&old.id])),
+        ],
+    );
+    assert_eq!(
+        run(&mut authenticator, &mut ui, &assertion)[0],
+        OK,
+        "the old credential still signs"
+    );
+}
+
 /// §6.1.2 step 22: a discoverable credential for the RP and user of an existing one replaces
 /// it, in the same index slot; a full index is CTAP2_ERR_KEY_STORE_FULL, and a device-only
 /// discoverable credential also needs a free key slot beyond the one kept for replacements.
@@ -665,7 +775,10 @@ fn discoverable_credentials_replace_and_fill_the_index() {
 fn a_tap_registers_without_a_screen_once() {
     let mut authenticator = authenticator_with(Transports::UsbAndNfc);
     let mut ui = Scripted::new(Answer::Confirmed);
-    authenticator.nfc_tap(0);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
     let request = command(
         0x01,
         &registration(RP_ID, b"user-1", &[("rk", true), ("uv", true)]),
@@ -683,48 +796,101 @@ fn a_tap_registers_without_a_screen_once() {
     assert_eq!(ui.asked.len(), 1, "the tap was used");
 }
 
-/// §6.1.2 step 24: attestationFormatsPreference ["none"] leaves the attestation out: format
-/// "none" with an empty statement.
+/// A new selection of the applet is a new tap even within the same tick of the 100 ms device
+/// clock: after NFCCTAP_CONTROL ends CTAP and the platform selects the applet again, the next
+/// registration takes the new tap without a screen.
 #[test]
-fn attestation_none_on_request() {
-    let mut authenticator = authenticator();
+fn a_new_selection_is_a_new_tap_within_one_tick() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
     let mut ui = Scripted::new(Answer::Confirmed);
-    let mut members = registration(RP_ID, b"user-1", &[("uv", true)]);
-    members.push((
-        0x0B,
-        Value::Raw(encoded(|encoder| {
-            encoder
-                .array(1)
-                .and_then(|encoder| encoder.text("none"))
-                .expect("room");
-        })),
-    ));
-    let response = run(&mut authenticator, &mut ui, &command(0x01, &members));
+    let request = command(
+        0x01,
+        &registration(RP_ID, b"user-1", &[("rk", true), ("uv", true)]),
+    );
+    let mut response = [0u8; 1024];
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut response);
     assert_eq!(response[0], OK);
-    let made = made(&response[1..]);
-    assert_eq!(made.fmt, "none");
-    assert_eq!(made.statement, None);
+    authenticator.nfc_ended();
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 1,
+    });
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut response);
+    assert_eq!(response[0], OK);
+    assert_eq!(ui.asked, [], "each selection was a tap");
 }
 
-/// Names from the relying party are shown as received, cut to the 64 bytes a credential keeps,
-/// with an ASCII control character as `?`: a line break must not push the rest off the screen.
+/// attestationFormatsPreference picks the supported format with the lowest index (CTAP 2.2
+/// §6.1.2: "MUST choose a supported format whose attestation statement format identifier appears
+/// with the lowest index"); "none" leaves the attestation out with an empty statement, and a list
+/// naming no supported format keeps the default, packed.
 #[test]
-fn names_are_shown_safely() {
+fn attestation_follows_the_preference_order() {
     let mut authenticator = authenticator();
     let mut ui = Scripted::new(Answer::Confirmed);
-    let long = "é".repeat(40);
-    let mut members = registration(RP_ID, b"user-1", &[("uv", true)]);
-    members[2].1 = user(b"user-1", "ali\nce", &long);
-    assert_eq!(
-        run(&mut authenticator, &mut ui, &command(0x01, &members))[0],
-        OK
-    );
-    let [(Asked::Registration { account, .. }, _)] = &ui.asked[..] else {
-        panic!("a registration screen: {:?}", ui.asked);
+    for (preference, expected) in [
+        (&["none"][..], "none"),
+        (&["none", "packed"][..], "none"),
+        (&["tpm", "none", "packed"][..], "none"),
+        (&["packed", "none"][..], "packed"),
+        (&["tpm"][..], "packed"),
+        (&[][..], "packed"),
+    ] {
+        let mut members = registration(RP_ID, b"user-1", &[("uv", true)]);
+        members.push((
+            0x0B,
+            Value::Raw(encoded(|encoder| {
+                let mut encoder = encoder.array(preference.len()).expect("room");
+                for format in preference {
+                    encoder = encoder.text(format).expect("room");
+                }
+            })),
+        ));
+        let response = run(&mut authenticator, &mut ui, &command(0x01, &members));
+        assert_eq!(response[0], OK, "{preference:?}");
+        let made = made(&response[1..]);
+        assert_eq!(made.fmt, expected, "{preference:?}");
+        assert_eq!(
+            made.statement.is_none(),
+            expected == "none",
+            "{preference:?}"
+        );
+    }
+}
+
+/// Names from the relying party are shown cut to the 64 bytes a credential keeps, in the printable
+/// ASCII the device fonts hold: any other character, `<` included, is written as `<` its code
+/// point in hex `>`. Different names therefore never look alike: "Иван" and "Петр" differ, a name
+/// typed as `<418>` differs from the letter И, and a line break does not push the rest off the
+/// screen.
+#[test]
+fn names_are_shown_safely() {
+    let shown = |name: &str, display_name: &str| {
+        let mut authenticator = authenticator();
+        let mut ui = Scripted::new(Answer::Confirmed);
+        let mut members = registration(RP_ID, b"user-1", &[("uv", true)]);
+        members[2].1 = user(b"user-1", name, display_name);
+        assert_eq!(
+            run(&mut authenticator, &mut ui, &command(0x01, &members))[0],
+            OK
+        );
+        let [(Asked::Registration { account, .. }, _)] = &ui.asked[..] else {
+            panic!("a registration screen: {:?}", ui.asked);
+        };
+        (account.name.clone(), account.display_name.clone())
     };
-    assert_eq!(account.name.as_deref(), Some("ali?ce"));
+    let long = "é".repeat(40);
     assert_eq!(
-        account.display_name.as_deref(),
-        Some("é".repeat(32).as_str())
+        shown("ali\nce", &long),
+        (Some("ali<A>ce".into()), Some("<E9>".repeat(32)))
     );
+    assert_eq!(
+        shown("Иван", "<418>"),
+        (Some("<418><432><430><43D>".into()), Some("<3C>418>".into()))
+    );
+    assert_eq!(shown("Петр", "x").0, Some("<41F><435><442><440>".into()));
 }

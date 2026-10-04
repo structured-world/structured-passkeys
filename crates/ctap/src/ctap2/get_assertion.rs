@@ -114,6 +114,8 @@ pub(super) struct NextAssertions {
     last_ms: u64,
     up: bool,
     uv: bool,
+    /// Whether a pinUvAuthToken authenticated the assertion, whose expiry ends the state.
+    token: bool,
 }
 
 /// A credential that may answer the assertion, with its index entry when it was found there.
@@ -254,22 +256,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if up {
             self.consume_token_flags();
         }
-        if several && !pick {
-            // Step 15.2.2: the platform gets the count and the rest with getNextAssertion.
+        // Step 15.2.2: the platform gets the count and the rest with getNextAssertion, which
+        // continues only once this response has been written (§6.3 follows a received assertion).
+        let continuation = (several && !pick).then(|| NextAssertions {
+            rp_id: request.rp_id.clone(),
+            rp_id_hash,
+            client_data_hash: request.client_data_hash,
+            entries: applicable
+                .iter()
+                .filter_map(|candidate| candidate.entry)
+                .collect(),
+            next: 1,
+            last_ms: ui.now_ms(),
+            up,
+            uv,
+            token: protocol.is_some(),
+        });
+        if continuation.is_some() {
             extras.number_of_credentials = Some(applicable.len());
-            self.next_assertions = Some(NextAssertions {
-                rp_id: request.rp_id.clone(),
-                rp_id_hash,
-                client_data_hash: request.client_data_hash,
-                entries: applicable
-                    .iter()
-                    .filter_map(|candidate| candidate.entry)
-                    .collect(),
-                next: 1,
-                last_ms: ui.now_ms(),
-                up,
-                uv,
-            });
         }
         let chosen = applicable.swap_remove(selected);
         self.assert(
@@ -281,6 +285,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             &extras,
             encoder,
         )?;
+        self.next_assertions = continuation;
         if on_tap {
             self.use_nfc_tap();
         }
@@ -443,7 +448,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let expired = now_ms
             .checked_sub(state.last_ms)
             .is_none_or(|elapsed| elapsed > NEXT_ASSERTION_TIMEOUT_MS);
-        if expired {
+        // §6 "stateful commands": the state MUST be discarded once the pinUvAuthToken that
+        // authenticated the initializing command expires, as this command verifies none.
+        if expired || (state.token && !self.client_pin.in_use(now_ms)) {
             return Err(StatusCode::NotAllowed);
         }
         let keys = KeyRing::new(&mut self.crypto);

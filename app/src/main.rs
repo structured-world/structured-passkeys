@@ -170,8 +170,8 @@ where
     C: structured_passkeys_ctap::crypto::Crypto,
     S: structured_passkeys_ctap::storage::Storage,
 {
-    match nfc.tap_ms() {
-        Some(tap_ms) => authenticator.nfc_tap(tap_ms),
+    match nfc.tap() {
+        Some(tap) => authenticator.nfc_tap(tap),
         None => authenticator.nfc_ended(),
     }
 }

@@ -11,11 +11,12 @@ use super::super::make_credential::tests::{
 use super::super::tests::{
     Asked, Scripted, Shown, TestAuthenticator, authenticator, authenticator_with,
 };
-use super::super::{Authenticator, Link, Transports};
+use super::super::{Authenticator, Link, NfcTap, Transports};
 use super::NEXT_ASSERTION_TIMEOUT_MS;
 use crate::cbor::{Decoder, Key};
 use crate::credential_id::Origin;
 use crate::crypto::KEY_LEN;
+use crate::pin::MAX_USAGE_TIME_PERIOD_MS;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, Store};
 use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS};
@@ -366,6 +367,78 @@ fn get_next_assertion_needs_its_assertion() {
     );
 }
 
+/// A first assertion whose response does not fit the caller's buffer leaves nothing for
+/// authenticatorGetNextAssertion to continue: §6.3 continues an assertion the platform received,
+/// so the next call is CTAP2_ERR_NOT_ALLOWED rather than a signature for the second credential.
+#[test]
+fn a_failed_assertion_leaves_no_continuation() {
+    let mut authenticator = authenticator();
+    for user in [b"user-1", b"user-2"] {
+        register(&mut authenticator, RP_ID, user, true, None);
+    }
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut short = [0u8; 16];
+    authenticator.process(
+        &assertion(None, &[("up", false)]),
+        Link::Usb,
+        &mut ui,
+        &mut short,
+    );
+    assert_ne!(short[0], OK, "the response cannot fit 16 bytes");
+    assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
+}
+
+/// An assertion authenticated by a pinUvAuthToken leaves its continuation only while that token
+/// lives: once the token's max usage time period ends, authenticatorGetNextAssertion is
+/// CTAP2_ERR_NOT_ALLOWED although its own 30 seconds have not passed (§6 "stateful commands":
+/// the state MUST be discarded when the token that authenticated the initializing command
+/// expires). A token-authenticated assertion continues over the NFC tap, where no account list
+/// is shown.
+#[test]
+fn a_continuation_ends_with_its_token() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    for user in [b"user-1", b"user-2"] {
+        register(&mut authenticator, RP_ID, user, true, None);
+    }
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let (response, session) = uv_token(&mut authenticator, &mut ui, Some(0x02), Some(RP_ID));
+    assert_eq!(response[0], OK);
+    let token = session.decrypt(&parse_response(&response[1..]).token.expect("token"));
+    let request = |up: bool| {
+        command(
+            0x02,
+            &[
+                (0x01, Value::Text(RP_ID)),
+                (0x02, Value::Bytes(CLIENT_DATA_HASH.to_vec())),
+                (0x05, options(&[("up", up)])),
+                (
+                    0x06,
+                    Value::Bytes(hmac(&token, &[&CLIENT_DATA_HASH]).to_vec()),
+                ),
+                (0x07, Value::Uint(2)),
+            ],
+        )
+    };
+    // A first use within the initial usage time limit keeps the token for its full period; one
+    // without presence leaves its permissions for the next.
+    ui.now_ms = 1;
+    assert_eq!(run(&mut authenticator, &mut ui, &request(false))[0], OK);
+    ui.now_ms = MAX_USAGE_TIME_PERIOD_MS - 1_000;
+    authenticator.nfc_tap(NfcTap {
+        at_ms: ui.now_ms,
+        selection: 0,
+    });
+    let mut response = [0u8; 1024];
+    let length = authenticator.process(&request(true), Link::Nfc, &mut ui, &mut response);
+    assert_eq!(response[0], OK);
+    assert_eq!(
+        asserted(&response[1..length]).number_of_credentials,
+        Some(2)
+    );
+    ui.now_ms = MAX_USAGE_TIME_PERIOD_MS + 1_000;
+    assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
+}
+
 /// Nothing to sign with is CTAP2_ERR_NO_CREDENTIALS: an RP without credentials, an allowList of
 /// IDs this device did not create or created for another RP. A platform never sends `rk`, which
 /// is CTAP2_ERR_UNSUPPORTED_OPTION (§6.2.2 step 5.4).
@@ -518,7 +591,10 @@ fn a_tap_asserts_without_a_screen_once() {
     for user in [b"user-1", b"user-2"] {
         register(&mut authenticator, RP_ID, user, true, None);
     }
-    authenticator.nfc_tap(0);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
     let mut ui = Scripted::new(Answer::Confirmed);
     let mut response = [0u8; 1024];
     let length = authenticator.process(&assertion(None, &[]), Link::Nfc, &mut ui, &mut response);

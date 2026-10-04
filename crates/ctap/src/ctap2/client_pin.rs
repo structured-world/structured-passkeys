@@ -1,8 +1,10 @@
 //! authenticatorClientPIN (CTAP 2.2 §6.5.5): parsing a request into what its execution needs,
 //! and the subcommands.
 
+use alloc::string::String;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use super::credential::shown;
 use super::{Authenticator, StatusCode};
 use crate::cbor::{self, Decoder, Encoder, Full, Key};
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
@@ -111,18 +113,22 @@ pub enum PeerKey {
     Unusable,
 }
 
-/// The permissions RP ID (`rpId`): its hash for the token, and its display form.
+/// The permissions RP ID (`rpId`): its hash for the token, and the 64-byte form of CTAP 2.2
+/// §6.8.7 that a screen shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RpId {
     hash: [u8; KEY_LEN],
-    shown: [u8; MAX_RP_ID_LEN],
-    shown_len: usize,
+    stored: [u8; MAX_RP_ID_LEN],
+    stored_len: usize,
 }
 
 impl RpId {
-    fn shown(&self) -> &str {
-        // The display form is cut at UTF-8 boundaries, so it is text.
-        core::str::from_utf8(&self.shown[..self.shown_len]).unwrap_or_default()
+    /// The RP ID as the consent screen shows it, every character readable and none hiding the
+    /// rest (see [`shown`]).
+    fn shown(&self) -> String {
+        // The stored form is cut at UTF-8 boundaries, so it is text.
+        let stored = core::str::from_utf8(&self.stored[..self.stored_len]).unwrap_or_default();
+        shown(stored, MAX_RP_ID_LEN)
     }
 }
 
@@ -203,18 +209,11 @@ pub(super) fn parse<C: Crypto>(
                 Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
                 Key::Int(0x0A) => {
                     let rp_id = value.text()?;
-                    let (mut shown, shown_len) = crate::storage::stored_rp_id(rp_id);
-                    // A screen would end the text at a NUL or break the line at a control
-                    // character, hiding the rest of an RP ID the consent is for.
-                    for byte in &mut shown[..shown_len] {
-                        if byte.is_ascii_control() {
-                            *byte = b'?';
-                        }
-                    }
+                    let (stored, stored_len) = crate::storage::stored_rp_id(rp_id);
                     request.rp_id = Some(RpId {
                         hash: crypto.sha256(&[rp_id.as_bytes()]),
-                        shown,
-                        shown_len,
+                        stored,
+                        stored_len,
                     });
                 }
                 _ => value.skip()?,
@@ -572,10 +571,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         };
         self.pin_usable()?;
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
+        let shown_rp = request.rp_id.as_ref().map(RpId::shown);
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: request.rp_id.as_ref().map(RpId::shown),
+                rp_id: shown_rp.as_deref(),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
@@ -619,10 +619,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // Checked before any screen, so a request with an unusable key never asks the user.
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
         // Step 9: consent to the requested permissions.
+        let shown_rp = request.rp_id.as_ref().map(RpId::shown);
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: request.rp_id.as_ref().map(RpId::shown),
+                rp_id: shown_rp.as_deref(),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;

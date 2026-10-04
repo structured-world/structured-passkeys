@@ -958,8 +958,8 @@ fn a_pin_token_with_permissions_is_bound_to_its_rp() {
 }
 
 /// The consent screen shows the whole RP ID: a control character, which would end the text at a
-/// NUL or push the rest away at a line break, is shown as `?`. The token stays bound to the RP ID
-/// as sent.
+/// NUL or push the rest away at a line break, is shown as its code point in hex between `<` and
+/// `>`. The token stays bound to the RP ID as sent.
 #[test]
 fn control_characters_in_the_rp_id_are_shown() {
     let mut authenticator = authenticator();
@@ -979,7 +979,7 @@ fn control_characters_in_the_rp_id_are_shown() {
         [(
             Asked::Token {
                 permissions: 0x02,
-                rp_id: Some("example.com??.evil.test".into())
+                rp_id: Some("example.com<0><A>.evil.test".into())
             },
             USER_ACTION_TIMEOUT_MS
         )]

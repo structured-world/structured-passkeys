@@ -188,11 +188,12 @@ const TEXT_LEN: usize = 256;
 
 /// A NUL-terminated text composed for a screen. It lives in the frame of the call that shows the
 /// screen and waits for it, so it outlives the screen without taking RAM between screens, which
-/// the Nano X does not have to spare. Longer text is cut.
+/// the Nano X does not have to spare. Longer text is cut, never inside a `<…>` code.
 ///
 /// The application's NBGL fonts hold the printable ASCII range (`first_char` to `last_char` of
-/// `nbgl_font_t`); any other character is written as `?`, a visible placeholder, so two names that
-/// differ in a character the font lacks never look identical.
+/// `nbgl_font_t`). Text from the relying party arrives already written in that range, any other
+/// character as `<` its code point in hex `>`; the application's own text is ASCII, and a
+/// character outside the range would show as `?`.
 struct Text([u8; TEXT_LEN]);
 
 impl Text {
@@ -200,10 +201,12 @@ impl Text {
     fn new(parts: &[&str]) -> Self {
         let mut bytes = [0u8; TEXT_LEN];
         let mut length = 0;
+        let mut cut = false;
         'parts: for part in parts {
             for character in part.chars() {
                 // One byte stays for the terminating NUL.
                 if length + 1 >= TEXT_LEN {
+                    cut = true;
                     break 'parts;
                 }
                 bytes[length] = match character {
@@ -212,6 +215,13 @@ impl Text {
                 };
                 length += 1;
             }
+        }
+        // A code cut in half would read as another character: the cut moves before it.
+        if cut
+            && let Some(open) = bytes[..length].iter().rposition(|&byte| byte == b'<')
+            && !bytes[open..length].contains(&b'>')
+        {
+            bytes[open..length].fill(0);
         }
         Self(bytes)
     }

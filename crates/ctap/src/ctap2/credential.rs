@@ -79,19 +79,31 @@ pub(super) fn authenticator_data(
     Ok(data)
 }
 
-/// `text` as a screen shows it: cut to `max` bytes on a character boundary, and an ASCII control
-/// character as `?`, since a NUL would end the text and a line break push the rest off the screen.
+/// `text` as a screen shows it: cut to `max` bytes on a character boundary, in the printable ASCII
+/// the device fonts hold. Any other character, and `<` itself, is written as `<` its code point in
+/// upper-case hex `>`, so the mapping is one to one: two different texts never look alike, and a
+/// NUL or a line break can neither end the text nor push the rest off the screen.
 pub(super) fn shown(text: &str, max: usize) -> String {
-    truncate_on_char_boundary(text, max)
-        .chars()
-        .map(|character| {
-            if character.is_ascii_control() {
-                '?'
-            } else {
-                character
+    let kept = truncate_on_char_boundary(text, max);
+    let mut shown = String::with_capacity(kept.len());
+    for character in kept.chars() {
+        match character {
+            ' '..='~' if character != '<' => shown.push(character),
+            _ => {
+                let code = u32::from(character);
+                // At most six hex digits for a code point, without leading zeros.
+                let digits = (u32::BITS - code.leading_zeros()).div_ceil(4).max(1);
+                shown.push('<');
+                for shift in (0..digits).rev() {
+                    let nibble = (code >> (shift * 4)) & 0xF;
+                    let digit = char::from_digit(nibble, 16).expect("a nibble is a hex digit");
+                    shown.push(digit.to_ascii_uppercase());
+                }
+                shown.push('>');
             }
-        })
-        .collect()
+        }
+    }
+    shown
 }
 
 /// The RP ID as a screen shows it: the 64-byte form of CTAP 2.2 §6.8.7, made safe by [`shown`].
@@ -269,12 +281,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// the tap the presence of one registration or assertion, with no screen to answer while the
     /// device is held to a phone.
     pub(super) fn nfc_tap_unused(&self, link: Link, now_ms: u64) -> bool {
-        link == Link::Nfc && self.nfc_present(now_ms) && self.nfc_tap_used != self.nfc_tap_ms
+        link == Link::Nfc
+            && self.nfc_present(now_ms)
+            && self.nfc_tap.map(|tap| tap.selection) != self.nfc_tap_used
     }
 
     /// A credential operation succeeded on the tap: a further one needs a new tap.
-    pub(super) const fn use_nfc_tap(&mut self) {
-        self.nfc_tap_used = self.nfc_tap_ms;
+    pub(super) fn use_nfc_tap(&mut self) {
+        self.nfc_tap_used = self.nfc_tap.map(|tap| tap.selection);
     }
 
     /// The credential `id` presented for `rp_id`, if this authenticator created it for that RP,

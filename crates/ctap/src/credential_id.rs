@@ -284,7 +284,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
 ///
 /// # Errors
 ///
-/// [`SealError::TooLong`] for a user ID outside 1..=64 bytes, [`SealError::KeySource`] for a
+/// [`SealError::TooLong`] for a user ID over 64 bytes, [`SealError::KeySource`] for a
 /// key source that does not fit the credential's discoverability.
 pub fn seal<C: Crypto>(
     crypto: &mut C,
@@ -297,8 +297,8 @@ pub fn seal<C: Crypto>(
     }
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
-        // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
-        if user.id.is_empty() || user.id.len() > MAX_USER_ID_LEN {
+        // A user ID is at most 64 bytes (WebAuthn L3 §5.4.3) and may be empty (CTAP 2.2 §6.1).
+        if user.id.len() > MAX_USER_ID_LEN {
             return Err(SealError::TooLong);
         }
         for name in [&mut user.name, &mut user.display_name]
@@ -474,8 +474,8 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
                 return Err(NOT_A_CREDENTIAL);
             }
             let id = entries.value().bytes()?.to_vec();
-            // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
-            if id.is_empty() || id.len() > MAX_USER_ID_LEN {
+            // A user ID is at most 64 bytes (WebAuthn L3 §5.4.3) and may be empty (CTAP 2.2 §6.1).
+            if id.len() > MAX_USER_ID_LEN {
                 return Err(NOT_A_CREDENTIAL);
             }
             next = next_int_key(entries)?;

@@ -126,16 +126,20 @@ fn algorithm(
     })
 }
 
-/// Reads attestationFormatsPreference: whether it is the single format `none`, which asks for
-/// the attestation to be left out (§6.1.2 step 24).
+/// Reads attestationFormatsPreference: whether `none` comes before `packed`, the two supported
+/// formats, so the attestation is left out (§6.1.2: the supported format "with the lowest index in
+/// the supplied array"). A list naming neither keeps the default, packed.
 fn attestation_none(decoder: &mut Decoder<'_>) -> Result<bool, crate::cbor::Error> {
     decoder.array(|elements| {
-        let count = elements.remaining();
-        let mut none = false;
+        let mut chosen = None;
         while let Some(element) = elements.next_element() {
-            none = element.text()? == "none";
+            // Every element is read, so a malformed later one is still refused.
+            let format = element.text()?;
+            if chosen.is_none() && matches!(format, "none" | "packed") {
+                chosen = Some(format == "none");
+            }
         }
-        Ok(count == 1 && none)
+        Ok(chosen.unwrap_or(false))
     })
 }
 
@@ -299,9 +303,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if request.enterprise_attestation {
             return Err(StatusCode::InvalidParameter);
         }
-        // A discoverable credential stores the user handle, 1..=64 bytes (WebAuthn L3 §5.4.3);
-        // refused before anything asks the user.
-        if rk && (request.user.id.is_empty() || request.user.id.len() > MAX_USER_ID_LEN) {
+        // A discoverable credential stores the user handle, at most 64 bytes (WebAuthn L3
+        // §5.4.3), refused before anything asks the user; an empty one is valid (CTAP 2.2 §6.1,
+        // user: "an empty account identifier is valid").
+        if rk && request.user.id.len() > MAX_USER_ID_LEN {
             return Err(StatusCode::InvalidParameter);
         }
         let rp_id_hash = self.crypto.sha256(&[request.rp_id.as_bytes()]);
@@ -378,17 +383,43 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             }
         };
         self.consume_token_flags();
-        // Steps 21 to 23: the key pair, stored as the origin and discoverability require.
-        let created = self.create(&keys, request, &rp_id_hash, origin, rk, alg)?;
+        // Steps 21 to 23: the key pair, stored as the origin and discoverability require. A
+        // discoverable credential enters the index only once its response is written: until
+        // then the one it replaces keeps its entry and key, as the RP has received no other.
+        let (created, reservation) = self.create(&keys, request, &rp_id_hash, origin, rk, alg)?;
+        let written = self.attest(request, &rp_id_hash, (uv, origin), &created, encoder);
+        match (written, reservation) {
+            (Ok(()), Some(reservation)) => {
+                self.store.commit(reservation, &created.id)?;
+            }
+            (Ok(()), None) => {}
+            (Err(status), Some(reservation)) => {
+                self.store.release(reservation);
+                return Err(status);
+            }
+            (Err(status), None) => return Err(status),
+        }
         if on_tap {
             self.use_nfc_tap();
         }
+        Ok(())
+    }
+
+    /// Writes the response for `created` (§6.1.2 step 24): packed self attestation, or none when
+    /// the preference puts it first.
+    fn attest(
+        &mut self,
+        request: &MakeCredentialRequest,
+        rp_id_hash: &[u8; KEY_LEN],
+        (uv, origin): (bool, Origin),
+        created: &Created,
+        encoder: &mut Encoder<'_>,
+    ) -> Result<(), StatusCode> {
         let auth_data = authenticator_data(
-            &rp_id_hash,
+            rp_id_hash,
             flags(true, uv, origin) | AT,
             Some((&created.id, &created.public_key)),
         )?;
-        // Step 24: packed self attestation, or none when that is the only format asked for.
         if request.attestation_none {
             write_full(
                 encoder
@@ -426,7 +457,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// device-only key is drawn from the TRNG into a key slot when discoverable, or derived under
     /// the device key `K_dev` when not, so nothing outside NVM reproduces it. A discoverable
     /// credential takes the index slot of the one it replaces for this RP and user (step 22.2),
-    /// or a free one; no room is CTAP2_ERR_KEY_STORE_FULL (step 22.4).
+    /// or a free one; no room is CTAP2_ERR_KEY_STORE_FULL (step 22.4). Its reservation comes
+    /// back uncommitted, for the caller to commit or release.
     fn create(
         &mut self,
         keys: &KeyRing,
@@ -435,7 +467,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         origin: Origin,
         rk: bool,
         alg: i64,
-    ) -> Result<Created, StatusCode> {
+    ) -> Result<(Created, Option<Reservation>), StatusCode> {
         let reset_id = self.store.config().reset_id;
         let reservation = if rk {
             let crypto = &self.crypto;
@@ -448,18 +480,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         } else {
             None
         };
-        let outcome = self.create_reserved(keys, request, origin, alg, reservation.as_ref());
-        match (outcome, reservation) {
-            (Ok(created), Some(reservation)) => {
-                self.store.commit(reservation, &created.id)?;
-                Ok(created)
-            }
-            (Ok(created), None) => Ok(created),
-            (Err(status), Some(reservation)) => {
-                self.store.release(reservation);
+        match self.create_reserved(keys, request, origin, alg, reservation.as_ref()) {
+            Ok(created) => Ok((created, reservation)),
+            Err(status) => {
+                if let Some(reservation) = reservation {
+                    self.store.release(reservation);
+                }
                 Err(status)
             }
-            (Err(status), None) => Err(status),
         }
     }
 

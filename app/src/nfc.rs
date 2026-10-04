@@ -9,7 +9,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use ledger_device_sdk::io::{ApduTransport, CommError, Command, Reply};
-use structured_passkeys_ctap::ctap2::StatusCode;
+use structured_passkeys_ctap::ctap2::{NfcTap, StatusCode};
 use structured_passkeys_ctap::nfc::{Apdu, Applet, Outcome};
 
 use crate::hid::Buffer;
@@ -24,8 +24,10 @@ pub struct Nfc {
     applet: Applet<MESSAGE_SIZE, &'static mut [u8; MESSAGE_SIZE]>,
     /// The applet holds a request the main loop has not taken yet.
     pending: bool,
-    /// When the applet was last selected: the NFC tap, until CTAP ends.
-    tap_ms: Option<u64>,
+    /// The last selection of the applet: the NFC tap, until CTAP ends.
+    tap: Option<NfcTap>,
+    /// The number of the last selection, which tells taps in one tick of the clock apart.
+    selections: u32,
 }
 
 impl Nfc {
@@ -44,7 +46,8 @@ impl Nfc {
         Self {
             applet: Applet::new(message),
             pending: false,
-            tap_ms: None,
+            tap: None,
+            selections: 0,
         }
     }
 
@@ -69,7 +72,13 @@ impl Nfc {
                 send(command.reply(reply.data, Reply(reply.sw.0)));
             }
             Outcome::Selected(reply) => {
-                self.tap_ms = Some(now_ms);
+                // Wraps after 2^32 selections: a number only has to differ from the one the last
+                // credential operation used.
+                self.selections = self.selections.wrapping_add(1);
+                self.tap = Some(NfcTap {
+                    at_ms: now_ms,
+                    selection: self.selections,
+                });
                 send(command.reply(reply.data, Reply(reply.sw.0)));
             }
             Outcome::Request if busy => {
@@ -82,7 +91,7 @@ impl Nfc {
             Outcome::Request => self.pending = true,
         }
         if !self.applet.selected() {
-            self.tap_ms = None;
+            self.tap = None;
         }
     }
 
@@ -115,9 +124,9 @@ impl Nfc {
         self.applet.cancelled()
     }
 
-    /// The NFC tap that still counts: the time the applet was selected, until CTAP ends.
-    pub const fn tap_ms(&self) -> Option<u64> {
-        self.tap_ms
+    /// The NFC tap that still counts: the last selection of the applet, until CTAP ends.
+    pub const fn tap(&self) -> Option<NfcTap> {
+        self.tap
     }
 }
 

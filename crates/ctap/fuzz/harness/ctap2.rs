@@ -13,7 +13,9 @@
 use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
 use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::crypto::{Crypto, KEY_LEN};
-use structured_passkeys_ctap::ctap2::{Authenticator, Link, MaxMsgSize, Settings, Transports};
+use structured_passkeys_ctap::ctap2::{
+    Authenticator, Link, MaxMsgSize, NfcTap, Settings, Transports,
+};
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
 use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
@@ -147,7 +149,10 @@ pub fn run(data: &[u8]) {
         Link::Nfc
     };
     if answers & 0x80 != 0 {
-        authenticator.nfc_tap(0);
+        authenticator.nfc_tap(NfcTap {
+            at_ms: 0,
+            selection: 0,
+        });
     }
     let mut response = [0u8; 1024];
     let length = authenticator.process(request, link, &mut Fuzzed(answers), &mut response);
