@@ -29,10 +29,10 @@ restores the tries; a refused consent spends none (CTAP2_ERR_OPERATION_DENIED); 
 which the old PIN is wrong. The consent screen is compared with its snapshot like the selection
 screen.
 
-    fido_check.py --uv        on a device: built-in user verification, where the person allows
-                              the token on the consent screen and then enters the device PIN on
-                              the keypad, then once with a wrong PIN, after which built-in
-                              verification is blocked until a correct entry
+Built-in user verification (§6.5.5.7.3), which is the device unlock, in Speculos and on a device:
+getUVRetries offers one attempt; getPinUvAuthTokenUsingUvWithPermissions gives a token after the
+consent choice alone, no PIN asked, and a refused consent gives none (CTAP2_ERR_OPERATION_DENIED).
+Its consent screen, which names the RP, is compared with its snapshot.
 """
 
 import argparse
@@ -75,8 +75,8 @@ TIMEOUT_SLACK_S = 5
 SELECTION_TITLE = "Allow security key access?"
 SELECTION_CONFIRM = "Allow"
 SELECTION_REJECT = "Don't allow"
-# The title of the consent screen for a pinUvAuthToken obtained with the client PIN.
-TOKEN_TITLE = "Use your security key PIN?"
+# The title of the consent screen for a pinUvAuthToken, with the client PIN or built-in UV.
+TOKEN_TITLE = "Allow security key use?"
 # authenticatorClientPIN subcommands and response members (§6.5.5).
 GET_PIN_RETRIES = 0x01
 GET_KEY_AGREEMENT = 0x02
@@ -459,8 +459,9 @@ def check_client_pin(device: CtapHidDevice, user, snapshot) -> None:
     check(status == CtapError.ERR.PIN_INVALID, f"clientPIN: the old PIN is wrong now ({status!r})")
 
 
-def check_built_in_uv(device: CtapHidDevice) -> None:
-    """Built-in user verification on a device, with the person entering the device PIN."""
+def check_built_in_uv(device: CtapHidDevice, user, snapshot) -> None:
+    """Built-in user verification, which is the device unlock: the consent choice alone gives a
+    token, and refusing it gives none."""
     ctap = Ctap2(device)
     protocol = PinProtocolV2()
 
@@ -471,28 +472,19 @@ def check_built_in_uv(device: CtapHidDevice) -> None:
         )
         return protocol.decrypt(session.secret, response[PIN_UV_AUTH_TOKEN])
 
-    def uv_retries() -> int:
-        return ctap.client_pin(2, GET_UV_RETRIES)[UV_RETRIES]
-
-    check(uv_retries() == 1, "built-in UV: one attempt offered while the device count is full")
-    print(f"   on the device, choose {SELECTION_CONFIRM!r}, then enter the device PIN", flush=True)
+    uv_retries = ctap.client_pin(2, GET_UV_RETRIES)[UV_RETRIES]
+    check(uv_retries == 1, f"built-in UV: offered on the unlocked device ({uv_retries})")
     token: list[bytes] = []
-    status = ctap_status(lambda: token.append(uv_token()))
+    status = answered(user, True, TOKEN_TITLE, lambda: token.append(uv_token()), snapshot)
     check(
         status == CtapError.ERR.SUCCESS and [len(t) for t in token] == [32],
-        f"built-in UV: the device PIN gives a token ({status!r})",
+        f"built-in UV: consent gives a 32-byte token, no PIN asked ({status!r})",
     )
-    print(
-        f"   on the device, choose {SELECTION_CONFIRM!r}, then enter a WRONG device PIN once"
-        " (one of the device's three tries)",
-        flush=True,
+    status = answered(user, False, TOKEN_TITLE, uv_token)
+    check(
+        status == CtapError.ERR.OPERATION_DENIED,
+        f"built-in UV: a refused consent gives no token ({status!r})",
     )
-    status = ctap_status(uv_token)
-    check(status == CtapError.ERR.UV_BLOCKED, f"built-in UV: a wrong PIN blocks it ({status!r})")
-    check(uv_retries() == 0, "built-in UV: no attempt offered while the device count is not full")
-    status = ctap_status(uv_token)
-    check(status == CtapError.ERR.UV_BLOCKED, "built-in UV: refused without a keypad")
-    print("   unlock the device again with the correct PIN to restore its count")
 
 
 def snapshot_check(model: str, directory: Path, golden: bool, name: str, title: str):
@@ -519,7 +511,6 @@ def main() -> None:
     parser.add_argument("--model", help="Speculos model, for the screen and the snapshot")
     parser.add_argument("--snapshots", type=Path, help="directory of the screen snapshots")
     parser.add_argument("--golden", action="store_true", help="write the snapshots instead")
-    parser.add_argument("--uv", action="store_true", help="built-in user verification on a device")
     args = parser.parse_args()
 
     keepalives = KeepaliveLog()
@@ -559,8 +550,7 @@ def main() -> None:
     if args.speculos:
         # Speculos starts with empty NVM, so the PIN can be set; a device keeps its PIN.
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
-    if args.uv:
-        check_built_in_uv(device)
+    check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
     device.close()
 
 

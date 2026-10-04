@@ -10,14 +10,13 @@ use super::super::tests::{Asked, Scripted, TestAuthenticator, authenticator};
 use crate::cbor::{Decoder, Encoder, Key};
 use crate::crypto::Crypto;
 use crate::pin::{INITIAL_USAGE_TIME_LIMIT_MS, Permissions, Protocol};
-use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS, Verification};
+use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS};
 
 const OK: u8 = 0x00;
 const INVALID_PARAMETER: u8 = 0x02;
 const MISSING_PARAMETER: u8 = 0x14;
 const OPERATION_DENIED: u8 = 0x27;
 const KEEPALIVE_CANCEL: u8 = 0x2D;
-const USER_ACTION_TIMEOUT: u8 = 0x2F;
 const PIN_INVALID: u8 = 0x31;
 const PIN_BLOCKED: u8 = 0x32;
 const PIN_AUTH_INVALID: u8 = 0x33;
@@ -26,7 +25,6 @@ const PIN_NOT_SET: u8 = 0x35;
 const PIN_POLICY_VIOLATION: u8 = 0x37;
 const UV_BLOCKED: u8 = 0x3C;
 const INVALID_SUBCOMMAND: u8 = 0x3E;
-const UV_INVALID: u8 = 0x3F;
 const UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 /// A member value of a request.
@@ -1061,9 +1059,9 @@ fn uv_token(
     (response, session)
 }
 
-/// Built-in UV (§6.5.5.7.3): consent naming the permissions and the RP (step 9), then the device
-/// PIN on the keypad (step 10), gives a token with user presence, no client PIN needed; the token
-/// is the device's.
+/// Built-in UV (§6.5.5.7.3) is the device unlock: consent naming the permissions and the RP
+/// (step 9), and nothing more, gives a token with user presence on an unlocked device, no client
+/// PIN needed; the token is the device's.
 #[test]
 fn built_in_uv_gives_a_token_with_presence() {
     let mut authenticator = authenticator();
@@ -1076,16 +1074,13 @@ fn built_in_uv_gives_a_token_with_presence() {
     assert_eq!(token, authenticator.client_pin.token(Protocol::Two)[..]);
     assert_eq!(
         ui.asked,
-        [
-            (
-                Asked::Token {
-                    permissions: 0x02,
-                    rp_id: Some("example.com".into())
-                },
-                USER_ACTION_TIMEOUT_MS
-            ),
-            (Asked::Keypad, USER_ACTION_TIMEOUT_MS)
-        ]
+        [(
+            Asked::Token {
+                permissions: 0x02,
+                rp_id: Some("example.com".into())
+            },
+            USER_ACTION_TIMEOUT_MS
+        )]
     );
     assert!(authenticator.client_pin.user_present(1_000));
     assert!(
@@ -1100,34 +1095,12 @@ fn built_in_uv_gives_a_token_with_presence() {
     );
 }
 
-/// Built-in UV failures (§6.5.5.7.3 step 11): a wrong entry leaves no attempt, so it is
-/// UV_BLOCKED; a keypad not offered is UV_BLOCKED before any screen; backing out of the keypad
-/// is a failed verification with the attempt still offered, UV_INVALID; a cancel
-/// KEEPALIVE_CANCEL, no entry USER_ACTION_TIMEOUT. No token results.
+/// Built-in UV refusals: consent not approved (§6.5.5.7.3 step 9) is OPERATION_DENIED, a cancel
+/// KEEPALIVE_CANCEL; a device whose PIN the operating system does not hold validated offers no
+/// attempt (`uvRetries` 0), so the request is UV_BLOCKED (step 8) before any screen. No token
+/// results.
 #[test]
 fn built_in_uv_failures() {
-    for (verification, status) in [
-        (Verification::Invalid, UV_BLOCKED),
-        (Verification::Blocked, UV_BLOCKED),
-        (Verification::Rejected, UV_INVALID),
-        (Verification::Cancelled, KEEPALIVE_CANCEL),
-        (Verification::TimedOut, USER_ACTION_TIMEOUT),
-    ] {
-        let mut authenticator = authenticator();
-        let mut ui = Scripted::new(Answer::Confirmed);
-        ui.verification = verification;
-        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), Some("example.com"));
-        assert_eq!(response, [status], "{verification:?}");
-        assert_eq!(
-            ui.asked.last(),
-            Some(&(Asked::Keypad, USER_ACTION_TIMEOUT_MS)),
-            "{verification:?}"
-        );
-        assert!(!authenticator.client_pin.in_use(0), "{verification:?}");
-    }
-
-    // Consent not approved (§6.5.5.7.3 step 9) is OPERATION_DENIED and shows no keypad, so no
-    // device PIN try is at stake; a cancel ends the request as for any screen.
     for (answer, status) in [
         (Answer::Rejected, OPERATION_DENIED),
         (Answer::TimedOut, OPERATION_DENIED),
@@ -1153,10 +1126,11 @@ fn built_in_uv_failures() {
 
     let mut authenticator = authenticator();
     let mut ui = Scripted::new(Answer::Confirmed);
-    ui.uv_retries = 0;
+    ui.unlocked = false;
     let (response, _) = uv_token(&mut authenticator, &mut ui, Some(0x01), Some("example.com"));
     assert_eq!(response, [UV_BLOCKED]);
-    assert_eq!(ui.asked, [], "no keypad when no attempt is offered");
+    assert_eq!(ui.asked, [], "no screen when no attempt is offered");
+    assert!(!authenticator.client_pin.in_use(0));
 }
 
 /// mc and ga need a permissions RP ID (CTAP 2.2 §6.5.5.7, the RP ID column "Required"): without
@@ -1193,7 +1167,7 @@ fn rp_scoped_permissions_need_an_rp_id() {
 }
 
 /// Built-in UV requires permissions (MISSING_PARAMETER), refuses 0 (INVALID_PARAMETER) and acfg
-/// without uvAcfg (UNAUTHORIZED_PERMISSION), all before the keypad.
+/// without uvAcfg (UNAUTHORIZED_PERMISSION), all before any screen.
 #[test]
 fn built_in_uv_permission_checks() {
     let mut authenticator = authenticator();
@@ -1210,7 +1184,8 @@ fn built_in_uv_permission_checks() {
     assert_eq!(ui.asked, []);
 }
 
-/// getUVRetries answers what the device offers: {5: 1} while the device count is full.
+/// getUVRetries answers {5: 1} while the operating system holds the device PIN validated, and
+/// {5: 0} when it does not.
 #[test]
 fn get_uv_retries_reports_the_device() {
     let mut authenticator = authenticator();
@@ -1221,7 +1196,7 @@ fn get_uv_retries_reports_the_device() {
         &request(&[(0x02, Value::Uint(0x07))]),
     );
     assert_eq!(response, [0x00, 0xA1, 0x05, 0x01]);
-    ui.uv_retries = 0;
+    ui.unlocked = false;
     let response = run(
         &mut authenticator,
         &mut ui,

@@ -12,20 +12,17 @@
 //! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
-//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
+//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
 //!
-//! /// A user who confirms everything and has no PIN to enter.
+//! /// A user who confirms everything on an unlocked device.
 //! struct Present;
 //!
 //! impl Ui for Present {
 //!     fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
 //!         Answer::Confirmed
 //!     }
-//!     fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
-//!         Verification::Blocked
-//!     }
-//!     fn uv_retries(&mut self) -> u8 {
-//!         0
+//!     fn device_unlocked(&mut self) -> bool {
+//!         true
 //!     }
 //!     fn now_ms(&self) -> u64 {
 //!         0

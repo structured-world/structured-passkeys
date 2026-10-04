@@ -16,6 +16,29 @@ Rules a change in this repository must meet. Reviewers check them; the gate scri
 - The pull request description states the scope and acceptance checks of the change; a behavior
   change without them is incomplete.
 
+## CTAP on a Ledger device
+
+CTAP describes a dedicated security key that owns its power, its PIN and its storage; this
+application runs inside a Ledger wallet, where the operating system owns all three.
+
+- Behavior the platform sees (requests and responses, status codes, getInfo members, the order of
+  the checks) follows the specification literally: browsers and operating systems implement it
+  and adapt to nothing else.
+- Mechanics inside the device follow the Ledger platform, and a review does not ask to put the
+  dedicated-key model back. The accepted mappings:
+  - Built-in user verification is the device unlock: the person entered the device PIN to unlock
+    the device, so performBuiltInUv succeeds while `os_global_pin_is_validated()` holds. The
+    application never asks for the device PIN, holds no PIN permission, and spends none of the
+    device's own tries (three wrong entries wipe the device).
+  - The power cycle of CTAP is opening the application.
+  - authenticatorReset keeps the 10-second window after the application opens, which CTAP 2.2
+    §6.6 requires only without a display, so a reset never reaches a device sitting open.
+  - getInfo reports the options of a feature (`clientPin`, `pinUvAuthToken`, `uv`, `rk`) together
+    with the commands that use it, so a platform never starts a flow that ends in a command the
+    application does not have yet.
+- A new mapping is a decision about the product, not a review fix: it comes with its reason in
+  the code and is added to this list.
+
 ## Code
 
 - Protocol logic lives in `crates/ctap`, which is `#![no_std]` with `alloc`; `std` only behind the

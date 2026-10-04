@@ -10,7 +10,7 @@ use structured_passkeys_ctap::crypto::{Crypto, KEY_LEN};
 use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings};
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
-use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
+use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
 
 /// The status codes of CTAP 2.2 §8.2 the authenticator may answer with.
 const STATUS_CODES: [u8; 46] = [
@@ -19,8 +19,8 @@ const STATUS_CODES: [u8; 46] = [
     0x33, 0x34, 0x35, 0x36, 0x37, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x7F,
 ];
 
-/// A user whose answers come from one byte: bits 0-1 the confirmation, bits 2-4 the keypad,
-/// bit 5 whether built-in verification is offered.
+/// A user whose answers come from one byte: bits 0-1 the confirmation, bit 5 whether the device
+/// is locked.
 struct Fuzzed(u8);
 
 impl Ui for Fuzzed {
@@ -33,19 +33,8 @@ impl Ui for Fuzzed {
         }
     }
 
-    fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
-        match (self.0 >> 2) & 0x07 {
-            0 => Verification::Verified,
-            1 => Verification::Invalid,
-            2 => Verification::Blocked,
-            3 => Verification::Rejected,
-            4 => Verification::Cancelled,
-            _ => Verification::TimedOut,
-        }
-    }
-
-    fn uv_retries(&mut self) -> u8 {
-        u8::from(self.0 & 0x20 == 0)
+    fn device_unlocked(&mut self) -> bool {
+        self.0 & 0x20 == 0
     }
 
     fn now_ms(&self) -> u64 {
