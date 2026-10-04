@@ -235,10 +235,9 @@ impl<'a> DeviceUi<'a> {
         }
     }
 
-    /// Starts a ceremony that may take `timeout_ms`: the transport says that the user is needed,
-    /// and the returned deadline bounds every screen of the ceremony together.
+    /// Starts a ceremony that may take `timeout_ms`: the returned deadline bounds every screen of
+    /// the ceremony together.
     fn begin(&mut self, timeout_ms: u32) -> u64 {
-        self.waiting_for_user(true);
         hid::now_ms()
             .checked_add(u64::from(timeout_ms))
             .expect("a u64 millisecond clock outlives the device")
@@ -255,8 +254,8 @@ impl<'a> DeviceUi<'a> {
         self.home.show_and_return();
     }
 
-    /// Shows one choice screen and takes events until it is answered, the request ends or the
-    /// deadline passes.
+    /// Shows one choice screen, with the transport saying that the user is needed, and takes
+    /// events until it is answered, the request ends or the deadline passes.
     fn choose(&mut self, choices: &Choices, deadline_ms: u64) -> Answer {
         OUTCOME.store(PENDING, Ordering::Relaxed);
         let icon = self.icon();
@@ -272,6 +271,10 @@ impl<'a> DeviceUi<'a> {
                 Some(choice_callback),
             );
         }
+        // Said once the screen is drawn: the status change sends a keepalive at once, and a
+        // drawing after it would stretch the gap to the next one. Later screens of the ceremony
+        // leave the status unchanged, which sends nothing.
+        self.waiting_for_user(true);
         loop {
             match OUTCOME.load(Ordering::Relaxed) {
                 PENDING => {}
