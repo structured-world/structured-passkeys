@@ -134,8 +134,7 @@ const fn origin_meaning(origin: Origin) -> &'static str {
             "Restored from your recovery phrase, after an app update or on another Ledger."
         }
         Origin::DeviceOnly => {
-            "Kept on this device alone: an app update or uninstall deletes it, so keep a second \
-             sign-in method."
+            "An app update or uninstall deletes it, so keep a second sign-in method."
         }
     }
 }
