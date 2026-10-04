@@ -24,6 +24,10 @@ rustup toolchain install "$toolchain" --profile minimal
 # in sync and builds exactly what is committed.
 cargo "+$toolchain" metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml >/dev/null
 
+# cargo-fuzz builds for the target it was itself built for unless told otherwise, and a prebuilt
+# cargo-fuzz is a static musl binary on Linux; the targets are built for the toolchain's host.
+host=$(rustc "+$toolchain" -vV | awk '/^host:/ { print $2 }')
+
 targets=$(cargo "+$toolchain" fuzz list)
 if [[ -z "$targets" ]]; then
     echo "no fuzz targets in crates/ctap/fuzz" >&2
@@ -31,5 +35,5 @@ if [[ -z "$targets" ]]; then
 fi
 for target in $targets; do
     echo "== fuzz $target, ${seconds}s"
-    cargo "+$toolchain" fuzz run "$target" -- -max_total_time="$seconds"
+    cargo "+$toolchain" fuzz run --target "$host" "$target" -- -max_total_time="$seconds"
 done
