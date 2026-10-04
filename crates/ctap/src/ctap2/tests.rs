@@ -53,27 +53,19 @@ pub(super) enum Asked {
         permissions: u8,
         rp_id: Option<String>,
     },
-    /// The device PIN keypad, for a token with these permission bits and RP ID.
-    Keypad {
-        permissions: u8,
-        rp_id: Option<String>,
-    },
+    /// The device PIN keypad.
+    Keypad,
 }
 
 impl Asked {
-    fn from_prompt(prompt: Prompt<'_>, keypad: bool) -> Self {
+    fn from_prompt(prompt: Prompt<'_>) -> Self {
         match prompt {
             Prompt::Selection => Asked::Selection,
             Prompt::Reset => Asked::Reset,
-            Prompt::Token { permissions, rp_id } => {
-                let permissions = permissions.bits();
-                let rp_id = rp_id.map(String::from);
-                if keypad {
-                    Asked::Keypad { permissions, rp_id }
-                } else {
-                    Asked::Token { permissions, rp_id }
-                }
-            }
+            Prompt::Token { permissions, rp_id } => Asked::Token {
+                permissions: permissions.bits(),
+                rp_id: rp_id.map(String::from),
+            },
         }
     }
 }
@@ -103,14 +95,12 @@ impl Scripted {
 
 impl Ui for Scripted {
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
-        self.asked
-            .push((Asked::from_prompt(prompt, false), timeout_ms));
+        self.asked.push((Asked::from_prompt(prompt), timeout_ms));
         self.answer
     }
 
-    fn verify_user(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Verification {
-        self.asked
-            .push((Asked::from_prompt(prompt, true), timeout_ms));
+    fn verify_user(&mut self, timeout_ms: u32) -> Verification {
+        self.asked.push((Asked::Keypad, timeout_ms));
         if self.verification == Verification::Invalid {
             // A wrong entry leaves the operating system's count short of full.
             self.uv_retries = 0;

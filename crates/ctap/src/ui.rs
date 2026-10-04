@@ -69,11 +69,10 @@ pub trait Ui {
     /// Asks the user to confirm `prompt` within `timeout_ms`.
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer;
 
-    /// Asks the user to enter the device PIN for `prompt` within `timeout_ms` and has the
-    /// operating system check it; the keypad states what the PIN is for, so entering it is the
-    /// consent to `prompt` and backing out the refusal. Offered only while
-    /// [`Ui::uv_retries`] is not zero.
-    fn verify_user(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Verification;
+    /// Asks the user to enter the device PIN within `timeout_ms` and has the operating system
+    /// check it. The consent to what the PIN is for comes before, through [`Ui::confirm`], so the
+    /// keypad says nothing more. Offered only while [`Ui::uv_retries`] is not zero.
+    fn verify_user(&mut self, timeout_ms: u32) -> Verification;
 
     /// Built-in user verification attempts the device offers now (`uvRetries`, §6.5.2.3): one
     /// while the operating system's retry count is full, none otherwise, so the application

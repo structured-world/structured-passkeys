@@ -269,29 +269,20 @@ impl Ui for DeviceUi<'_> {
         }
     }
 
-    fn verify_user(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Verification {
+    fn verify_user(&mut self, timeout_ms: u32) -> Verification {
         // The device's own count: three wrong entries wipe it. The keypad is offered only while
         // the count is full, so this application spends at most one try before a correct
         // entry, here or at unlock, restores it.
         if self.uv_retries() == 0 {
             return Verification::Blocked;
         }
-        // The keypad names what the PIN is for: entering it is the consent to the token.
-        let title = match prompt {
-            Prompt::Token {
-                rp_id: Some(rp_id), ..
-            } => Text::new(&["Device PIN to sign in to ", rp_id]),
-            Prompt::Token { .. } | Prompt::Selection | Prompt::Reset => {
-                Text::new(&["Enter your device PIN"])
-            }
-        };
         PIN.wipe();
         OUTCOME.store(PENDING, Ordering::Relaxed);
-        // SAFETY: the title is NUL-terminated and lives in this frame; the callbacks only write
-        // the statics above, and the wait below ends the keypad before this function returns.
+        // SAFETY: the title is a static C string; the callbacks only write the statics above, and
+        // the wait below ends the keypad before this function returns.
         unsafe {
             nbgl_useCaseKeypad(
-                title.as_ptr(),
+                c"Enter your device PIN".as_ptr(),
                 PIN_MIN_DIGITS,
                 PIN_MAX_DIGITS,
                 true,
