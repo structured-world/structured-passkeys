@@ -117,6 +117,9 @@ extern "C" fn sample_main(_arg0: u32) {
             CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
             CommandOrEvent::Event(_) => {}
         }
+        if ui::home_due() {
+            home.show_and_return();
+        }
         // Parsed while the transport holds the request; run once it is released, so the screen
         // of a waiting command can take events.
         if let Some(command) = hid::take_request(|request| authenticator.parse(request)) {

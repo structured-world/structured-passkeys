@@ -8,17 +8,20 @@
 //!
 //! Every screen is one `nbgl_useCaseChoice`, which looks the same on all five devices; a ceremony
 //! that needs more than two answers (the key origin at registration, the account to sign in with)
-//! is a short chain of them within one timeout.
+//! is a short chain of them within one timeout. Each screen carries the system icon Ledger's own
+//! applications use for that kind of question, and an answered registration, sign-in or reset
+//! ends on the system status page, as in Ledger's Security Key.
 
-use core::ffi::c_char;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::ffi::{CStr, c_char};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
 use ledger_device_sdk::io::ApduTransport;
 use ledger_device_sdk::io::{CommandOrEvent, DecodedEventType};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
 use ledger_device_sdk::sys::{
-    BOLOS_TRUE, nbgl_icon_details_t, nbgl_useCaseChoice, os_global_pin_is_validated,
+    BOLOS_TRUE, nbgl_icon_details_t, nbgl_useCaseChoice, nbgl_useCaseStatus,
+    os_global_pin_is_validated,
 };
 use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::ctap2::Link;
@@ -50,6 +53,135 @@ static OUTCOME: AtomicU8 = AtomicU8::new(PENDING);
 const PENDING: u8 = 0;
 const CONFIRMED: u8 = 1;
 const REJECTED: u8 = 2;
+
+/// Set when a status page has had its time, for the main loop to show the home screen again.
+static HOME_DUE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the status page that ended the last ceremony is done, so the home screen is due; the
+/// main loop asks after every event.
+pub fn home_due() -> bool {
+    // A load and a store, as the Nano X core has no atomic swap: the page's callback runs only
+    // while an event is taken, never between the two.
+    let due = HOME_DUE.load(Ordering::Relaxed);
+    if due {
+        HOME_DUE.store(false, Ordering::Relaxed);
+    }
+    due
+}
+
+unsafe extern "C" fn status_ended() {
+    HOME_DUE.store(true, Ordering::Relaxed);
+}
+
+/// Copies of the NBGL system glyphs (`lib_nbgl/glyphs` of Ledger's secure SDK, Apache-2.0) at
+/// each device's size, built like the application's own icon. The SDK compiles its glyphs into
+/// the application too, but as C data that Rust code reaches only through `extern` statics, which
+/// the `ropi-rwpi` device targets do not address correctly.
+mod system {
+    use ledger_device_sdk::include_gif;
+    use ledger_device_sdk::nbgl::NbglGlyph;
+
+    #[cfg(any(target_os = "stax", target_os = "flex"))]
+    mod size {
+        use super::{NbglGlyph, include_gif};
+
+        pub const SHIELD: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/64px/SecurityShield_64px.png",
+            NBGL
+        ));
+        pub const BACKUP: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/64px/Shield_Backup_64px.png",
+            NBGL
+        ));
+        pub const LOGIN: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/64px/Login_64px.png", NBGL));
+        pub const ACCOUNTS: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/64px/Address_Book_64px.png", NBGL));
+        pub const WARNING: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/64px/Warning_64px.png", NBGL));
+        pub const NOTICE: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/64px/Important_Circle_64px.png",
+            NBGL
+        ));
+    }
+
+    #[cfg(target_os = "apex_p")]
+    mod size {
+        use super::{NbglGlyph, include_gif};
+
+        pub const SHIELD: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/48px/SecurityShield_48px.png",
+            NBGL
+        ));
+        pub const BACKUP: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/48px/Shield_Backup_48px.png",
+            NBGL
+        ));
+        pub const LOGIN: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/48px/Login_48px.png", NBGL));
+        pub const ACCOUNTS: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/48px/Address_Book_48px.png", NBGL));
+        pub const WARNING: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/48px/Warning_48px.png", NBGL));
+        pub const NOTICE: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/48px/Important_Circle_48px.png",
+            NBGL
+        ));
+    }
+
+    // The Nano set has no backup shield: that screen keeps the application's key.
+    #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+    mod size {
+        use super::{NbglGlyph, include_gif};
+
+        pub const SHIELD: NbglGlyph = NbglGlyph::from_include(include_gif!(
+            "glyphs/nbgl/nano/SecurityShield_14px.png",
+            NBGL
+        ));
+        pub const LOGIN: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/nano/Login_14px.png", NBGL));
+        pub const ACCOUNTS: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/nano/Address_Book_14px.png", NBGL));
+        pub const WARNING: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/nano/icon_warning.gif", NBGL));
+        pub const NOTICE: NbglGlyph =
+            NbglGlyph::from_include(include_gif!("glyphs/nbgl/nano/Alert_circle_14px.png", NBGL));
+    }
+
+    pub use size::*;
+}
+
+/// What a screen asks about, which picks its icon.
+#[derive(Clone, Copy)]
+enum Icon {
+    /// The application's key: a passkey being created.
+    App,
+    /// Access to the security key: selection and a token.
+    Shield,
+    /// A key the recovery phrase restores.
+    Backup,
+    /// Signing in.
+    Login,
+    /// Choosing between accounts.
+    Accounts,
+    /// Something that is lost or erased: a device-only key, a reset.
+    Warning,
+    /// A registration that cannot go ahead.
+    Notice,
+}
+
+/// How a ceremony ended, which decides what replaces its screens.
+enum Ending {
+    /// Cancelled or timed out: the request is answered at once.
+    Unanswered,
+    /// Answered, with work left that the transport reports as processing.
+    Answered,
+    /// Answered, and the status page says how.
+    Reported {
+        success: bool,
+        message: &'static CStr,
+    },
+}
 
 /// Room for a composed screen text: the longest sentence with a 64-byte RP ID and a 64-byte name.
 const TEXT_LEN: usize = 256;
@@ -171,8 +303,9 @@ unsafe extern "C" fn choice_callback(confirm: bool) {
     );
 }
 
-/// The four strings of a choice screen.
+/// The icon and the four strings of a choice screen.
 struct Choices {
+    icon: Icon,
     message: *const c_char,
     sub_message: *const c_char,
     confirm: *const c_char,
@@ -243,22 +376,44 @@ impl<'a> DeviceUi<'a> {
             .expect("a u64 millisecond clock outlives the device")
     }
 
-    /// Ends a ceremony: back to the home screen. Only an answered ceremony leaves work after it,
-    /// which the keepalives and status updates then report as processing; a cancelled or
-    /// timed-out request is answered at once, and a keepalive in front of that answer would tell
-    /// the host nothing.
-    fn end(&mut self, answered: bool) {
-        if answered {
+    /// Ends a ceremony with the home screen or a status page, which the main loop replaces with
+    /// the home screen when its time is up. Only an answered ceremony leaves work after it, which
+    /// the keepalives and status updates then report as processing; a cancelled or timed-out
+    /// request is answered at once, and a keepalive in front of that answer would tell the host
+    /// nothing. The status change follows the drawing, as in [`Self::choose`].
+    fn end(&mut self, ending: Ending) {
+        match ending {
+            Ending::Unanswered | Ending::Answered => self.home.show_and_return(),
+            Ending::Reported { success, message } => {
+                // A status page replaced before its time never calls back; a flag left by one
+                // that did must not end this one early.
+                HOME_DUE.store(false, Ordering::Relaxed);
+                // SAFETY: the message is a static NUL-terminated string; the page starts its own
+                // timer and returns at once.
+                unsafe { nbgl_useCaseStatus(message.as_ptr(), success, Some(status_ended)) };
+            }
+        }
+        if !matches!(ending, Ending::Unanswered) {
             self.waiting_for_user(false);
         }
-        self.home.show_and_return();
     }
 
     /// Shows one choice screen, with the transport saying that the user is needed, and takes
     /// events until it is answered, the request ends or the deadline passes.
     fn choose(&mut self, choices: &Choices, deadline_ms: u64) -> Answer {
         OUTCOME.store(PENDING, Ordering::Relaxed);
-        let icon = self.icon();
+        let icon: nbgl_icon_details_t = match choices.icon {
+            Icon::App => self.glyph.into(),
+            Icon::Shield => (&system::SHIELD).into(),
+            #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+            Icon::Backup => (&system::BACKUP).into(),
+            #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+            Icon::Backup => self.glyph.into(),
+            Icon::Login => (&system::LOGIN).into(),
+            Icon::Accounts => (&system::ACCOUNTS).into(),
+            Icon::Warning => (&system::WARNING).into(),
+            Icon::Notice => (&system::NOTICE).into(),
+        };
         // SAFETY: the strings are NUL-terminated, static or composed in the caller's frame, and
         // they and `icon` outlive the screen, which the wait below ends before the caller returns.
         unsafe {
@@ -315,9 +470,21 @@ impl<'a> DeviceUi<'a> {
             hid::refuse_request();
         }
     }
+}
 
-    fn icon(&self) -> nbgl_icon_details_t {
-        self.glyph.into()
+/// The status page of an answered sign-in. It names the answer, not the result: the signature is
+/// made after the page appears.
+const fn signed_in(confirmed: bool) -> Ending {
+    if confirmed {
+        Ending::Reported {
+            success: true,
+            message: c"Sign-in confirmed",
+        }
+    } else {
+        Ending::Reported {
+            success: false,
+            message: c"Sign-in cancelled",
+        }
     }
 }
 
@@ -339,6 +506,7 @@ impl Ui for DeviceUi<'_> {
             // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
             // why it names none.
             Prompt::Selection => Choices {
+                icon: Icon::Shield,
                 message: c"Allow security key access?".as_ptr(),
                 sub_message: c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
                 confirm: c"Allow".as_ptr(),
@@ -348,8 +516,9 @@ impl Ui for DeviceUi<'_> {
             // while this application's data lasts: reinstalling it without restoring a backup
             // brings them back.
             Prompt::Reset => Choices {
+                icon: Icon::Warning,
                 message: c"Reset the security key?".as_ptr(),
-                sub_message: c"Erases the passkeys kept only on this device, the security key PIN and its settings, and stops passkeys from your recovery phrase working. Those come back if the app is reinstalled without restoring its backup.".as_ptr(),
+                sub_message: c"Erases this device's passkeys, the PIN and settings, and stops your recovery phrase passkeys. Reinstalling the app without its backup brings those back.".as_ptr(),
                 confirm: c"Reset".as_ptr(),
                 reject: c"Cancel".as_ptr(),
             },
@@ -368,6 +537,7 @@ impl Ui for DeviceUi<'_> {
                     ".",
                 ]);
                 Choices {
+                    icon: Icon::Shield,
                     message: c"Allow security key use?".as_ptr(),
                     sub_message: sub_message.as_ptr(),
                     confirm: c"Allow".as_ptr(),
@@ -385,6 +555,7 @@ impl Ui for DeviceUi<'_> {
                     account.origin.map_or("", origin_name),
                 ]);
                 Choices {
+                    icon: Icon::Login,
                     message: message.as_ptr(),
                     sub_message: sub_message.as_ptr(),
                     confirm: c"Sign in".as_ptr(),
@@ -400,6 +571,7 @@ impl Ui for DeviceUi<'_> {
                     ".",
                 ]);
                 Choices {
+                    icon: Icon::Notice,
                     message: c"Already registered".as_ptr(),
                     sub_message: sub_message.as_ptr(),
                     confirm: c"OK".as_ptr(),
@@ -409,7 +581,22 @@ impl Ui for DeviceUi<'_> {
         };
         let deadline_ms = self.begin(timeout_ms);
         let answer = self.choose(&choices, deadline_ms);
-        self.end(matches!(answer, Answer::Confirmed | Answer::Rejected));
+        let ending = match (answer, prompt) {
+            (Answer::Cancelled | Answer::TimedOut, _) => Ending::Unanswered,
+            (answer, Prompt::Assertion { .. }) => signed_in(answer == Answer::Confirmed),
+            (Answer::Confirmed, Prompt::Reset) => Ending::Reported {
+                success: true,
+                message: c"Security key reset",
+            },
+            (Answer::Rejected, Prompt::Reset) => Ending::Reported {
+                success: false,
+                message: c"Reset cancelled",
+            },
+            // A selection or a token is followed by the request it prepares, and an excluded
+            // registration has said all there is.
+            _ => Ending::Answered,
+        };
+        self.end(ending);
         answer
     }
 
@@ -430,6 +617,7 @@ impl Ui for DeviceUi<'_> {
                 origin_meaning(origin),
             ]);
             let summary = Choices {
+                icon: Icon::App,
                 message: message.as_ptr(),
                 sub_message: sub_message.as_ptr(),
                 confirm: c"Create passkey".as_ptr(),
@@ -444,6 +632,12 @@ impl Ui for DeviceUi<'_> {
             let message = Text::new(&["Use ", origin_name(other), "?"]);
             let sub_message = Text::new(&[origin_meaning(other)]);
             let switch = Choices {
+                // What the key type keeps or loses, as Ledger warns before keys stored only on
+                // the device.
+                icon: match other {
+                    Origin::SeedRecoverable => Icon::Backup,
+                    Origin::DeviceOnly => Icon::Warning,
+                },
                 message: message.as_ptr(),
                 sub_message: sub_message.as_ptr(),
                 confirm: c"Use this key type".as_ptr(),
@@ -454,7 +648,17 @@ impl Ui for DeviceUi<'_> {
                 answer => break unanswered(answer),
             }
         };
-        self.end(matches!(outcome, Choice::Chose(_) | Choice::Rejected));
+        self.end(match outcome {
+            Choice::Chose(_) => Ending::Reported {
+                success: true,
+                message: c"Registration confirmed",
+            },
+            Choice::Rejected => Ending::Reported {
+                success: false,
+                message: c"Registration cancelled",
+            },
+            Choice::Cancelled | Choice::TimedOut => Ending::Unanswered,
+        });
         outcome
     }
 
@@ -483,6 +687,7 @@ impl Ui for DeviceUi<'_> {
                 total_text,
             ]);
             let choices = Choices {
+                icon: Icon::Accounts,
                 message: message.as_ptr(),
                 sub_message: sub_message.as_ptr(),
                 confirm: c"Sign in".as_ptr(),
@@ -504,7 +709,11 @@ impl Ui for DeviceUi<'_> {
                 }
             }
         }
-        self.end(matches!(outcome, Choice::Chose(_) | Choice::Rejected));
+        self.end(match outcome {
+            Choice::Chose(_) => signed_in(true),
+            Choice::Rejected => signed_in(false),
+            Choice::Cancelled | Choice::TimedOut => Ending::Unanswered,
+        });
         outcome
     }
 
