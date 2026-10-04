@@ -6,6 +6,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::{Digest, Sha256};
 
+use super::super::Link;
 use super::super::tests::{Asked, Scripted, TestAuthenticator, authenticator};
 use crate::cbor::{Decoder, Encoder, Key};
 use crate::crypto::Crypto;
@@ -72,7 +73,7 @@ fn request(members: &[(u64, Value)]) -> Vec<u8> {
 
 fn run(authenticator: &mut TestAuthenticator, ui: &mut Scripted, request: &[u8]) -> Vec<u8> {
     let mut response = [0u8; 512];
-    let length = authenticator.process(request, ui, &mut response);
+    let length = authenticator.process(request, Link::Usb, ui, &mut response);
     response[..length].to_vec()
 }
 

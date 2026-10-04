@@ -12,11 +12,12 @@ publish = false
 # `app_io_stack` runs the IO stack in the application, so the application can drive the FIDO HID
 # interface itself, `Comm::next_command_or_event` hands it the ticker events its transport clock
 # needs, `AtomicStorage::get_or_init` initializes the zeroed NVM Speculos loads and
-# `AtomicStorage::settle` erases the copy an update retired; they come from this fork of the
-# Ledger Rust SDK until the published crate has them.
+# `AtomicStorage::settle` erases the copy an update retired, and `nfc` builds the NFC card
+# emulation whose APDUs reach the application with their transport and Le; they come from this
+# fork of the Ledger Rust SDK until the published crate has them.
 # `sys` exposes the C SDK calls the application makes directly: the NBGL use cases its screens
 # start without the SDK's blocking wait, and whether the device is unlocked.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "f7c289a5da04fdbbb9da1eaf45252cc44e948952", features = ["io_new", "nano_nbgl", "app_io_stack", "sys"] }
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "bebc9afda85e470f8ced92193242409590217e70", features = ["io_new", "nano_nbgl", "app_io_stack", "nfc", "sys"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 zeroize = { version = "1.9.0", default-features = false }
 
@@ -25,7 +26,9 @@ zeroize = { version = "1.9.0", default-features = false }
 [package.metadata.ledger]
 name = "Structured Passkeys"
 curve = ["secp256r1"]
-# No application flags: built-in user verification is the device unlock, which needs none.
+# No application flags of its own: built-in user verification is the device unlock, which needs
+# none. The SDK adds APPLICATION_FLAG_BOLOS_SETTINGS on the devices with Bluetooth or NFC, which the
+# NFC stack needs to read whether NFC is enabled.
 flags = "0"
 path = ["5722689'/5262163'"]
 nanosplus = { icon = "icons/key_14x14.png" }

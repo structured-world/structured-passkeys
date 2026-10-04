@@ -9,7 +9,9 @@
 //! # Examples
 //!
 //! ```
-//! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
+//! use structured_passkeys_ctap::ctap2::{
+//!     Authenticator, Link, MaxMsgSize, Settings, StatusCode, Transports,
+//! };
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
 //! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
@@ -32,9 +34,10 @@
 //! let max_msg_size = MaxMsgSize::try_from(1024).expect("at least 1024");
 //! let crypto = SoftCrypto::new([1; 32], [2; 32]);
 //! let store = Store::open(MemoryStorage::new(4, 4));
-//! let mut authenticator = Authenticator::new(Settings { max_msg_size }, crypto, store);
+//! let settings = Settings { max_msg_size, transports: Transports::Usb };
+//! let mut authenticator = Authenticator::new(settings, crypto, store);
 //! let mut response = [0u8; 128];
-//! let length = authenticator.process(&[0x04], &mut Present, &mut response);
+//! let length = authenticator.process(&[0x04], Link::Usb, &mut Present, &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
 //! assert!(length > 1);
 //! ```
@@ -279,12 +282,46 @@ impl MaxMsgSize {
     }
 }
 
+/// The transports a device offers, reported as getInfo `transports` (§6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transports {
+    /// USB HID only.
+    Usb,
+    /// USB HID and NFC.
+    UsbAndNfc,
+}
+
+impl Transports {
+    /// The AuthenticatorTransport names (WebAuthn L3 §5.8.4) of the transports.
+    const fn names(self) -> &'static [&'static str] {
+        match self {
+            Transports::Usb => &["usb"],
+            Transports::UsbAndNfc => &["nfc", "usb"],
+        }
+    }
+}
+
 /// Device facts the authenticator reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// Largest request the transport accepts.
+    /// Largest request a transport accepts, the same on every transport.
     pub max_msg_size: MaxMsgSize,
+    /// The transports the device offers.
+    pub transports: Transports,
 }
+
+/// The transport a request arrived on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// USB HID (§11.2).
+    Usb,
+    /// NFC (§11.3).
+    Nfc,
+}
+
+/// How long an NFC tap counts as user presence: the "NFC user presence maximum time limit" of
+/// CTAP 2.2 (Terminology, "Evidence of user interaction"), two minutes.
+pub const NFC_PRESENCE_MS: u64 = 120_000;
 
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
 /// material, which exists once and is wiped when the request is dropped.
@@ -319,6 +356,9 @@ pub struct Authenticator<C, S> {
     crypto: C,
     store: Store<S>,
     client_pin: ClientPin,
+    /// When the device was last placed in an NFC field with the applet selected, the tap that
+    /// establishes user presence over NFC; `None` once the platform ended CTAP.
+    nfc_tap_ms: Option<u64>,
 }
 
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
@@ -332,7 +372,26 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             crypto,
             store,
             client_pin,
+            nfc_tap_ms: None,
         }
+    }
+
+    /// The NFC tap at `now_ms`: the device entered a reader's field and the platform selected the
+    /// FIDO applet. It establishes user presence over NFC for [`NFC_PRESENCE_MS`].
+    pub const fn nfc_tap(&mut self, now_ms: u64) {
+        self.nfc_tap_ms = Some(now_ms);
+    }
+
+    /// The platform deselected the applet: the tap no longer counts as presence.
+    pub const fn nfc_ended(&mut self) {
+        self.nfc_tap_ms = None;
+    }
+
+    /// Whether an NFC tap still counts as user presence at `now_ms`.
+    fn nfc_present(&self, now_ms: u64) -> bool {
+        self.nfc_tap_ms
+            .and_then(|tap_ms| now_ms.checked_sub(tap_ms))
+            .is_some_and(|age_ms| age_ms <= NFC_PRESENCE_MS)
     }
 
     /// The persistent state.
@@ -340,12 +399,18 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         &self.store
     }
 
-    /// Processes one request (command byte and CBOR parameters) and writes the response into
-    /// `response`, returning its length: [`Authenticator::parse`], then
+    /// Processes one request (command byte and CBOR parameters) that arrived on `link` and writes
+    /// the response into `response`, returning its length: [`Authenticator::parse`], then
     /// [`Authenticator::execute`].
-    pub fn process<U: Ui>(&mut self, request: &[u8], ui: &mut U, response: &mut [u8]) -> usize {
+    pub fn process<U: Ui>(
+        &mut self,
+        request: &[u8],
+        link: Link,
+        ui: &mut U,
+        response: &mut [u8],
+    ) -> usize {
         let command = self.parse(request);
-        self.execute(command, ui, response)
+        self.execute(command, link, ui, response)
     }
 
     /// Parses one request (command byte and CBOR parameters) into the command it asks for, or
@@ -389,13 +454,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         }
     }
 
-    /// Runs a parsed request, asking `ui` when the command waits for the user, and writes the
-    /// response (status byte, then the CBOR response on success) into `response`, returning its
-    /// length. A response that does not fit is replaced by CTAP1_ERR_OTHER; an empty `response`
-    /// gets nothing.
+    /// Runs a parsed request that arrived on `link`, asking `ui` when the command waits for the
+    /// user, and writes the response (status byte, then the CBOR response on success) into
+    /// `response`, returning its length. A response that does not fit is replaced by
+    /// CTAP1_ERR_OTHER; an empty `response` gets nothing.
     pub fn execute<U: Ui>(
         &mut self,
         command: Result<Command, StatusCode>,
+        link: Link,
         ui: &mut U,
         response: &mut [u8],
     ) -> usize {
@@ -403,7 +469,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return 0;
         };
         let mut encoder = Encoder::new(body);
-        let outcome = command.and_then(|command| self.run(command, ui, &mut encoder));
+        let outcome = command.and_then(|command| self.run(command, link, ui, &mut encoder));
         let written = encoder.len();
         match outcome {
             Ok(()) => {
@@ -422,6 +488,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     fn run<U: Ui>(
         &mut self,
         command: Command,
+        link: Link,
         ui: &mut U,
         encoder: &mut Encoder<'_>,
     ) -> Result<(), StatusCode> {
@@ -429,7 +496,25 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
             Command::ClientPin(request) => self.client_pin(&request, ui, encoder),
             Command::Reset => self.reset(ui),
-            Command::Selection => selection(ui),
+            Command::Selection => self.selection(link, ui),
+        }
+    }
+
+    /// authenticatorSelection (§6.9): user presence answers CTAP2_OK with no body, an explicit
+    /// refusal CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT; a request the
+    /// platform cancelled while it waited is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5). Over NFC
+    /// the tap is the presence while it counts, so no screen is shown; the tap is not used up, as
+    /// it is kept for the credential operation that follows. Once it no longer counts, the device
+    /// asks on its screen as over USB.
+    fn selection<U: Ui>(&self, link: Link, ui: &mut U) -> Result<(), StatusCode> {
+        if link == Link::Nfc && self.nfc_present(ui.now_ms()) {
+            return Ok(());
+        }
+        match ui.confirm(Prompt::Selection, USER_ACTION_TIMEOUT_MS) {
+            Answer::Confirmed => Ok(()),
+            Answer::Rejected => Err(StatusCode::OperationDenied),
+            Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
+            Answer::TimedOut => Err(StatusCode::UserActionTimeout),
         }
     }
 
@@ -465,8 +550,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// getAssertion, the commands the tokens are for: a platform reading them now would start
     /// PIN/UV flows that end in commands this authenticator does not have yet.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
+        let transports = self.settings.transports.names();
         encoder
-            .map(4)?
+            .map(5)?
             // versions (0x01), required.
             .unsigned(0x01)?
             .array(0)?
@@ -482,19 +568,12 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         for protocol in Protocol::SUPPORTED {
             encoder.unsigned(u64::from(protocol as u8))?;
         }
+        // transports (0x09): the same list on every transport, as maxMsgSize is.
+        encoder.unsigned(0x09)?.array(transports.len())?;
+        for name in transports {
+            encoder.text(name)?;
+        }
         Ok(())
-    }
-}
-
-/// authenticatorSelection (§6.9): user presence answers CTAP2_OK with no body, an explicit
-/// refusal CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT; a request the
-/// platform cancelled while it waited is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
-fn selection<U: Ui>(ui: &mut U) -> Result<(), StatusCode> {
-    match ui.confirm(Prompt::Selection, USER_ACTION_TIMEOUT_MS) {
-        Answer::Confirmed => Ok(()),
-        Answer::Rejected => Err(StatusCode::OperationDenied),
-        Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
-        Answer::TimedOut => Err(StatusCode::UserActionTimeout),
     }
 }
 

@@ -40,6 +40,13 @@ application runs inside a Ledger wallet, where the operating system owns all thr
   - getInfo reports the options of a feature (`clientPin`, `pinUvAuthToken`, `uv`, `rk`) together
     with the commands that use it, so a platform never starts a flow that ends in a command the
     application does not have yet.
+  - The NFC tap is user presence although the device has a screen (CTAP 2.2 grants it to
+    authenticators without another gesture): a prompt answered while the device rests on a phone
+    makes NFC unusable. The tap is the selection of the FIDO applet with the application open, as
+    no field event reaches the application, and counts for 120 seconds or until NFCCTAP_CONTROL
+    ends CTAP. Consent screens and the reset confirmation still show over NFC.
+  - Every transport takes the same 1024-byte messages, the CTAP minimum, so getInfo reports one
+    `maxMsgSize` whichever transport carries it; the HID buffer is no larger than the NFC one.
 - A new mapping is a decision about the product, not a review fix: it comes with its reason in
   the code and is added to this list.
 
@@ -51,9 +58,10 @@ application runs inside a Ledger wallet, where the operating system owns all thr
 - Untrusted input (CTAPHID packets, CBOR, credential IDs, backup blobs) is bounded by the received
   length; no allocation sized by a field the attacker controls beyond that.
 - Secrets (derived keys, private keys, CredRandom, PIN material) live in RAM only for the command
-  that needs them and are zeroised on every exit path, including errors and drop. Buffers that
-  receive host requests count: a request can carry PIN/UV material. Zeroise with the `zeroize`
-  crate, never with a plain fill the compiler may remove.
+  that needs them and are zeroised on every exit path, including errors and drop. The
+  application's own request buffers count: a request can carry PIN/UV material. The SDK's and the
+  OS's receive buffers do not: they sit in this application's RAM, which nothing else on the
+  device reads. Zeroise with the `zeroize` crate, never with a plain fill the compiler may remove.
 - No `unwrap` outside tests; `expect` only for internal invariants with the invariant stated.
 - Arithmetic: `checked_*` with explicit handling; `saturating_*` only where clamping is the specified
   behavior, with a comment saying so. On values derived from host input a failed check drops the
@@ -71,8 +79,9 @@ application runs inside a Ledger wallet, where the operating system owns all thr
 - Each test states what it checks. Expected values come from specification vectors or an independent
   computation, never from the code under test.
 - A bug fix starts with a test that fails without the fix.
-- A fuzz harness asserts the protocol's MUST and MUST NOT rules, not only the absence of panics. Its
-  minimized corpus is committed and replayed by the test suite on stable.
+- A fuzz harness asserts the protocol's MUST and MUST NOT rules, not only the absence of panics. The
+  gate runs every target for a while (`scripts/fuzz.sh`); its corpus is generated there and never
+  committed. An input that breaks a rule becomes a named regression test, not a corpus file.
 - `cargo nextest run` for Rust tests; `cargo test --doc` for doc tests.
 
 ## Scripts and CI
