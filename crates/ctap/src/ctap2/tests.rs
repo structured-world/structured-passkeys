@@ -10,7 +10,7 @@ use crate::crypto::KEY_LEN;
 use crate::pin::Protocol;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, PIN_RETRIES, PinVerifier, Store};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui, Verification};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
 
@@ -53,8 +53,6 @@ pub(super) enum Asked {
         permissions: u8,
         rp_id: Option<String>,
     },
-    /// The device PIN keypad.
-    Keypad,
 }
 
 impl Asked {
@@ -70,13 +68,12 @@ impl Asked {
     }
 }
 
-/// A user who gives `answer` to every confirmation and `verification` to the keypad, recording
-/// what was shown with its timeout. `uv_retries` is what the device offers before a keypad entry,
-/// zero after an invalid one; the clock is `now_ms`.
+/// A user who gives `answer` to every confirmation, recording what was shown with its timeout,
+/// on a device whose PIN the operating system holds validated while `unlocked`; the clock is
+/// `now_ms`.
 pub(super) struct Scripted {
     pub(super) answer: Answer,
-    pub(super) verification: Verification,
-    pub(super) uv_retries: u8,
+    pub(super) unlocked: bool,
     pub(super) now_ms: u64,
     pub(super) asked: Vec<(Asked, u32)>,
 }
@@ -85,8 +82,7 @@ impl Scripted {
     pub(super) fn new(answer: Answer) -> Self {
         Self {
             answer,
-            verification: Verification::Verified,
-            uv_retries: 1,
+            unlocked: true,
             now_ms: 0,
             asked: Vec::new(),
         }
@@ -99,17 +95,8 @@ impl Ui for Scripted {
         self.answer
     }
 
-    fn verify_user(&mut self, timeout_ms: u32) -> Verification {
-        self.asked.push((Asked::Keypad, timeout_ms));
-        if self.verification == Verification::Invalid {
-            // A wrong entry leaves the operating system's count short of full.
-            self.uv_retries = 0;
-        }
-        self.verification
-    }
-
-    fn uv_retries(&mut self) -> u8 {
-        self.uv_retries
+    fn device_unlocked(&mut self) -> bool {
+        self.unlocked
     }
 
     fn now_ms(&self) -> u64 {

@@ -12,20 +12,17 @@
 //! use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings, StatusCode};
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
-//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
+//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
 //!
-//! /// A user who confirms everything and has no PIN to enter.
+//! /// A user who confirms everything on an unlocked device.
 //! struct Present;
 //!
 //! impl Ui for Present {
 //!     fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
 //!         Answer::Confirmed
 //!     }
-//!     fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
-//!         Verification::Blocked
-//!     }
-//!     fn uv_retries(&mut self) -> u8 {
-//!         0
+//!     fn device_unlocked(&mut self) -> bool {
+//!         true
 //!     }
 //!     fn now_ms(&self) -> u64 {
 //!         0
@@ -463,7 +460,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
     /// until a version's command set exists and passes its conformance tests: §6.4 requires the
     /// member but not a non-empty list, and a version string is a promise platforms act on, so
-    /// an empty list is the truthful answer rather than an error for the command.
+    /// an empty list is the truthful answer rather than an error for the command. The options
+    /// `clientPin`, `pinUvAuthToken` and `uv`, and `minPINLength`, come with makeCredential and
+    /// getAssertion, the commands the tokens are for: a platform reading them now would start
+    /// PIN/UV flows that end in commands this authenticator does not have yet.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         encoder
             .map(4)?

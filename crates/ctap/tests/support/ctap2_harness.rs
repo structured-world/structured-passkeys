@@ -3,14 +3,17 @@
 //!
 //! The first byte picks the user's answers, the rest is the request. The authenticator has a
 //! client PIN set, so the PIN subcommands reach their checks. Every response must be a known
-//! status and, on success, canonical CBOR; a request must never panic.
+//! status and, on success, canonical CBOR; a request must never panic. Beyond the shape, the
+//! clientPIN rules that hold for any input: a pinUvAuthToken only after the consent was approved
+//! (CTAP 2.2 §6.5.5.7), built-in UV only on an unlocked device, and a PIN try spent only by a PIN
+//! check that fails, one at a time (§6.5.5.6, §6.5.5.7).
 
-use structured_passkeys_ctap::cbor::validate;
+use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
 use structured_passkeys_ctap::crypto::{Crypto, KEY_LEN};
 use structured_passkeys_ctap::ctap2::{Authenticator, MaxMsgSize, Settings};
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
-use structured_passkeys_ctap::ui::{Answer, Prompt, Ui, Verification};
+use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
 
 /// The status codes of CTAP 2.2 §8.2 the authenticator may answer with.
 const STATUS_CODES: [u8; 46] = [
@@ -19,8 +22,8 @@ const STATUS_CODES: [u8; 46] = [
     0x33, 0x34, 0x35, 0x36, 0x37, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x7F,
 ];
 
-/// A user whose answers come from one byte: bits 0-1 the confirmation, bits 2-4 the keypad,
-/// bit 5 whether built-in verification is offered.
+/// A user whose answers come from one byte: bits 0-1 the confirmation, bit 5 whether the device
+/// is locked.
 struct Fuzzed(u8);
 
 impl Ui for Fuzzed {
@@ -33,24 +36,35 @@ impl Ui for Fuzzed {
         }
     }
 
-    fn verify_user(&mut self, _timeout_ms: u32) -> Verification {
-        match (self.0 >> 2) & 0x07 {
-            0 => Verification::Verified,
-            1 => Verification::Invalid,
-            2 => Verification::Blocked,
-            3 => Verification::Rejected,
-            4 => Verification::Cancelled,
-            _ => Verification::TimedOut,
-        }
-    }
-
-    fn uv_retries(&mut self) -> u8 {
-        u8::from(self.0 & 0x20 == 0)
+    fn device_unlocked(&mut self) -> bool {
+        self.0 & 0x20 == 0
     }
 
     fn now_ms(&self) -> u64 {
         0
     }
+}
+
+/// The subCommand of an authenticatorClientPIN request, if the request is one and carries it.
+fn client_pin_sub_command(request: &[u8]) -> Option<u64> {
+    let (&0x06, parameters) = request.split_first()? else {
+        return None;
+    };
+    Decoder::new(parameters)
+        .map(|entries| {
+            let mut found = None;
+            while let Some(key) = entries.next_key()? {
+                let value = entries.value();
+                if key == Key::Int(0x02) {
+                    found = value.unsigned().ok();
+                } else {
+                    value.skip()?;
+                }
+            }
+            Ok(found)
+        })
+        .ok()
+        .flatten()
 }
 
 /// Runs one input; panics on any broken property.
@@ -83,5 +97,28 @@ pub fn run(data: &[u8]) {
         assert_eq!(validate(&response[1..length]), Ok(()), "canonical response");
     } else {
         assert_eq!(length, 1, "an error carries no body");
+    }
+
+    let sub_command = client_pin_sub_command(request);
+    let succeeded = response[0] == 0x00;
+    // getPinToken, getPinUvAuthTokenUsingUvWithPermissions, getPinUvAuthTokenUsingPinWithPermissions.
+    if succeeded && matches!(sub_command, Some(0x05 | 0x06 | 0x09)) {
+        assert_eq!(
+            answers & 0x03,
+            0,
+            "a token only after the consent was approved"
+        );
+    }
+    if succeeded && sub_command == Some(0x06) {
+        assert_eq!(answers & 0x20, 0, "built-in UV only on an unlocked device");
+    }
+    let retries = authenticator.store().config().pin_retries;
+    if retries != 8 {
+        assert_eq!(retries, 7, "one try per request");
+        assert_eq!(response[0], 0x31, "a spent try answers PIN_INVALID");
+        assert!(
+            matches!(sub_command, Some(0x04 | 0x05 | 0x09)),
+            "only a PIN check spends a try"
+        );
     }
 }

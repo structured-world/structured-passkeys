@@ -198,18 +198,23 @@ impl Crypto for DeviceCrypto {
         let mut schedule = Self::aes_key(key);
         let mut chain = *iv;
         let mut plain = [0u8; AES_BLOCK_LEN];
+        // One copy of the block being decrypted, reused and wiped: the ciphertext can be a PIN
+        // hash, which with the key agreement key would let stale stack bytes be tested offline.
+        let mut ciphertext = [0u8; AES_BLOCK_LEN];
         for chunk in data.as_chunks_mut::<AES_BLOCK_LEN>().0 {
             // P_i = D(C_i) xor C_{i-1}, C_0 = IV (SP 800-38A §6.2).
             // SAFETY: both blocks hold 16 bytes and do not overlap.
             let status = unsafe { cx_aes_dec_block(&schedule, chunk.as_ptr(), plain.as_mut_ptr()) };
             assert_eq!(status, CX_OK, "a block decrypts");
-            let ciphertext = *chunk;
+            ciphertext.copy_from_slice(chunk);
             for ((byte, &decrypted), &previous) in chunk.iter_mut().zip(&plain).zip(&chain) {
                 *byte = decrypted ^ previous;
             }
-            chain = ciphertext;
+            chain.copy_from_slice(&ciphertext);
         }
         plain.zeroize();
+        ciphertext.zeroize();
+        chain.zeroize();
         wipe(&mut schedule);
         Ok(())
     }

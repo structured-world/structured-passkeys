@@ -11,7 +11,7 @@ use crate::pin::{
     Protocol, SharedSecret, TOKEN_LEN, new_pin,
 };
 use crate::storage::{MAX_RP_ID_LEN, PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui, Verification};
+use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// The getInfo option IDs that decide token permissions. Credential management and
 /// authenticatorConfig are not implemented yet, so `credMgmt` and `authnrCfg` are absent and
@@ -282,8 +282,9 @@ const fn oversized_new_pin(protocol: Protocol, len: usize) -> StatusCode {
 
 /// Reads a COSE_Key (RFC 9052 §7) as the platform key agreement key, parsed as §6.5.6 ecdh
 /// requires, "as specified for getPublicKey": kty 2 (EC2), alg -25, crv 1 (P-256), 32-byte x
-/// and y. Other labels are skipped: getPublicKey lists the parameters the key has, not a ban on
-/// further ones, and COSE ignores labels it does not use.
+/// and y, and nothing else: such a key "MUST contain the optional alg parameter and MUST NOT
+/// contain any other optional parameters" (§6.5.5, keyAgreement). A key with a further label
+/// cannot be decapsulated.
 fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
     decoder.map(|entries| {
         let mut kty = None;
@@ -291,6 +292,7 @@ fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
         let mut crv = None;
         let mut x = None;
         let mut y = None;
+        let mut other = false;
         while let Some(key) = entries.next_key()? {
             let value = entries.value();
             match key {
@@ -299,12 +301,15 @@ fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
                 Key::Int(-1) => crv = Some(value.int()?),
                 Key::Int(-2) => x = Some(value.bytes()?),
                 Key::Int(-3) => y = Some(value.bytes()?),
-                _ => value.skip()?,
+                _ => {
+                    value.skip()?;
+                    other = true;
+                }
             }
         }
         let point = match (kty, alg, crv, x, y) {
             (Some(2), Some(-25), Some(1), Some(x), Some(y))
-                if x.len() == KEY_LEN && y.len() == KEY_LEN =>
+                if !other && x.len() == KEY_LEN && y.len() == KEY_LEN =>
             {
                 let mut point = [0u8; PUBLIC_KEY_LEN];
                 point[0] = 0x04;
@@ -442,15 +447,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         )
     }
 
-    /// `uvRetries`: none once the client PIN is blocked, since a blocked PIN disables built-in
-    /// user verification too (§6.5.2.3, performBuiltInUv step 3); otherwise what the device
-    /// offers.
+    /// `uvRetries` (§6.5.2.3) with built-in UV as the device unlock, which cannot fail: 1 while
+    /// the device PIN is validated, none once the client PIN is blocked, since a blocked PIN
+    /// disables built-in user verification too (performBuiltInUv step 3), and none on a device
+    /// the operating system does not hold unlocked.
     fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
         let config = self.store.config();
         if config.pin.is_some() && config.pin_retries == 0 {
             return 0;
         }
-        ui.uv_retries()
+        u8::from(ui.device_unlocked())
     }
 
     /// setPIN (§6.5.5.5).
@@ -587,8 +593,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         self.write_token(&secret, encoder)
     }
 
-    /// getPinUvAuthTokenUsingUvWithPermissions (§6.5.5.7.3): the device PIN entered on the
-    /// device, checked by the operating system.
+    /// getPinUvAuthTokenUsingUvWithPermissions (§6.5.5.7.3): built-in UV is the device PIN the
+    /// person entered to unlock the device, which the operating system holds validated.
     fn get_token_using_uv<U: Ui>(
         &mut self,
         request: &ClientPinRequest,
@@ -612,8 +618,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         }
         // Checked before any screen, so a request with an unusable key never asks the user.
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
-        // Step 9: consent to the requested permissions, then step 10: the device PIN. The keypad
-        // title on the Nano S Plus and Nano X is one short line, too small to carry the consent.
+        // Step 9: consent to the requested permissions.
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
@@ -621,24 +626,13 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
-        match ui.verify_user(USER_ACTION_TIMEOUT_MS) {
-            Verification::Verified => {}
-            // Step 11: a failed verification other than a timeout, a wrong entry or backing out
-            // of the keypad after the consent, is UV_BLOCKED once no attempt is left (which one
-            // wrong entry here always leaves), else UV_INVALID.
-            Verification::Invalid | Verification::Rejected => {
-                return Err(if self.uv_retries(ui) == 0 {
-                    StatusCode::UvBlocked
-                } else {
-                    StatusCode::UvInvalid
-                });
-            }
-            Verification::Blocked => return Err(StatusCode::UvBlocked),
-            Verification::Cancelled => return Err(StatusCode::KeepaliveCancel),
-            Verification::TimedOut => return Err(StatusCode::UserActionTimeout),
+        // Step 10, performBuiltInUv: the unlock is the verification, so it succeeds unless the
+        // device was locked meanwhile, which leaves no attempt (step 11, UV_BLOCKED).
+        if !ui.device_unlocked() {
+            return Err(StatusCode::UvBlocked);
         }
         self.client_pin.reset_tokens(&mut self.crypto);
-        // Entering the PIN on the device is evidence of user interaction (step 3.13).
+        // The consent tap on the device is evidence of user interaction (step 14).
         let now_ms = ui.now_ms();
         self.client_pin.begin_using(
             now_ms,
