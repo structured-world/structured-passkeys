@@ -29,6 +29,12 @@ restores the tries; a refused consent spends none (CTAP2_ERR_OPERATION_DENIED); 
 which the old PIN is wrong. The consent screen is compared with its snapshot like the selection
 screen.
 
+authenticatorReset (§6.6), in Speculos, run first because it is accepted only in the 10 seconds
+after the application opens: with a PIN set, refusing answers CTAP2_ERR_OPERATION_DENIED and keeps
+the PIN; confirming answers CTAP2_OK and erases it (getPinToken then answers CTAP2_ERR_PIN_NOT_SET).
+The confirmation screen is compared with its snapshot. Once the other checks have outlasted the
+window, a reset answers CTAP2_ERR_NOT_ALLOWED without a screen.
+
 Built-in user verification (§6.5.5.7.3), which is the device unlock, in Speculos and on a device:
 getUVRetries offers one attempt; getPinUvAuthTokenUsingUvWithPermissions gives a token after the
 consent choice alone, no PIN asked, and in Speculos a refused consent gives none
@@ -81,6 +87,12 @@ SELECTION_CONFIRM = "Allow"
 SELECTION_REJECT = "Don't allow"
 # The title of the consent screen for a pinUvAuthToken, with the client PIN or built-in UV.
 TOKEN_TITLE = "Allow security key use?"
+# The texts of the reset confirmation, and how long after the application opens a reset is
+# accepted.
+RESET_TITLE = "Reset the security key?"
+RESET_CONFIRM = "Reset"
+RESET_REJECT = "Cancel"
+RESET_WINDOW_S = 10
 # authenticatorClientPIN subcommands and response members (§6.5.5).
 GET_PIN_RETRIES = 0x01
 GET_KEY_AGREEMENT = 0x02
@@ -224,24 +236,31 @@ def wait_for_screen(text: str) -> None:
     raise SystemExit(f"FAILED: the screen never showed {text!r}: {screen_texts()}")
 
 
+SELECTION_LABELS = (SELECTION_CONFIRM, SELECTION_REJECT)
+RESET_LABELS = (RESET_CONFIRM, RESET_REJECT)
+
+
 class SpeculosUser:
-    """Answers the selection screen through the Speculos API, as the person would."""
+    """Answers a screen through the Speculos API, as the person would; `labels` are its confirm
+    and reject choices."""
 
     def __init__(self, model: str):
         self.nano = model in ("nanosp", "nanox")
 
-    def answer(self, confirm: bool) -> None:
-        wanted = SELECTION_CONFIRM if confirm else SELECTION_REJECT
+    def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
+        wanted = labels[0] if confirm else labels[1]
         if self.nano:
             # The choice steps through its pages with the right button and takes the shown
-            # one with both buttons.
-            for _ in range(6):
+            # one with both buttons; the last page stays put when pressed again.
+            shown = None
+            while (texts := screen_texts()) != shown:
                 if button(wanted) is not None:
                     api("/button/both", {"action": "press-and-release"})
                     return
+                shown = texts
                 api("/button/right", {"action": "press-and-release"})
                 time.sleep(0.2)
-            raise SystemExit(f"FAILED: no page offers {wanted!r}")
+            raise SystemExit(f"FAILED: no page offers {wanted!r}: {shown}")
         event = button(wanted)
         if event is None:
             raise SystemExit(f"FAILED: no button reads {wanted!r}: {screen_texts()}")
@@ -249,10 +268,10 @@ class SpeculosUser:
 
 
 class PersonAtDevice:
-    """Asks the person at the device to answer the selection screen."""
+    """Asks the person at the device to answer a screen."""
 
-    def answer(self, confirm: bool) -> None:
-        wanted = SELECTION_CONFIRM if confirm else SELECTION_REJECT
+    def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
+        wanted = labels[0] if confirm else labels[1]
         print(f"   on the device, choose {wanted!r}", flush=True)
 
 
@@ -398,9 +417,18 @@ def pin_retries(ctap: Ctap2) -> int:
     return ctap.client_pin(2, GET_PIN_RETRIES)[PIN_RETRIES]
 
 
-def answered(user, confirm: bool, title: str, call, snapshot=None) -> int:
-    """Runs `call` while the user answers the screen titled `title`; returns its CTAP status.
-    The answer runs in a timer's thread; an exception there is kept and raised here."""
+def answered(
+    user,
+    confirm: bool,
+    title: str,
+    call,
+    snapshot=None,
+    labels: tuple[str, str] = SELECTION_LABELS,
+    delay_s: float = 1.0,
+) -> int:
+    """Runs `call` while the user answers the screen titled `title` with one of `labels`, `delay_s`
+    after the call starts; returns its CTAP status. The answer runs in a timer's thread; an
+    exception there is kept and raised here."""
     failure: list[BaseException] = []
 
     def answer() -> None:
@@ -409,11 +437,11 @@ def answered(user, confirm: bool, title: str, call, snapshot=None) -> int:
                 wait_for_screen(title)
             if snapshot is not None:
                 snapshot()
-            user.answer(confirm)
+            user.answer(confirm, labels)
         except BaseException as error:
             failure.append(error)
 
-    timer = threading.Timer(1.0, answer)
+    timer = threading.Timer(delay_s, answer)
     timer.start()
     status = ctap_status(call)
     timer.join()
@@ -465,6 +493,36 @@ def check_client_pin(device: CtapHidDevice, user, snapshot) -> None:
     )
     status = answered(user, True, TOKEN_TITLE, lambda: pin_token(ctap, PinProtocolV2(), "1234"))
     check(status == CtapError.ERR.PIN_INVALID, f"clientPIN: the old PIN is wrong now ({status!r})")
+
+
+def check_reset(device: CtapHidDevice, user, snapshot) -> None:
+    """authenticatorReset inside its window, which the checks before it must leave room for."""
+    ctap = Ctap2(device)
+    check(
+        ctap_status(lambda: set_pin(ctap, PinProtocolV2(), "1234")) == CtapError.ERR.SUCCESS,
+        "reset: a PIN is set first",
+    )
+    # The answers come as soon as the screen shows: the window is short.
+    status = answered(user, False, RESET_TITLE, ctap.reset, labels=RESET_LABELS, delay_s=0.1)
+    check(status == CtapError.ERR.OPERATION_DENIED, f"reset: refusing answers {status!r}")
+    # setPIN with a PIN already set fails its check (§6.5.5.5), so it shows the PIN is kept.
+    status = ctap_status(lambda: set_pin(ctap, PinProtocolV2(), "1234"))
+    check(status == CtapError.ERR.PIN_AUTH_INVALID, f"reset: a refused reset keeps the PIN ({status!r})")
+    status = answered(
+        user, True, RESET_TITLE, ctap.reset, snapshot, labels=RESET_LABELS, delay_s=0.1
+    )
+    check(status == CtapError.ERR.SUCCESS, f"reset: confirming answers {status!r}")
+    status = ctap_status(lambda: pin_token(ctap, PinProtocolV2(), "1234"))
+    check(status == CtapError.ERR.PIN_NOT_SET, f"reset: the PIN is erased ({status!r})")
+
+
+def check_reset_window_closed(device: CtapHidDevice) -> None:
+    """authenticatorReset after its window: refused at once, with no screen to answer."""
+    status = ctap_status(Ctap2(device).reset)
+    check(
+        status == CtapError.ERR.NOT_ALLOWED,
+        f"reset: after {RESET_WINDOW_S} s it is not allowed ({status!r})",
+    )
 
 
 def check_built_in_uv(device: CtapHidDevice, user, snapshot) -> None:
@@ -532,13 +590,6 @@ def main() -> None:
         CAPABILITY.CBOR in capabilities and CAPABILITY.NMSG in capabilities,
         f"INIT: capabilities {capabilities!r} (CBOR, no MSG)",
     )
-    for length in (1, MAX_MESSAGE):
-        payload = os.urandom(length)
-        check(device.ping(payload) == payload, f"PING echoes {length} bytes")
-
-    info = Ctap2(device).info
-    check(bytes(info.aaguid) == AAGUID, f"getInfo: AAGUID {bytes(info.aaguid).hex()}")
-    check(info.max_msg_size == MAX_MESSAGE, f"getInfo: maxMsgSize {info.max_msg_size}")
 
     if args.speculos:
         if args.model is None:
@@ -551,20 +602,35 @@ def main() -> None:
                 return None
             return snapshot_check(args.model, snapshots, args.golden, name, title)
 
+        # First, while the reset window is open. A device keeps its credentials, so it is not
+        # reset here.
+        check_reset(device, user, snapshot("reset", RESET_TITLE))
+
     else:
         user = PersonAtDevice()
 
         def snapshot(name: str, title: str):
             return None
 
+    for length in (1, MAX_MESSAGE):
+        payload = os.urandom(length)
+        check(device.ping(payload) == payload, f"PING echoes {length} bytes")
+
+    info = Ctap2(device).info
+    check(bytes(info.aaguid) == AAGUID, f"getInfo: AAGUID {bytes(info.aaguid).hex()}")
+    check(info.max_msg_size == MAX_MESSAGE, f"getInfo: maxMsgSize {info.max_msg_size}")
+
     # The screens the person answers come first, in the order refuse, allow, allow; the ones
     # left unanswered (cancel, timeout) last, so no answer is given to the wrong screen.
     check_selection_answers(device, user, snapshot("selection", SELECTION_TITLE))
     check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
     if args.speculos:
-        # Speculos starts with empty NVM, so the PIN can be set; a device keeps its PIN.
+        # The reset left the PIN unset, so it can be set; a device keeps its PIN.
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
     check_selection_unanswered(device, keepalives)
+    if args.speculos:
+        # The selection timeout alone outlasts the reset window.
+        check_reset_window_closed(device)
     device.close()
 
 

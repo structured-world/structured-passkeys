@@ -7,10 +7,11 @@
 #   - an instruction the app does not implement (E0 01) answers exactly 6D00,
 #   - the current screen shows the app name.
 # The FIDO HID interface, with Speculos on its U2F transport: scripts/fido_check.py
-# (INIT, PING with 1 and 7609-byte payloads, getInfo, and authenticatorSelection
-# waiting for the user: keepalives, cancel, timeout, confirm and refuse, its screen
-# compared with tests/snapshots/<model>/; SPECULOS_GOLDEN=1 writes the snapshots
-# instead).
+# (INIT, PING with 1 and 7609-byte payloads, getInfo, authenticatorReset in and
+# after its window, authenticatorSelection waiting for the user: keepalives, cancel,
+# timeout, confirm and refuse, and authenticatorClientPIN; the reset, selection and
+# token screens are compared with tests/snapshots/<model>/; SPECULOS_GOLDEN=1 writes
+# the snapshots instead).
 #
 # Expects the artifacts of scripts/device-build.sh in app/target/<target>/release/.
 # Linux only: the image is a Linux container.

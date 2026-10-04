@@ -42,11 +42,11 @@ pub const PIN_RETRIES: u8 = 8;
 /// Marks a slot record in use; a free slot is all zeros.
 const USED: u8 = 1;
 
-// Configuration record: version, generation, epoch, alwaysUv, PIN retries, PIN set, verifier,
+// Configuration record: version, generation, reset ID, alwaysUv, PIN retries, PIN set, verifier,
 // creation sequence limit, device key set, device key.
 const CONFIG_VERSION: usize = 0;
 const CONFIG_GENERATION: usize = 1;
-const CONFIG_EPOCH: usize = 5;
+const CONFIG_RESET_ID: usize = 5;
 const CONFIG_ALWAYS_UV: usize = 9;
 const CONFIG_PIN_RETRIES: usize = 10;
 const CONFIG_PIN_SET: usize = 11;
@@ -171,8 +171,9 @@ impl fmt::Debug for PinVerifier {
 /// The configuration region.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Reset epoch: incremented by every reset and written into new credential IDs.
-    pub epoch: u32,
+    /// Reset ID: 0 before any reset, a fresh random nonzero value after each, written into new
+    /// credential IDs. Only a reset changes it; [`Store::write_config`] keeps the stored one.
+    pub reset_id: u32,
     /// `alwaysUv` (CTAP 2.2 §7.2).
     pub always_uv: bool,
     /// The client PIN, if one is set.
@@ -182,10 +183,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// The configuration after a reset with `epoch`: no PIN, full retries, `alwaysUv` off.
-    pub const fn after_reset(epoch: u32) -> Self {
+    /// The configuration after a reset to `reset_id`: no PIN, full retries, `alwaysUv` off.
+    pub const fn after_reset(reset_id: u32) -> Self {
         Self {
-            epoch,
+            reset_id,
             always_uv: false,
             pin: None,
             pin_retries: PIN_RETRIES,
@@ -356,16 +357,16 @@ impl<S: Storage> Store<S> {
                 next_sequence: 0,
                 sequence_limit: 0,
             };
-            // Epoch 0 by design, not a lost revocation. Ledger OS replaces an application's NVM
-            // when it installs or updates the application, so a format only ever meets a fresh
-            // region and no state of the previous install survives anywhere the application can
-            // write. A seed-recoverable credential is reproducible from the recovery phrase by
-            // definition (it reports backup eligible and backed up, BE=BS=1): the phrase is its
-            // backup, as a synced provider's account is for a synced passkey, and restoring the
-            // phrase onto fresh NVM brings it back. Reset therefore revokes such credentials for
-            // as long as this NVM lives; the reset epoch travels in the encrypted backup, whose
-            // import keeps the larger epoch, and the reset confirmation screen says both.
-            // Device-only credentials are unaffected: their keys are gone with the NVM.
+            // Reset ID 0 by design, not a lost revocation. Ledger OS replaces an application's
+            // NVM when it installs or updates the application, so a format only ever meets a
+            // fresh region and no state of the previous install survives anywhere the
+            // application can write. A seed-recoverable credential is reproducible from the
+            // recovery phrase by definition (it reports backup eligible and backed up, BE=BS=1):
+            // the phrase is its backup, as a synced provider's account is for a synced passkey,
+            // and restoring the phrase onto fresh NVM brings it back. Reset therefore revokes such
+            // credentials for as long as this NVM lives; the reset ID travels in the encrypted
+            // backup, and the reset confirmation screen says both. Device-only credentials are
+            // unaffected: their keys are gone with the NVM.
             // No device key: the record of another layout holds none that this one could read.
             store.write_record(&Config::after_reset(0), 0, None);
             return store;
@@ -396,23 +397,21 @@ impl<S: Storage> Store<S> {
             pin
         });
         Config {
-            epoch: read_u32(record, CONFIG_EPOCH),
+            reset_id: read_u32(record, CONFIG_RESET_ID),
             always_uv: record[CONFIG_ALWAYS_UV] == USED,
             pin,
             pin_retries: record[CONFIG_PIN_RETRIES],
         }
     }
 
-    /// Replaces the configuration in one write; the device key stays, and so does the stored
-    /// epoch when `config` carries a smaller one. The epoch only grows: credential IDs issued
-    /// before a reset carry an older one, and a write from a stale `Config` must not let them
-    /// pass the epoch check again. A larger epoch is taken, as a backup import keeps the larger.
+    /// Replaces the configuration in one write; the device key and the stored reset ID stay,
+    /// whatever `config` carries. Only a reset changes the reset ID: a write from a stale
+    /// `Config` must not bring back one a reset replaced, which would open the credential IDs it
+    /// revoked.
     pub fn write_config(&mut self, config: &Config) {
         let device_key = self.device_key();
-        let epoch = config
-            .epoch
-            .max(read_u32(self.storage.config(), CONFIG_EPOCH));
-        self.write_record(config, epoch, device_key.as_deref());
+        let reset_id = read_u32(self.storage.config(), CONFIG_RESET_ID);
+        self.write_record(config, reset_id, device_key.as_deref());
     }
 
     /// The device key `K_dev` of non-discoverable device-only credentials, if one was created
@@ -436,17 +435,17 @@ impl<S: Storage> Store<S> {
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         crypto.random(&mut key[..]);
         let config = self.config();
-        self.write_record(&config, config.epoch, Some(&key));
+        self.write_record(&config, config.reset_id, Some(&key));
         key
     }
 
-    /// Writes `config` with `epoch` in place of its own, so a caller can keep the stored epoch
-    /// without copying the rest of the configuration (it holds the PIN verifier).
-    fn write_record(&mut self, config: &Config, epoch: u32, device_key: Option<&[u8; KEY_LEN]>) {
+    /// Writes `config` with `reset_id` in place of its own, so a caller can keep the stored reset
+    /// ID without copying the rest of the configuration (it holds the PIN verifier).
+    fn write_record(&mut self, config: &Config, reset_id: u32, device_key: Option<&[u8; KEY_LEN]>) {
         let mut record = Zeroizing::new([0u8; CONFIG_LEN]);
         record[CONFIG_VERSION] = LAYOUT_VERSION;
         write_u32(&mut record[..], CONFIG_GENERATION, self.generation);
-        write_u32(&mut record[..], CONFIG_EPOCH, epoch);
+        write_u32(&mut record[..], CONFIG_RESET_ID, reset_id);
         record[CONFIG_ALWAYS_UV] = u8::from(config.always_uv);
         record[CONFIG_PIN_RETRIES] = config.pin_retries;
         if let Some(pin) = &config.pin {
@@ -462,25 +461,35 @@ impl<S: Storage> Store<S> {
     }
 
     /// authenticatorReset (CTAP 2.2 §6.6): empties the index and the key slots and writes the
-    /// configuration after a reset with the next epoch and no device key, all in one write, then
+    /// configuration after a reset with a new reset ID and no device key, all in one write, then
     /// wipes the slots. §6.6 requires every credential to stop working and the PIN, `alwaysUv`
     /// and the discoverable state to be cleared: device-only keys, the device key and entries are
-    /// erased, and seed-recoverable credential IDs of an earlier epoch are refused when opened.
+    /// erased, and seed-recoverable credential IDs of any other reset ID are refused when opened.
+    /// The new reset ID is random, nonzero and not the current one, so it differs from every ID
+    /// created since the last reset, also after an NVM wipe that lost the earlier ones.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Exhausted`] when the epoch or the generation would wrap.
-    pub fn reset(&mut self) -> Result<(), StoreError> {
-        let epoch = self
-            .config()
-            .epoch
-            .checked_add(1)
-            .ok_or(StoreError::Exhausted)?;
+    /// [`StoreError::Exhausted`] when the generation would wrap.
+    pub fn reset<C: Crypto>(&mut self, crypto: &mut C) -> Result<(), StoreError> {
+        let current = self.config().reset_id;
+        // 32 bits from the TRNG: the draw matches one of n earlier reset IDs with probability
+        // n / 2^32, and n counts resets a person confirmed on the device within 10 seconds of
+        // opening the application, so it stays in the tens. Nobody can steer the draw, and a
+        // wider ID would lengthen every credential ID for a risk of the order of 10^-8.
+        let reset_id = loop {
+            let mut bytes = [0u8; 4];
+            crypto.random(&mut bytes);
+            let drawn = u32::from_le_bytes(bytes);
+            if drawn != 0 && drawn != current {
+                break drawn;
+            }
+        };
         self.generation = self
             .generation
             .checked_add(1)
             .ok_or(StoreError::Exhausted)?;
-        self.write_record(&Config::after_reset(epoch), epoch, None);
+        self.write_record(&Config::after_reset(reset_id), reset_id, None);
         self.sweep();
         Ok(())
     }

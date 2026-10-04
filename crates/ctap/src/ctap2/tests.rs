@@ -2,13 +2,14 @@
 //! written out byte by byte, never produced by the code under test.
 
 use super::{
-    AAGUID, Authenticator, Command, CommandCode, MaxMsgSize, Settings, StatusCode, TooSmall,
-    UnknownCommand,
+    AAGUID, Authenticator, Command, CommandCode, MaxMsgSize, RESET_WINDOW_MS, Settings, StatusCode,
+    TooSmall, UnknownCommand,
 };
 use crate::cbor::{self, validate};
 use crate::crypto::KEY_LEN;
+use crate::pin::Protocol;
 use crate::soft::SoftCrypto;
-use crate::storage::{MemoryStorage, Store};
+use crate::storage::{MemoryStorage, PIN_RETRIES, PinVerifier, Store};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
@@ -45,6 +46,8 @@ impl TestAuthenticator {
 pub(super) enum Asked {
     /// authenticatorSelection.
     Selection,
+    /// authenticatorReset.
+    Reset,
     /// Consent to a token with these permission bits and permissions RP ID.
     Token {
         permissions: u8,
@@ -56,6 +59,7 @@ impl Asked {
     fn from_prompt(prompt: Prompt<'_>) -> Self {
         match prompt {
             Prompt::Selection => Asked::Selection,
+            Prompt::Reset => Asked::Reset,
             Prompt::Token { permissions, rp_id } => Asked::Token {
                 permissions: permissions.bits(),
                 rp_id: rp_id.map(String::from),
@@ -151,6 +155,7 @@ fn parsing_names_the_command() {
     let authenticator = authenticator();
     assert_eq!(authenticator.parse(&[0x04]), Ok(Command::GetInfo));
     assert_eq!(authenticator.parse(&[0x0B]), Ok(Command::Selection));
+    assert_eq!(authenticator.parse(&[0x07]), Ok(Command::Reset));
     assert_eq!(authenticator.parse(&[]), Err(StatusCode::InvalidLength));
     assert_eq!(
         authenticator.parse(&[0x01]),
@@ -200,10 +205,82 @@ fn an_empty_request_is_invalid_length() {
 #[test]
 fn unimplemented_commands_are_invalid_command() {
     for code in [
-        0x01, 0x02, 0x03, 0x05, 0x07, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
+        0x01, 0x02, 0x03, 0x05, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
     ] {
         assert_eq!(process(&[code, 0xA0]), [0x01], "command {code:#04x}");
     }
+}
+
+/// authenticatorReset (§6.6) within the window after the application opens: the user confirms
+/// on the device, and the store forgets the PIN and every credential and draws a new reset ID,
+/// which stays across a reopening. Refusal, timeout and cancel leave everything as it was.
+#[test]
+fn reset_asks_the_user_and_erases_everything() {
+    for (answer, status) in [
+        (Answer::Rejected, 0x27),
+        (Answer::TimedOut, 0x2F),
+        (Answer::Cancelled, 0x2D),
+    ] {
+        let mut authenticator = with_pin();
+        let mut ui = Scripted::new(answer);
+        let mut response = [0u8; 8];
+        let length = authenticator.process(&[0x07], &mut ui, &mut response);
+        assert_eq!(response[..length], [status], "{answer:?}");
+        assert!(authenticator.store.config().pin.is_some(), "{answer:?}");
+        assert_eq!(authenticator.store.config().reset_id, 0, "{answer:?}");
+    }
+
+    let mut authenticator = with_pin();
+    let mut ui = Scripted::new(Answer::Confirmed);
+    ui.now_ms = RESET_WINDOW_MS;
+    let token = *authenticator.client_pin.token(Protocol::Two);
+    let mut response = [0u8; 8];
+    let length = authenticator.process(&[0x07], &mut ui, &mut response);
+    assert_eq!(response[..length], [0x00]);
+    assert_eq!(ui.asked, [(Asked::Reset, USER_ACTION_TIMEOUT_MS)]);
+    let config = authenticator.store.config();
+    assert!(config.pin.is_none());
+    assert_eq!(config.pin_retries, PIN_RETRIES);
+    assert_ne!(config.reset_id, 0);
+    assert_ne!(
+        *authenticator.client_pin.token(Protocol::Two),
+        token,
+        "tokens issued before no longer verify"
+    );
+    let reopened = authenticator.reopen();
+    assert_eq!(
+        reopened.store.config().reset_id,
+        config.reset_id,
+        "the reset ID survives a reopening"
+    );
+}
+
+/// After the window a reset is CTAP2_ERR_NOT_ALLOWED (§6.6) and shows no screen.
+#[test]
+fn reset_after_the_window_is_not_allowed() {
+    let mut authenticator = with_pin();
+    let mut ui = Scripted::new(Answer::Confirmed);
+    ui.now_ms = RESET_WINDOW_MS + 1;
+    let mut response = [0u8; 8];
+    let length = authenticator.process(&[0x07], &mut ui, &mut response);
+    assert_eq!(response[..length], [0x30]);
+    assert_eq!(ui.asked, []);
+    assert!(authenticator.store.config().pin.is_some());
+}
+
+/// authenticatorReset takes no parameters.
+#[test]
+fn reset_with_parameters_is_invalid_length() {
+    assert_eq!(process(&[0x07, 0xA0]), [StatusCode::InvalidLength as u8]);
+}
+
+/// An authenticator whose store holds a client PIN.
+fn with_pin() -> TestAuthenticator {
+    let mut authenticator = authenticator();
+    let mut config = authenticator.store.config();
+    config.pin = Some(PinVerifier::new([0x5A; 16]));
+    authenticator.store.write_config(&config);
+    authenticator
 }
 
 /// A response that does not fit is CTAP1_ERR_OTHER, and an empty buffer gets nothing.

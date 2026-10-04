@@ -299,9 +299,17 @@ pub enum Command {
     GetInfo,
     /// authenticatorClientPIN (§6.5).
     ClientPin(ClientPinRequest),
+    /// authenticatorReset (§6.6).
+    Reset,
     /// authenticatorSelection (§6.9).
     Selection,
 }
+
+/// How long after the application opens authenticatorReset is accepted. §6.6 requires it of an
+/// authenticator without a display; this one has a display and keeps the window anyway, so a
+/// reset is never a request that arrives while the device sits open on a desk: the user opens
+/// the application for it and confirms it on the device.
+pub const RESET_WINDOW_MS: u64 = 10_000;
 
 /// The CTAP2 command processor: the device's cryptography, its persistent state and the PIN/UV
 /// auth protocol state, which lives as long as the application is open.
@@ -351,13 +359,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // A CTAPHID_CBOR message carries at least the command byte (§11.2.9.1.2).
         let (&code, parameters) = request.split_first().ok_or(StatusCode::InvalidLength)?;
         match CommandCode::try_from(code) {
-            // §6.4 and §6.9 define no parameters.
-            Ok(command @ (CommandCode::GetInfo | CommandCode::Selection)) => {
+            // §6.4, §6.6 and §6.9 define no parameters.
+            Ok(command @ (CommandCode::GetInfo | CommandCode::Reset | CommandCode::Selection)) => {
                 if !parameters.is_empty() {
                     return Err(StatusCode::InvalidLength);
                 }
                 Ok(match command {
                     CommandCode::Selection => Command::Selection,
+                    CommandCode::Reset => Command::Reset,
                     _ => Command::GetInfo,
                 })
             }
@@ -370,7 +379,6 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             Ok(
                 CommandCode::MakeCredential
                 | CommandCode::GetAssertion
-                | CommandCode::Reset
                 | CommandCode::GetNextAssertion
                 | CommandCode::BioEnrollment
                 | CommandCode::CredentialManagement
@@ -420,8 +428,33 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         match command {
             Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
             Command::ClientPin(request) => self.client_pin(&request, ui, encoder),
+            Command::Reset => self.reset(ui),
             Command::Selection => selection(ui),
         }
+    }
+
+    /// authenticatorReset (§6.6): within [`RESET_WINDOW_MS`] of the application opening, else
+    /// CTAP2_ERR_NOT_ALLOWED; then the user confirms on the device (refusal
+    /// CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT, a request the platform
+    /// cancelled while it waited CTAP2_ERR_KEEPALIVE_CANCEL, §11.2.9.1.5), and the store erases
+    /// every credential, the PIN and the configuration and draws a new reset ID, which revokes
+    /// the seed-recoverable credential IDs created before. The PIN/UV auth state starts over too,
+    /// so no token issued before verifies.
+    fn reset<U: Ui>(&mut self, ui: &mut U) -> Result<(), StatusCode> {
+        if ui.now_ms() > RESET_WINDOW_MS {
+            return Err(StatusCode::NotAllowed);
+        }
+        match ui.confirm(Prompt::Reset, USER_ACTION_TIMEOUT_MS) {
+            Answer::Confirmed => {}
+            Answer::Rejected => return Err(StatusCode::OperationDenied),
+            Answer::Cancelled => return Err(StatusCode::KeepaliveCancel),
+            Answer::TimedOut => return Err(StatusCode::UserActionTimeout),
+        }
+        self.store.reset(&mut self.crypto)?;
+        self.client_pin.reset(&mut self.crypto);
+        // §6.6 also renews the device identifier, which exists only for getInfo's encIdentifier;
+        // this authenticator does not report encIdentifier, so it keeps no identifier to renew.
+        Ok(())
     }
 
     /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty

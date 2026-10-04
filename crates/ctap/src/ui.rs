@@ -17,6 +17,8 @@ pub enum Prompt<'a> {
     /// authenticatorSelection (§6.9): the platform asks which of the connected authenticators
     /// the user means.
     Selection,
+    /// authenticatorReset (§6.6): erase every credential, the PIN and the settings.
+    Reset,
     /// A pinUvAuthToken with `permissions` (§6.5.5.7.1 to §6.5.5.7.3: an authenticator with a
     /// display asks for consent to the permissions), for the RP `rp_id` when the request names
     /// one. The RP ID is the form kept for display, at most 64 bytes.
