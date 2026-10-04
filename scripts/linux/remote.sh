@@ -93,11 +93,46 @@ case "$mode" in
         ;;
     stop)
         token="${3:?owner token}"
+        # The name the run directory is moved to before it is removed.
+        removing="$dir.removing"
+        # Whether directory $1 carries the owner token this stop was given.
+        owned_at() {
+            [[ "$(cat "$1/owner" 2>/dev/null)" == "$token" ]]
+        }
         # Whether the run directory is still the one this stop was given.
         owned() {
-            [[ "$(cat "$dir/owner" 2>/dev/null)" == "$token" ]]
+            owned_at "$dir"
         }
-        owned || exit 0
+        # Removes the moved run directory, its owner token last, so a removal cut
+        # off half way still marks it as this run's for a retry. A tree already
+        # gone was removed by a concurrent stop of the same run: the host is clean.
+        remove_moved() {
+            # Files a container wrote as root into the checkout are handed back
+            # first: the build returns app/target only when its command ends,
+            # which a container removed by force never reaches, and a user other
+            # than root cannot remove them. The image is the one the run used.
+            if [[ $(id -u) -ne 0 && -d "$removing/src" ]] &&
+                ! docker run --rm --volume "$removing/src:/app" --entrypoint chown \
+                    "$(bash "$removing/src/scripts/dev-tools-image.sh")" \
+                    -R "$(id -u):$(id -g)" /app >/dev/null; then
+                echo "cannot hand back the files containers wrote in $removing" >&2
+            fi
+            if ! { find "$removing" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                rm -f "$removing/owner" && rmdir "$removing"; } 2>/dev/null &&
+                [[ -e "$removing" ]]; then
+                echo "cannot remove $removing" >&2
+                return 1
+            fi
+        }
+        if ! owned; then
+            # A stop cut off during the removal left the run directory under the
+            # name it was moved to; this retry finishes it.
+            if owned_at "$removing"; then
+                remove_moved
+                exit
+            fi
+            exit 0
+        fi
         status=0
         # A launch may be under way without its process id file yet. The stop
         # takes that file first, the way a run takes it (a hard link fails on an
@@ -158,18 +193,19 @@ case "$mode" in
         # The directory (and its owner token) stays while a container may be
         # left, so a stop retried after a dropped connection tries again instead
         # of finding nothing to clean.
-        # The owner token goes last, so a removal cut off half way still marks
-        # the directory as this run's for the retry. A removal that fails on a
-        # directory already gone met a concurrent stop of the same run (a retry
-        # while this one still ran), which removed it: the host is clean. A
-        # directory still there with this token, or with none left, failed.
+        # The directory is moved away from its name before anything in it is
+        # removed: a launch whose run has not taken the process id file yet then
+        # finds no run directory and exits, so nothing starts in it while it is
+        # removed, the marker this stop left in it included. A move that fails on
+        # a directory already gone met a concurrent stop of the same run (a retry
+        # while this one still ran), which moved it; this one removes it too.
         # Run names carry 64 random bits, so no other run takes this path between
-        # the owner check and the removal unless CHECK_RUN_ID names it on purpose.
+        # the owner check and the move unless CHECK_RUN_ID names it on purpose.
         if [[ $status -eq 0 ]] && owned; then
-            if ! { find "$dir" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
-                rm -f "$dir/owner" && rmdir "$dir"; } 2>/dev/null &&
-                [[ -e "$dir" ]] && { owned || [[ ! -e "$dir/owner" ]]; }; then
-                echo "cannot remove $dir" >&2
+            if ! mv -T "$dir" "$removing" 2>/dev/null && [[ -e "$dir" ]]; then
+                echo "cannot move $dir away to remove it" >&2
+                status=1
+            elif ! remove_moved; then
                 status=1
             fi
         fi

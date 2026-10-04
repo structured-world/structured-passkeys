@@ -125,10 +125,22 @@ cleanup() {
         # A setup or upload cut off here may still finish on the host after this,
         # leaving the token and the snapshot or remote.sh but never a run, which
         # this project's own host clears with its /tmp ageing.
-        if ! remote "rm -rf $staging; if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" != $owner ]; then exit 0;
-            elif [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir $owner;
-            else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
-                rm -f $remote_dir/owner && rmdir $remote_dir; fi"; then
+        # A stop moves the directory to <dir>.removing once the run and its
+        # containers are gone, and removes it there: a stop cut off then is
+        # finished from that name, by its remote.sh while it is still there. A
+        # removal that fails on a tree already gone met a concurrent stop that
+        # finished it.
+        local moved="$remote_dir.removing"
+        if ! remote "rm -rf $staging;
+            if [ \"\$(cat $remote_dir/owner 2>/dev/null)\" = $owner ]; then
+                if [ -f $remote_dir/remote.sh ]; then bash $remote_dir/remote.sh stop $remote_dir $owner;
+                else find $remote_dir -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                    rm -f $remote_dir/owner && rmdir $remote_dir; fi
+            elif [ \"\$(cat $moved/owner 2>/dev/null)\" = $owner ]; then
+                if [ -f $moved/remote.sh ]; then bash $moved/remote.sh stop $remote_dir $owner;
+                else { find $moved -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&
+                    rm -f $moved/owner && rmdir $moved; } 2>/dev/null || [ ! -e $moved ]; fi
+            fi"; then
             echo "remote directory $remote_dir could not be removed" >&2
             rc=1
         fi

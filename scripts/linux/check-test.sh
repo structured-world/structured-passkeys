@@ -26,6 +26,8 @@
 #   - a run launched after its stop began exits without starting;
 #   - a stop that finds its run directory removed by a concurrent stop of the
 #     same run succeeds;
+#   - a run that reaches its process id file while its stop removes the
+#     directory starts nothing there;
 #   - a process group whose only member is a zombie counts as stopped;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
@@ -34,13 +36,16 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 tmp=$(mktemp -d)
 check=""
-# A stop the concurrent-stop case holds in the fake find, the directory it
-# waits in, and the run directory it works on; the late-launch case's run
-# directory, which lives outside $tmp.
+# A stop a case holds in the fake find and the directory it waits in; the run
+# directories the cases make outside $tmp, and the foreign case's stand-in run
+# (the leader of its own process group).
 held_stop=""
 hold=""
 twice=""
 late=""
+fenced=""
+foreign=""
+launched=""
 # A check still running is stopped before the fake host it uses goes: without
 # its fake ssh it could not clean up its run. A held stop is released and
 # reaped first, since removing $tmp would leave it waiting for good.
@@ -57,8 +62,13 @@ finish() {
         kill -TERM "$check" 2>/dev/null || true
         wait "$check" 2>/dev/null || true
     fi
-    [[ -n "$twice" ]] && rm -rf "$twice"
+    if [[ -n "$launched" ]]; then
+        kill -KILL -- "-$launched" 2>/dev/null || true
+    fi
+    [[ -n "$twice" ]] && rm -rf "$twice" "$twice.removing"
     [[ -n "$late" ]] && rm -rf "$late"
+    [[ -n "$fenced" ]] && rm -rf "$fenced" "$fenced.removing"
+    [[ -n "$foreign" ]] && rm -rf "$foreign"
     rm -rf "$tmp"
     exit "$code"
 }
@@ -364,10 +374,19 @@ launched=$!
 # Killed by this test below: no job report for it.
 disown
 stand_in=""
-# Sets `stand_in` once the stand-in runs under its command line.
+# Sets `stand_in` once the stand-in runs under its command line, found through
+# /proc as remote.sh finds a run (no pgrep: a minimal host has no procps).
 find_stand_in() {
-    stand_in=$(pgrep -f "$foreign/remote.sh run $foreign " | head -n 1) || return 1
-    [[ -n "$stand_in" ]]
+    local file cmdline
+    for file in /proc/[0-9]*/cmdline; do
+        { cmdline=$(tr '\0' ' ' <"$file"); } 2>/dev/null || continue
+        if [[ "$cmdline" == *"$foreign/remote.sh run $foreign "* ]]; then
+            stand_in=${file#/proc/}
+            stand_in=${stand_in%/cmdline}
+            return 0
+        fi
+    done
+    return 1
 }
 if wait_for 10 find_stand_in; then
     echo "$stand_in" >"$foreign/pid"
@@ -380,6 +399,8 @@ else
     kill -KILL -- "-$launched" 2>/dev/null || kill -KILL "$launched" 2>/dev/null || true
 fi
 rm -rf "$foreign"
+foreign=""
+launched=""
 
 # A stop that meets a launch which has not taken the process id file yet: the
 # stop takes it first, so the late run exits at once instead of starting after
@@ -409,18 +430,51 @@ mkdir "$hold"
 FAKE_FIND_HOLD="$hold" bash "$twice/remote.sh" stop "$twice" this-run &
 held_stop=$!
 if wait_for 10 test -e "$hold/held"; then
-    bash "$twice/remote.sh" stop "$twice" this-run || fail "twice: the second stop failed"
+    # The first stop has moved the directory away with its remote.sh; the retry
+    # runs the same script from elsewhere and finishes the removal there.
+    bash "$repo/scripts/linux/remote.sh" stop "$twice" this-run || fail "twice: the second stop failed"
     touch "$hold/release"
     wait "$held_stop" || fail "twice: a stop failed on a directory the other stop removed"
-    [[ ! -e "$twice" ]] || fail "twice: $twice left on the host"
+    [[ ! -e "$twice" && ! -e "$twice.removing" ]] || fail "twice: $twice left on the host"
 else
     fail "twice: the first stop never reached the removal"
     touch "$hold/release"
     wait "$held_stop" || true
 fi
 held_stop=""
-rm -rf "$twice"
+rm -rf "$twice" "$twice.removing"
 twice=""
+
+# A launch whose run reaches the process id file while the stop is removing the
+# directory, after the stop's marker there is gone: the stop moved the directory
+# away from its name first, so the run finds none and starts nothing.
+fenced="/tmp/structured-passkeys-check-test-fenced-$$"
+mkdir -m 700 "$fenced"
+cp "$repo/scripts/linux/remote.sh" "$fenced/remote.sh"
+cp "$repo/scripts/linux/remote.sh" "$tmp/fenced-remote.sh"
+echo this-run >"$fenced/owner"
+hold="$tmp/fenced-hold"
+mkdir "$hold"
+FAKE_FIND_HOLD="$hold" bash "$fenced/remote.sh" stop "$fenced" this-run &
+held_stop=$!
+if wait_for 10 test -e "$hold/held"; then
+    # The removal has taken the marker, as it does before the directory goes.
+    rm -f "$fenced/pid"
+    bash "$tmp/fenced-remote.sh" run "$fenced" ref device >/dev/null 2>&1 || true
+    if [[ -e "$fenced/src" || -e "$fenced/status" ]]; then
+        fail "fenced: a run started in a directory being removed"
+    fi
+    touch "$hold/release"
+    wait "$held_stop" || fail "fenced: the stop failed"
+    [[ ! -e "$fenced" && ! -e "$fenced.removing" ]] || fail "fenced: $fenced left on the host"
+else
+    fail "fenced: the stop never reached the removal"
+    touch "$hold/release"
+    wait "$held_stop" || true
+fi
+held_stop=""
+rm -rf "$fenced" "$fenced.removing"
+fenced=""
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
