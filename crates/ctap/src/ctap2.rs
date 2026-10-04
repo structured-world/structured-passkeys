@@ -438,7 +438,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
 
     /// authenticatorReset (§6.6): within [`RESET_WINDOW_MS`] of the application opening, else
     /// CTAP2_ERR_NOT_ALLOWED; then the user confirms on the device (refusal
-    /// CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT), and the store erases
+    /// CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT, a request the platform
+    /// cancelled while it waited CTAP2_ERR_KEEPALIVE_CANCEL, §11.2.9.1.5), and the store erases
     /// every credential, the PIN and the configuration and draws a new reset ID, which revokes
     /// the seed-recoverable credential IDs created before. The PIN/UV auth state starts over too,
     /// so no token issued before verifies.
