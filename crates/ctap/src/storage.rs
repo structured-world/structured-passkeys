@@ -473,6 +473,10 @@ impl<S: Storage> Store<S> {
     /// [`StoreError::Exhausted`] when the generation would wrap.
     pub fn reset<C: Crypto>(&mut self, crypto: &mut C) -> Result<(), StoreError> {
         let current = self.config().reset_id;
+        // 32 bits from the TRNG: the draw matches one of n earlier reset IDs with probability
+        // n / 2^32, and n counts resets a person confirmed on the device within 10 seconds of
+        // opening the application, so it stays in the tens. Nobody can steer the draw, and a
+        // wider ID would lengthen every credential ID for a risk of the order of 10^-8.
         let reset_id = loop {
             let mut bytes = [0u8; 4];
             crypto.random(&mut bytes);
