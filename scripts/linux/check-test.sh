@@ -34,16 +34,28 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 tmp=$(mktemp -d)
 check=""
+# A stop the concurrent-stop case holds in the fake find, the directory it
+# waits in, and the run directory it works on.
+held_stop=""
+hold=""
+twice=""
 # A check still running is stopped before the fake host it uses goes: without
-# its fake ssh it could not clean up its run.
+# its fake ssh it could not clean up its run. A held stop is released and
+# reaped first, since removing $tmp would leave it waiting for good.
 # Older shellcheck releases report this as SC2317, newer ones as SC2329.
 # shellcheck disable=SC2317,SC2329 # called by the EXIT trap
 finish() {
     local code=$?
+    if [[ -n "$held_stop" ]] && kill -0 "$held_stop" 2>/dev/null; then
+        touch "$hold/release" 2>/dev/null || true
+        kill -TERM "$held_stop" 2>/dev/null || true
+        wait "$held_stop" 2>/dev/null || true
+    fi
     if [[ -n "$check" ]] && kill -0 "$check" 2>/dev/null; then
         kill -TERM "$check" 2>/dev/null || true
         wait "$check" 2>/dev/null || true
     fi
+    [[ -n "$twice" ]] && rm -rf "$twice"
     rm -rf "$tmp"
     exit "$code"
 }
@@ -392,18 +404,20 @@ echo this-run >"$twice/owner"
 hold="$tmp/twice-hold"
 mkdir "$hold"
 FAKE_FIND_HOLD="$hold" bash "$twice/remote.sh" stop "$twice" this-run &
-first=$!
+held_stop=$!
 if wait_for 10 test -e "$hold/held"; then
     bash "$twice/remote.sh" stop "$twice" this-run || fail "twice: the second stop failed"
     touch "$hold/release"
-    wait "$first" || fail "twice: a stop failed on a directory the other stop removed"
+    wait "$held_stop" || fail "twice: a stop failed on a directory the other stop removed"
     [[ ! -e "$twice" ]] || fail "twice: $twice left on the host"
 else
     fail "twice: the first stop never reached the removal"
     touch "$hold/release"
-    wait "$first" || true
+    wait "$held_stop" || true
 fi
+held_stop=""
 rm -rf "$twice"
+twice=""
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
