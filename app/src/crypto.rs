@@ -100,17 +100,14 @@ impl Crypto for DeviceCrypto {
         rand_bytes(out);
     }
 
-    fn sha256(&self, parts: &[&[u8]]) -> [u8; KEY_LEN] {
+    fn sha256_into(&self, parts: &[&[u8]], out: &mut [u8; KEY_LEN]) {
         let mut hash = Sha2_256::new();
         for part in parts {
             hash.update(part).expect("SHA-256 takes any input");
         }
-        let mut digest = [0u8; KEY_LEN];
-        hash.finalize(&mut digest)
-            .expect("the digest fits 32 bytes");
+        hash.finalize(out).expect("the digest fits 32 bytes");
         // The state may have hashed secrets (a PIN, an ECDH output).
         wipe(&mut hash);
-        digest
     }
 
     fn hmac_sha256(&self, key: &[u8], parts: &[&[u8]]) -> Zeroizing<[u8; KEY_LEN]> {

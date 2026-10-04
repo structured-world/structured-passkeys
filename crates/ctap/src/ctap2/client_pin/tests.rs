@@ -662,6 +662,37 @@ fn oversized_members_are_authenticated_first() {
     );
 }
 
+/// A protocol-one newPinEnc that fits the request buffer but is longer than a padded PIN keeps
+/// the §6.5.5.5 order: a length `decrypt` refuses is a decrypt error, PIN_AUTH_INVALID, and only
+/// one that decrypts to more than 64 bytes is INVALID_PARAMETER.
+#[test]
+fn protocol_one_long_new_pins_keep_the_decrypt_error() {
+    let mut authenticator = authenticator();
+    let session = Session::start(&mut authenticator, Protocol::One);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut set = |new_pin_enc: &[u8]| {
+        run(
+            &mut authenticator,
+            &mut ui,
+            &request(&[
+                (0x01, Value::Uint(1)),
+                (0x02, Value::Uint(0x03)),
+                (0x03, session.key_agreement()),
+                (0x04, Value::Bytes(session.authenticate(&[new_pin_enc]))),
+                (0x05, Value::Bytes(new_pin_enc.to_vec())),
+            ]),
+        )
+    };
+    // 80 bytes: five whole blocks, so it decrypts, to 80 bytes rather than 64.
+    let whole = session.encrypt(&[0x31; 80]);
+    assert_eq!(set(&whole), [INVALID_PARAMETER]);
+    // 65 to 79 bytes: not whole blocks, which protocol one cannot decrypt.
+    for len in [65, 72, 79] {
+        assert_eq!(set(&whole[..len]), [PIN_AUTH_INVALID], "{len} bytes");
+    }
+    assert!(authenticator.store.config().pin.is_none());
+}
+
 /// A wrong PIN spends a try (§6.5.5.7.1: decremented before the check) and is PIN_INVALID; the
 /// key agreement key is regenerated. The third mismatch in a row is PIN_AUTH_BLOCKED, and from
 /// then on PIN entries are refused without spending a try until a power cycle; getPINRetries
