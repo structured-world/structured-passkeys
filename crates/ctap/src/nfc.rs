@@ -279,6 +279,11 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         if let State::Running { .. } = self.state {
             return Outcome::Reply(self.while_running(apdu));
         }
+        // A chain is a run of consecutive parts (ISO/IEC 7816-4 5.4.2): any other command, a
+        // poll included, ends it, so the next part never lands after a stale prefix.
+        if apdu.ins != INS_MSG || !matches!(apdu.cla, CLA_FIDO | CLA_CHAINING) {
+            self.abandon_chain();
+        }
         // The rest of a chained response is read with GET RESPONSE (ISO/IEC 7816-4 5.3.4), in
         // either class; any other command drops it, so a response is never read out of order.
         if apdu.ins == INS_GET_RESPONSE && matches!(apdu.cla, CLA_ISO | CLA_FIDO) {
@@ -295,13 +300,9 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             (CLA_FIDO | CLA_CHAINING, INS_MSG) => self.message(apdu),
             (CLA_FIDO, INS_CONTROL) => Outcome::Reply(self.control(apdu)),
             (CLA_FIDO | CLA_CHAINING | CLA_ISO, _) => {
-                self.abandon_chain();
                 Outcome::Reply(Reply::status(StatusWord::INS_NOT_SUPPORTED))
             }
-            _ => {
-                self.abandon_chain();
-                Outcome::Reply(Reply::status(StatusWord::CLA_NOT_SUPPORTED))
-            }
+            _ => Outcome::Reply(Reply::status(StatusWord::CLA_NOT_SUPPORTED)),
         }
     }
 
@@ -388,6 +389,9 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             // platforms (python-fido2) send 0x11 to cancel the request, which ends it like
             // CTAPHID_CANCEL (§11.2.9.1.5) rather than leaving it to time out.
             (CLA_FIDO, INS_NFC_GETRESPONSE) => {
+                if !getresponse_parameters(apdu) {
+                    return Reply::status(StatusWord::WRONG_P1_P2);
+                }
                 let State::Running {
                     deferred: true,
                     cancel,
@@ -414,6 +418,9 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
 
     /// NFCCTAP_GETRESPONSE (§11.3.7.2) once the response is ready.
     fn deferred_response<'a>(&'a mut self, apdu: &Apdu<'_>) -> Reply<'a> {
+        if !getresponse_parameters(apdu) {
+            return Reply::status(StatusWord::WRONG_P1_P2);
+        }
         let State::Ready { len } = self.state else {
             return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
         };
@@ -531,6 +538,13 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         }
         Some(self.send(len, 0, frame))
     }
+}
+
+/// Whether the parameters of an NFCCTAP_GETRESPONSE are acceptable: §11.3.7.2 makes P1 and P2
+/// RFU, zero; P1 0x11 is the cancel platforms send. Anything else is refused before the exchange
+/// moves.
+const fn getresponse_parameters(apdu: &Apdu<'_>) -> bool {
+    apdu.p2 == 0 && (apdu.p1 == 0 || apdu.p1 == P1_CANCEL)
 }
 
 /// The status data of a status update: one byte, the keepalive status of §11.2.9.1.7.

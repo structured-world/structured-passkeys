@@ -204,6 +204,51 @@ fn an_interrupted_chain_is_dropped() {
     assert_eq!(applet.request(), Some(&[0x04][..]));
 }
 
+/// A GET RESPONSE or an NFCCTAP_GETRESPONSE between the parts of a chain also ends it (ISO/IEC
+/// 7816-4 5.4.2): the part after it starts a request of its own instead of finishing the old one.
+#[test]
+fn a_poll_inside_a_chain_drops_it() {
+    for poll in [
+        apdu(0x80, 0xC0, 0x00, 0x00, &[]),
+        apdu(0x00, 0xC0, 0x00, 0x00, &[]),
+        apdu(0x80, 0x11, 0x00, 0x00, &[]),
+    ] {
+        let mut applet = selected();
+        applet.command(&apdu(0x90, 0x10, 0x00, 0x00, &[0x01, 0x02]));
+        assert_eq!(
+            answer(&mut applet, &poll),
+            Some((vec![], 0x6985)),
+            "{poll:?}"
+        );
+        applet.command(&msg(&[0x04]));
+        assert_eq!(applet.request(), Some(&[0x04][..]), "{poll:?}");
+    }
+}
+
+/// §11.3.7.2: P1 and P2 of NFCCTAP_GETRESPONSE are RFU and MUST be zero (P1 0x11 is taken as the
+/// cancel platforms send). Other values are refused with 6A86, and the exchange stays where it
+/// was: a waiting request is not cancelled, a ready response is not given out.
+#[test]
+fn getresponse_parameters_are_checked() {
+    let mut applet = selected();
+    applet.command(&apdu(0x80, 0x10, 0x80, 0x00, &[0x0B]));
+    applet.wait_for_user(true);
+    for (p1, p2) in [(0x01, 0x00), (0x00, 0x01), (0x11, 0x01)] {
+        let bad = apdu(0x80, 0x11, p1, p2, &[]);
+        assert_eq!(
+            answer(&mut applet, &bad),
+            Some((vec![], 0x6A86)),
+            "{p1:02x} {p2:02x}"
+        );
+        assert!(!applet.cancelled(), "{p1:02x} {p2:02x}");
+    }
+    assert_eq!(applet.respond(&[0x00, 0x42]), None);
+    let bad = apdu(0x80, 0x11, 0x00, 0x01, &[]);
+    assert_eq!(answer(&mut applet, &bad), Some((vec![], 0x6A86)));
+    let poll = apdu(0x80, 0x11, 0x00, 0x00, &[]);
+    assert_eq!(answer(&mut applet, &poll), Some((vec![0x00, 0x42], 0x9000)));
+}
+
 /// §11.3.7.1: P1 bit 0x80 of NFCCTAP_MSG announces NFCCTAP_GETRESPONSE support; the other P1 bits
 /// and P2 are RFU and MUST be zero, so they are refused with 6A86.
 #[test]
