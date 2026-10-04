@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Runs the NFC check of the FIDO applet against a device held to the phone; see
+     scripts/android/nfc-probe.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="world.structured.passkeys.nfcprobe">
+
+    <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="36" />
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="true" />
+
+    <application android:label="Passkeys NFC probe">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
