@@ -4,7 +4,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../tests/support/ctaphid_harness.rs"]
+#[path = "../harness/ctaphid.rs"]
 mod harness;
 
 fuzz_target!(|data: &[u8]| harness::run(data));

@@ -8,8 +8,8 @@ Run with `uv run crates/ctap/tests/vectors/derive.py`; the printed values are th
 in crates/ctap/src/keys/tests.rs and crates/ctap/src/credential_id/tests.rs. With
 `--seeds <dir>` it also writes every plaintext and credential ID into `<dir>` as seeds of the
 credential-id fuzz corpus, each named by the SHA-1 of its bytes as cargo-fuzz names corpus
-entries, so writing into crates/ctap/fuzz/corpus/credential-id adds what is missing and
-duplicates nothing.
+entries, so writing into the local, uncommitted crates/ctap/fuzz/corpus/credential-id adds what
+is missing and duplicates nothing.
 """
 
 import hashlib

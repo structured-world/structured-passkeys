@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # Runs every device build of the application in Speculos, inside Ledger's
-# dev-tools image, and checks both of its USB interfaces.
+# dev-tools image, and checks both of its USB interfaces and, on the models
+# with NFC, the FIDO applet.
 #
 # The Ledger APDU channel and the home screen, with Speculos on its HID transport:
 #   - BOLOS GET_APP_NAME_AND_VERSION (B0 01) answers the app name and 9000,
 #   - an instruction the app does not implement (E0 01) answers exactly 6D00,
 #   - the current screen shows the app name.
 # The FIDO HID interface, with Speculos on its U2F transport: scripts/fido_check.py
-# (INIT, PING with 1 and 7609-byte payloads, getInfo, authenticatorReset in and
+# (INIT, PING up to the 1024-byte message size, getInfo, authenticatorReset in and
 # after its window, authenticatorSelection waiting for the user: keepalives, cancel,
 # timeout, confirm and refuse, and authenticatorClientPIN; the reset, selection and
 # token screens are compared with tests/snapshots/<model>/; SPECULOS_GOLDEN=1 writes
 # the snapshots instead).
+# The FIDO applet over NFC on Stax, Flex and Nano Gen5, with Speculos on its NFC
+# transport: scripts/nfc_check.py (selection and deselection of the applet,
+# short and extended APDUs, reset, selection by the tap, the consent screen with
+# and without status updates, cancel).
 #
 # Expects the artifacts of scripts/device-build.sh in app/target/<target>/release/.
 # Linux only: the image is a Linux container.
@@ -111,6 +116,19 @@ docker run --rm \
                 fi
                 if ! /tmp/fido/bin/python scripts/fido_check.py --speculos --model "$model" \
                     --snapshots tests/snapshots "${golden[@]}"; then
+                    cat /tmp/speculos.log
+                    status=1
+                fi
+            else
+                status=1
+            fi
+            stop
+            case "$target" in
+                nanosplus | nanox) continue ;;
+            esac
+            echo "== speculos $target, FIDO over NFC"
+            if start "$model" NFC "$elf"; then
+                if ! /tmp/fido/bin/python scripts/nfc_check.py --model "$model"; then
                     cat /tmp/speculos.log
                     status=1
                 fi
