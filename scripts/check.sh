@@ -33,6 +33,7 @@ pinned() {
 }
 pinned "version: 0.11.0" shellcheck --version
 pinned "1.7.12" actionlint -version
+pinned "cargo-fuzz 0.13.2" cargo fuzz --version
 
 run scripts/check-links.sh
 run shellcheck scripts/*.sh scripts/linux/*.sh
