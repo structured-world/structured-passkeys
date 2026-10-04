@@ -319,6 +319,17 @@ class PersonAtDevice:
     def press(self, wanted: str) -> None:
         print(f"   on the device, choose {wanted!r}", flush=True)
 
+    def follow(self, steps: list[tuple[str, str]]) -> None:
+        """Names every screen of one ceremony with its option at once, in order, since the person
+        answers screens this script cannot see."""
+        if len(steps) == 1:
+            title, label = steps[0]
+            print(f"   on the device, on {title!r} choose {label!r}", flush=True)
+            return
+        print("   on the device, one screen after another:", flush=True)
+        for number, (title, label) in enumerate(steps, start=1):
+            print(f"     {number}. on {title!r} choose {label!r}", flush=True)
+
 
 def selection(ctap: Ctap2, cancel: threading.Event | None = None) -> int:
     """Runs authenticatorSelection and returns its CTAP status."""
@@ -610,9 +621,11 @@ def pressed(user, steps: list[tuple[str, str, object]], call) -> tuple[int, obje
 
     def answer() -> None:
         try:
+            if not isinstance(user, SpeculosUser):
+                user.follow([(title, label) for title, label, _ in steps])
+                return
             for title, label, snapshot in steps:
-                if isinstance(user, SpeculosUser):
-                    wait_for_screen(title)
+                wait_for_screen(title)
                 if snapshot is not None:
                     snapshot()
                 user.press(label)
