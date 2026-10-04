@@ -6,14 +6,21 @@
 //! clientPIN rules that hold for any input: a pinUvAuthToken only after the consent was approved
 //! (CTAP 2.2 §6.5.5.7), the NFC tap included, built-in UV only on an unlocked device, a PIN try
 //! spent only by a PIN check that fails, one at a time (§6.5.5.6, §6.5.5.7), and a selection only
-//! with user presence (§6.9).
+//! with user presence (§6.9). For the credential commands, authenticator data reports user
+//! presence only when the user answered on the device or the tap counted, and a new credential
+//! always comes with both UP and UV (§6.1.2 steps 11 and 18).
 
 use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
+use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::crypto::{Crypto, KEY_LEN};
 use structured_passkeys_ctap::ctap2::{Authenticator, Link, MaxMsgSize, Settings, Transports};
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
-use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
+use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
+
+/// Authenticator data flags UP and UV (WebAuthn L3 §6.1).
+const UP: u8 = 0x01;
+const UV: u8 = 0x04;
 
 /// The status codes of CTAP 2.2 §8.2 the authenticator may answer with.
 const STATUS_CODES: [u8; 46] = [
@@ -22,18 +29,46 @@ const STATUS_CODES: [u8; 46] = [
     0x33, 0x34, 0x35, 0x36, 0x37, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x7F,
 ];
 
-/// A user whose answers come from one byte: bits 0-1 the confirmation, bit 5 whether the device
-/// is locked.
+/// A user whose answers come from one byte: bits 0-1 the confirmation, bit 2 the key origin
+/// chosen at registration, bits 3-4 the account picked, bit 5 whether the device is locked.
 struct Fuzzed(u8);
 
-impl Ui for Fuzzed {
-    fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
+impl Fuzzed {
+    fn answer(&self) -> Answer {
         match self.0 & 0x03 {
             0 => Answer::Confirmed,
             1 => Answer::Rejected,
             2 => Answer::Cancelled,
             _ => Answer::TimedOut,
         }
+    }
+
+    fn choice<T>(&self, chosen: T) -> Choice<T> {
+        match self.answer() {
+            Answer::Confirmed => Choice::Chose(chosen),
+            Answer::Rejected => Choice::Rejected,
+            Answer::Cancelled => Choice::Cancelled,
+            Answer::TimedOut => Choice::TimedOut,
+        }
+    }
+}
+
+impl Ui for Fuzzed {
+    fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
+        self.answer()
+    }
+
+    fn register(&mut self, _registration: Registration<'_>, _timeout_ms: u32) -> Choice<Origin> {
+        self.choice(if self.0 & 0x04 == 0 {
+            Origin::SeedRecoverable
+        } else {
+            Origin::DeviceOnly
+        })
+    }
+
+    fn pick(&mut self, _rp_id: &str, accounts: &[Account<'_>], _timeout_ms: u32) -> Choice<usize> {
+        let wanted = usize::from((self.0 >> 3) & 0x03);
+        self.choice(wanted % accounts.len().max(1))
     }
 
     fn device_unlocked(&mut self) -> bool {
@@ -62,6 +97,25 @@ fn client_pin_sub_command(request: &[u8]) -> Option<u64> {
                 }
             }
             Ok(found)
+        })
+        .ok()
+        .flatten()
+}
+
+/// The flags byte of the authenticator data in a makeCredential or getAssertion response body.
+fn auth_data_flags(body: &[u8]) -> Option<u8> {
+    Decoder::new(body)
+        .map(|entries| {
+            let mut flags = None;
+            while let Some(key) = entries.next_key()? {
+                let value = entries.value();
+                if key == Key::Int(0x02) {
+                    flags = value.bytes()?.get(KEY_LEN).copied();
+                } else {
+                    value.skip()?;
+                }
+            }
+            Ok(flags)
         })
         .ok()
         .flatten()
@@ -111,10 +165,25 @@ pub fn run(data: &[u8]) {
 
     let sub_command = client_pin_sub_command(request);
     let succeeded = response[0] == 0x00;
+    let tapped = link == Link::Nfc && answers & 0x80 != 0;
+    // makeCredential and getAssertion report user presence only after the user answered on the
+    // device or the tap counted; a new credential always has UP and UV.
+    if succeeded && matches!(request.first(), Some(0x01 | 0x02)) {
+        let flags = auth_data_flags(&response[1..length]).expect("authenticator data");
+        if flags & UP != 0 {
+            assert!(
+                tapped || answers & 0x03 == 0,
+                "user presence only when proved"
+            );
+        }
+        if request[0] == 0x01 {
+            assert_eq!(flags & (UP | UV), UP | UV, "a credential with UP and UV");
+            assert_eq!(answers & 0x20, 0, "a credential only on an unlocked device");
+        }
+    }
     // authenticatorSelection answers OK only with user presence: a confirmation on the device, or
     // over NFC the tap (§6.9).
     if succeeded && request == [0x0B] {
-        let tapped = link == Link::Nfc && answers & 0x80 != 0;
         assert!(
             tapped || answers & 0x03 == 0,
             "selection only with user presence"

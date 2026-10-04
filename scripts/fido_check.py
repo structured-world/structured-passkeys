@@ -41,9 +41,20 @@ getUVRetries offers one attempt; getPinUvAuthTokenUsingUvWithPermissions gives a
 consent choice alone, no PIN asked, and in Speculos a refused consent gives none
 (CTAP2_ERR_OPERATION_DENIED). Its consent screen, which names the RP, is compared with its snapshot.
 
+Credentials (§6.1 to §6.3), in Speculos and on a device, with built-in UV: getInfo reports the
+options rk, up, uv and pinUvAuthToken; a discoverable registration starts on the device-only key
+origin (UP, UV and AT, no BE or BS, packed self attestation) and a second one switches to the
+recovery phrase key on the key type screen (BE and BS); a getAssertion without allowList lists both
+accounts, newest first, and the one picked signs with its user and userSelected; one with an
+allowList shows the sign-in screen and signs with UP and UV; one without presence answers the count
+with no screen, getNextAssertion the other, and then CTAP2_ERR_NOT_ALLOWED; a registration whose
+excludeList names a credential of the device ends with CTAP2_ERR_CREDENTIAL_EXCLUDED after the
+screen. Every signature is verified with the key its registration returned. The registration, key
+type, account picker and sign-in screens are compared with their snapshots.
+
 The screens to answer come first and those to leave alone last, so at a device the person
-answers: selection "Don't allow", selection "Allow", token consent "Allow", then nothing while
-a selection is cancelled and the next one times out.
+answers: selection "Don't allow", selection "Allow", token consent "Allow", the credential screens
+as printed, then nothing while a selection is cancelled and the next one times out.
 """
 
 import argparse
@@ -110,6 +121,23 @@ PIN_RETRIES = 0x03
 UV_RETRIES = 0x05
 # getAssertion permission (§6.5.5.7).
 PERMISSION_GA = 0x02
+# Authenticator data flags (WebAuthn L3 §6.1): UP, UV, BE, BS, AT.
+FLAG_UP = 0x01
+FLAG_UV = 0x04
+FLAG_BE = 0x08
+FLAG_BS = 0x10
+FLAG_AT = 0x40
+# The relying party of the credential checks, and the screens' labels.
+RP_ID = "example.com"
+REGISTER_TITLE = f"Create a passkey for {RP_ID}?"
+REGISTER_CONFIRM = "Create passkey"
+KEY_TYPE = "Key type"
+USE_KEY_TYPE = "Use this key type"
+SIGN_IN_TITLE = f"Sign in to {RP_ID}?"
+SIGN_IN = "Sign in"
+OTHER_ACCOUNT = "Other account"
+EXCLUDED_TITLE = "Already registered"
+EXCLUDED_CONFIRM = "OK"
 
 
 class KeepaliveLog:
@@ -251,7 +279,19 @@ class SpeculosUser:
         self.nano = model in NANO_MODELS
 
     def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
-        wanted = labels[0] if confirm else labels[1]
+        self.press(labels[0] if confirm else labels[1])
+
+    def press(self, wanted: str) -> None:
+        """Chooses the option labelled `wanted` on the shown screen, then waits until the screen
+        changes, so the next press meets the next screen."""
+        before = screen_texts()
+        self._press(wanted)
+        for _ in range(50):
+            if screen_texts() != before:
+                return
+            time.sleep(0.1)
+
+    def _press(self, wanted: str) -> None:
         if self.nano:
             # The choice steps through its pages with the right button and takes the shown
             # one with both buttons; the last page stays put when pressed again.
@@ -274,7 +314,9 @@ class PersonAtDevice:
     """Asks the person at the device to answer a screen."""
 
     def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
-        wanted = labels[0] if confirm else labels[1]
+        self.press(labels[0] if confirm else labels[1])
+
+    def press(self, wanted: str) -> None:
         print(f"   on the device, choose {wanted!r}", flush=True)
 
 
@@ -559,6 +601,163 @@ def check_built_in_uv(device: CtapHidDevice, user, snapshot) -> None:
         )
 
 
+def pressed(user, steps: list[tuple[str, str, object]], call) -> tuple[int, object]:
+    """Runs `call` while the user goes through `steps`, each a screen title, the option to choose
+    on it and a snapshot check or None; returns its CTAP status and result. The answers run in a
+    timer's thread; an exception there is kept and raised here."""
+    failure: list[BaseException] = []
+    result: list[object] = []
+
+    def answer() -> None:
+        try:
+            for title, label, snapshot in steps:
+                if isinstance(user, SpeculosUser):
+                    wait_for_screen(title)
+                if snapshot is not None:
+                    snapshot()
+                user.press(label)
+        except BaseException as error:
+            failure.append(error)
+
+    timer = threading.Timer(1.0, answer)
+    timer.start()
+    status = ctap_status(lambda: result.append(call()))
+    timer.join()
+    if failure:
+        raise failure[0]
+    return status, result[0] if result else None
+
+
+def check_credentials(device: CtapHidDevice, user, snapshot) -> None:
+    """makeCredential, getAssertion and getNextAssertion (CTAP 2.2 §6.1 to §6.3) with built-in user
+    verification (the uv option, the device unlock), for both key origins."""
+    ctap = Ctap2(device)
+    info_options = ctap.info.options
+    check(
+        all(info_options.get(name) for name in ("rk", "up", "uv", "pinUvAuthToken")),
+        f"getInfo: options {info_options}",
+    )
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    rp = {"id": RP_ID, "name": "Example"}
+    params = [{"type": "public-key", "alg": -7}]
+
+    def register(user_id: bytes, name: str):
+        return lambda: ctap.make_credential(
+            client_data_hash,
+            rp,
+            {"id": user_id, "name": name, "displayName": name.title()},
+            params,
+            options={"rk": True, "uv": True},
+        )
+
+    # A discoverable credential with UV starts on the device-only origin.
+    status, device_only = pressed(
+        user,
+        [(REGISTER_TITLE, REGISTER_CONFIRM, snapshot("registration", REGISTER_TITLE))],
+        register(b"user-device", "device user"),
+    )
+    flags = device_only.auth_data.flags if device_only else 0
+    check(
+        status == CtapError.ERR.SUCCESS
+        and flags & (FLAG_UP | FLAG_UV | FLAG_AT) == FLAG_UP | FLAG_UV | FLAG_AT
+        and flags & (FLAG_BE | FLAG_BS) == 0,
+        f"makeCredential: a device-only key, UP and UV, no BE or BS (flags {flags:#04x})",
+    )
+    check(device_only.fmt == "packed", "makeCredential: packed self attestation")
+    # The other origin through the key type screen.
+    status, seed = pressed(
+        user,
+        [
+            (REGISTER_TITLE, KEY_TYPE, None),
+            ("Use Recovery phrase key?", USE_KEY_TYPE, snapshot("key_type", "Use Recovery phrase key?")),
+            (REGISTER_TITLE, REGISTER_CONFIRM, None),
+        ],
+        register(b"user-seed", "seed user"),
+    )
+    flags = seed.auth_data.flags if seed else 0
+    check(
+        status == CtapError.ERR.SUCCESS
+        and flags & (FLAG_BE | FLAG_BS) == FLAG_BE | FLAG_BS,
+        f"makeCredential: a recovery phrase key reports BE and BS (flags {flags:#04x})",
+    )
+    keys = {
+        device_only.auth_data.credential_data.credential_id: device_only.auth_data.credential_data.public_key,
+        seed.auth_data.credential_data.credential_id: seed.auth_data.credential_data.public_key,
+    }
+
+    def verify(assertion) -> bool:
+        key = keys.get(assertion.credential["id"])
+        if key is None:
+            return False
+        try:
+            assertion.verify(client_data_hash, key)
+            return True
+        except Exception:
+            return False
+
+    # Two accounts for the RP: the device lists them, newest first; the second is picked.
+    status, picked = pressed(
+        user,
+        [
+            (SIGN_IN_TITLE, OTHER_ACCOUNT, snapshot("account_picker", SIGN_IN_TITLE)),
+            (SIGN_IN_TITLE, SIGN_IN, None),
+        ],
+        lambda: ctap.get_assertion(RP_ID, client_data_hash, options={"uv": True}),
+    )
+    check(
+        status == CtapError.ERR.SUCCESS
+        and verify(picked)
+        and picked.credential["id"] == device_only.auth_data.credential_data.credential_id
+        and picked.user_selected
+        and picked.user.get("name") == "device user",
+        f"getAssertion: the picked account signs, with its user ({status!r})",
+    )
+    # One credential named in the allowList: the sign-in screen, then UP and UV.
+    allow = [{"type": "public-key", "id": seed.auth_data.credential_data.credential_id}]
+    status, single = pressed(
+        user,
+        [(SIGN_IN_TITLE, SIGN_IN, snapshot("assertion", SIGN_IN_TITLE))],
+        lambda: ctap.get_assertion(RP_ID, client_data_hash, allow, options={"uv": True}),
+    )
+    flags = single.auth_data.flags if single else 0
+    check(
+        status == CtapError.ERR.SUCCESS
+        and verify(single)
+        and flags & (FLAG_UP | FLAG_UV | FLAG_BE | FLAG_BS) == FLAG_UP | FLAG_UV | FLAG_BE | FLAG_BS,
+        f"getAssertion: the allowList credential signs with UP and UV (flags {flags:#04x})",
+    )
+    # No presence asked for: the count, and getNextAssertion for the rest, with no screen.
+    first = ctap.get_assertion(RP_ID, client_data_hash, options={"up": False})
+    second = ctap.get_next_assertion()
+    check(
+        first.number_of_credentials == 2
+        and verify(first)
+        and verify(second)
+        and {first.credential["id"], second.credential["id"]} == set(keys)
+        and first.auth_data.flags & FLAG_UP == 0,
+        "getNextAssertion: both credentials, no UP, no screen",
+    )
+    status = ctap_status(ctap.get_next_assertion)
+    check(status == CtapError.ERR.NOT_ALLOWED, f"getNextAssertion: past the last ({status!r})")
+    # A registration whose excludeList names a credential of this device.
+    status, _ = pressed(
+        user,
+        [(EXCLUDED_TITLE, EXCLUDED_CONFIRM, None)],
+        lambda: ctap.make_credential(
+            client_data_hash,
+            rp,
+            {"id": b"user-new", "name": "new"},
+            params,
+            exclude_list=allow,
+            options={"uv": True},
+        ),
+    )
+    check(
+        status == CtapError.ERR.CREDENTIAL_EXCLUDED,
+        f"makeCredential: an excluded credential after presence ({status!r})",
+    )
+
+
 def snapshot_check(model: str, directory: Path, golden: bool, name: str, title: str):
     """Compares the shown screen titled `title` with the model's snapshot `name`, or writes it
     with `golden`."""
@@ -635,6 +834,7 @@ def main() -> None:
     # left unanswered (cancel, timeout) last, so no answer is given to the wrong screen.
     check_selection_answers(device, user, snapshot("selection", SELECTION_TITLE))
     check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
+    check_credentials(device, user, snapshot)
     if args.speculos:
         # The reset left the PIN unset, so it can be set; a device keeps its PIN.
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))

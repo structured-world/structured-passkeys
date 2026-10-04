@@ -6,15 +6,16 @@ use super::{
     RESET_WINDOW_MS, Settings, StatusCode, TooSmall, Transports, UnknownCommand,
 };
 use crate::cbor::{self, validate};
+use crate::credential_id::Origin;
 use crate::crypto::KEY_LEN;
 use crate::pin::Protocol;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, PIN_RETRIES, PinVerifier, Store};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{Account, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui};
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
 
-fn settings(transports: Transports) -> Settings {
+pub(super) fn settings(transports: Transports) -> Settings {
     Settings {
         max_msg_size: MaxMsgSize::try_from(1024).expect("at least 1024"),
         transports,
@@ -27,7 +28,7 @@ pub(super) fn authenticator() -> TestAuthenticator {
 }
 
 /// An authenticator on fresh NVM with the software platform, offering `transports`.
-fn authenticator_with(transports: Transports) -> TestAuthenticator {
+pub(super) fn authenticator_with(transports: Transports) -> TestAuthenticator {
     Authenticator::new(
         settings(transports),
         SoftCrypto::new([0x11; KEY_LEN], [0x22; KEY_LEN]),
@@ -47,6 +48,24 @@ impl TestAuthenticator {
     }
 }
 
+/// An account as a screen showed it, copied out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Shown {
+    pub(super) name: Option<String>,
+    pub(super) display_name: Option<String>,
+    pub(super) origin: Option<Origin>,
+}
+
+impl Shown {
+    fn from_account(account: &Account<'_>) -> Self {
+        Self {
+            name: account.name.map(String::from),
+            display_name: account.display_name.map(String::from),
+            origin: account.origin,
+        }
+    }
+}
+
 /// A screen the scripted user was shown, with the RP ID copied out of the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Asked {
@@ -59,6 +78,18 @@ pub(super) enum Asked {
         permissions: u8,
         rp_id: Option<String>,
     },
+    /// A sign-in with this account.
+    Assertion { rp_id: String, account: Shown },
+    /// A registration found in the excludeList.
+    Excluded { rp_id: String },
+    /// A registration for this account, the origin selector starting on `default_origin`.
+    Registration {
+        rp_id: String,
+        account: Shown,
+        default_origin: Origin,
+    },
+    /// The account picker with these accounts.
+    Pick { rp_id: String, accounts: Vec<Shown> },
 }
 
 impl Asked {
@@ -70,17 +101,27 @@ impl Asked {
                 permissions: permissions.bits(),
                 rp_id: rp_id.map(String::from),
             },
+            Prompt::Assertion { rp_id, account } => Asked::Assertion {
+                rp_id: String::from(rp_id),
+                account: Shown::from_account(&account),
+            },
+            Prompt::Excluded { rp_id } => Asked::Excluded {
+                rp_id: String::from(rp_id),
+            },
         }
     }
 }
 
 /// A user who gives `answer` to every confirmation, recording what was shown with its timeout,
 /// on a device whose PIN the operating system holds validated while `unlocked`; the clock is
-/// `now_ms`.
+/// `now_ms`. A confirmed registration takes `origin`, or the default when it is `None`; a
+/// confirmed account picker takes the account at `pick`.
 pub(super) struct Scripted {
     pub(super) answer: Answer,
     pub(super) unlocked: bool,
     pub(super) now_ms: u64,
+    pub(super) origin: Option<Origin>,
+    pub(super) pick: usize,
     pub(super) asked: Vec<(Asked, u32)>,
 }
 
@@ -90,7 +131,18 @@ impl Scripted {
             answer,
             unlocked: true,
             now_ms: 0,
+            origin: None,
+            pick: 0,
             asked: Vec::new(),
+        }
+    }
+
+    fn choice<T>(&self, chosen: T) -> Choice<T> {
+        match self.answer {
+            Answer::Confirmed => Choice::Chose(chosen),
+            Answer::Rejected => Choice::Rejected,
+            Answer::Cancelled => Choice::Cancelled,
+            Answer::TimedOut => Choice::TimedOut,
         }
     }
 }
@@ -99,6 +151,29 @@ impl Ui for Scripted {
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
         self.asked.push((Asked::from_prompt(prompt), timeout_ms));
         self.answer
+    }
+
+    fn register(&mut self, registration: Registration<'_>, timeout_ms: u32) -> Choice<Origin> {
+        self.asked.push((
+            Asked::Registration {
+                rp_id: String::from(registration.rp_id),
+                account: Shown::from_account(&registration.account),
+                default_origin: registration.default_origin,
+            },
+            timeout_ms,
+        ));
+        self.choice(self.origin.unwrap_or(registration.default_origin))
+    }
+
+    fn pick(&mut self, rp_id: &str, accounts: &[Account<'_>], timeout_ms: u32) -> Choice<usize> {
+        self.asked.push((
+            Asked::Pick {
+                rp_id: String::from(rp_id),
+                accounts: accounts.iter().map(Shown::from_account).collect(),
+            },
+            timeout_ms,
+        ));
+        self.choice(self.pick)
     }
 
     fn device_unlocked(&mut self) -> bool {
@@ -217,21 +292,35 @@ fn parsing_names_the_command() {
     assert_eq!(authenticator.parse(&[0x04]), Ok(Command::GetInfo));
     assert_eq!(authenticator.parse(&[0x0B]), Ok(Command::Selection));
     assert_eq!(authenticator.parse(&[0x07]), Ok(Command::Reset));
+    assert_eq!(authenticator.parse(&[0x08]), Ok(Command::GetNextAssertion));
     assert_eq!(authenticator.parse(&[]), Err(StatusCode::InvalidLength));
     assert_eq!(
-        authenticator.parse(&[0x01]),
+        authenticator.parse(&[0x09]),
         Err(StatusCode::InvalidCommand)
     );
 }
 
-/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 5: 1024, 6: [2, 1], 9: ["usb"]} in
-/// canonical order: the required versions and aaguid, maxMsgSize, the PIN/UV auth protocols,
-/// two first, and the transports (§6.4).
+/// The options map of getInfo (§6.4) in canonical order: `rk`, `up`, `uv` true, `clientPin`
+/// false while no client PIN is set, `pinUvAuthToken` true.
+const OPTIONS_WITHOUT_PIN: [u8; 41] = [
+    0x04, 0xA5, // key 4, a map of five
+    0x62, b'r', b'k', 0xF5, // "rk": true
+    0x62, b'u', b'p', 0xF5, // "up": true
+    0x62, b'u', b'v', 0xF5, // "uv": true
+    0x69, b'c', b'l', b'i', b'e', b'n', b't', b'P', b'i', b'n', 0xF4, // "clientPin": false
+    0x6E, b'p', b'i', b'n', b'U', b'v', b'A', b'u', b't', b'h', b'T', b'o', b'k', b'e', b'n',
+    0xF5, // "pinUvAuthToken": true
+];
+
+/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9:
+/// ["usb"]} in canonical order: the required versions and aaguid, the options, maxMsgSize, the
+/// PIN/UV auth protocols, two first, and the transports (§6.4).
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA5, 0x01, 0x80, 0x03, 0x50];
+    let mut expected = vec![0x00, 0xA6, 0x01, 0x80, 0x03, 0x50];
     expected.extend_from_slice(&AAGUID);
+    expected.extend_from_slice(&OPTIONS_WITHOUT_PIN);
     expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00, 0x06, 0x82, 0x02, 0x01]);
     expected.extend_from_slice(&[0x09, 0x81, 0x63, b'u', b's', b'b']);
     assert_eq!(response, expected);
@@ -248,7 +337,7 @@ fn get_info_lists_nfc_on_a_device_that_has_it() {
         let mut response = [0u8; 256];
         let length = authenticator.process(&[0x04], link, &mut ui, &mut response);
         let tail = [0x09, 0x82, 0x63, b'n', b'f', b'c', 0x63, b'u', b's', b'b'];
-        assert_eq!(response[1], 0xA5, "{link:?}");
+        assert_eq!(response[1], 0xA6, "{link:?}");
         assert!(response[..length].ends_with(&tail), "{link:?}");
         assert_eq!(validate(&response[1..length]), Ok(()), "{link:?}");
     }
@@ -282,9 +371,7 @@ fn an_empty_request_is_invalid_length() {
 /// CTAP1_ERR_INVALID_COMMAND with no body.
 #[test]
 fn unimplemented_commands_are_invalid_command() {
-    for code in [
-        0x01, 0x02, 0x03, 0x05, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF,
-    ] {
+    for code in [0x03, 0x05, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF] {
         assert_eq!(process(&[code, 0xA0]), [0x01], "command {code:#04x}");
     }
 }

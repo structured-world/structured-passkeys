@@ -80,7 +80,7 @@ impl<const N: usize> Drop for Bytes<N> {
 impl<const N: usize> ZeroizeOnDrop for Bytes<N> {}
 
 impl<const N: usize> Bytes<N> {
-    fn new(value: &[u8]) -> Self {
+    pub(super) fn new(value: &[u8]) -> Self {
         let mut bytes = [0u8; N];
         if let Some(target) = bytes.get_mut(..value.len()) {
             target.copy_from_slice(value);
@@ -384,7 +384,7 @@ fn decapsulate<C: Crypto>(
 /// The answer to a consent screen: approval goes on; a refusal or no answer is consent not
 /// approved, CTAP2_ERR_OPERATION_DENIED (§6.5.5.7.1 and §6.5.5.7.2 step 7); a request the host
 /// cancelled is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
-fn consent(answer: Answer) -> Result<(), StatusCode> {
+pub(super) fn consent(answer: Answer) -> Result<(), StatusCode> {
     match answer {
         Answer::Confirmed => Ok(()),
         Answer::Rejected | Answer::TimedOut => Err(StatusCode::OperationDenied),
@@ -451,7 +451,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// the device PIN is validated, none once the client PIN is blocked, since a blocked PIN
     /// disables built-in user verification too (performBuiltInUv step 3), and none on a device
     /// the operating system does not hold unlocked.
-    fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
+    pub(super) fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
         let config = self.store.config();
         if config.pin.is_some() && config.pin_retries == 0 {
             return 0;
@@ -756,9 +756,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
 }
 
 /// A response that does not fit the buffer is CTAP1_ERR_OTHER.
-fn write_full<T>(result: Result<T, Full>) -> Result<(), StatusCode> {
+pub(super) fn write_full<T>(result: Result<T, Full>) -> Result<(), StatusCode> {
     result.map(|_| ()).map_err(|Full| StatusCode::Other)
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

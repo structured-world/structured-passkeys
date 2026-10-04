@@ -5,6 +5,10 @@
 //! directly and the wait loop takes every event itself: the screen gets its buttons and touches,
 //! the FIDO interfaces their reports and APDUs (keepalives and status updates go out, CANCEL and
 //! deselection come in), and the ticker the clock that ends the wait.
+//!
+//! Every screen is one `nbgl_useCaseChoice`, which looks the same on all five devices; a ceremony
+//! that needs more than two answers (the key origin at registration, the account to sign in with)
+//! is a short chain of them within one timeout.
 
 use core::ffi::c_char;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -16,9 +20,10 @@ use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
 use ledger_device_sdk::sys::{
     BOLOS_TRUE, nbgl_icon_details_t, nbgl_useCaseChoice, os_global_pin_is_validated,
 };
+use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::ctap2::Link;
 use structured_passkeys_ctap::pin::Permissions;
-use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
+use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
 
 use crate::{Comm, hid};
 
@@ -46,28 +51,34 @@ const PENDING: u8 = 0;
 const CONFIRMED: u8 = 1;
 const REJECTED: u8 = 2;
 
-/// Room for a composed screen text: the longest consent sentence with a 64-byte RP ID.
-const TEXT_LEN: usize = 160;
+/// Room for a composed screen text: the longest sentence with a 64-byte RP ID and a 64-byte name.
+const TEXT_LEN: usize = 256;
 
 /// A NUL-terminated text composed for a screen. It lives in the frame of the call that shows the
 /// screen and waits for it, so it outlives the screen without taking RAM between screens, which
-/// the Nano X does not have to spare. Longer text is cut at a character boundary.
+/// the Nano X does not have to spare. Longer text is cut.
+///
+/// The application's NBGL fonts hold the printable ASCII range (`first_char` to `last_char` of
+/// `nbgl_font_t`); any other character is written as `?`, a visible placeholder, so two names that
+/// differ in a character the font lacks never look identical.
 struct Text([u8; TEXT_LEN]);
 
 impl Text {
-    /// The concatenation of `parts`.
+    /// The concatenation of `parts`, with a line break kept as one.
     fn new(parts: &[&str]) -> Self {
         let mut bytes = [0u8; TEXT_LEN];
         let mut length = 0;
         'parts: for part in parts {
             for character in part.chars() {
-                let width = character.len_utf8();
                 // One byte stays for the terminating NUL.
-                if length + width >= TEXT_LEN {
+                if length + 1 >= TEXT_LEN {
                     break 'parts;
                 }
-                character.encode_utf8(&mut bytes[length..length + width]);
-                length += width;
+                bytes[length] = match character {
+                    ' '..='~' | '\n' => character as u8,
+                    _ => b'?',
+                };
+                length += 1;
             }
         }
         Self(bytes)
@@ -100,6 +111,60 @@ fn purposes(permissions: Permissions) -> &'static str {
     }
 }
 
+/// The name a screen gives an account: the user name, else the display name.
+fn account_name<'a>(account: &Account<'a>) -> &'a str {
+    account
+        .name
+        .or(account.display_name)
+        .unwrap_or("an unnamed account")
+}
+
+/// The key origin as a badge on a sign-in screen and as the option at registration.
+const fn origin_name(origin: Origin) -> &'static str {
+    match origin {
+        Origin::SeedRecoverable => "Recovery phrase key",
+        Origin::DeviceOnly => "This device only",
+    }
+}
+
+/// What the key origin means for the user: what restores the key and what loses it.
+const fn origin_meaning(origin: Origin) -> &'static str {
+    match origin {
+        Origin::SeedRecoverable => {
+            "Restored from your recovery phrase, after an app update or on another Ledger."
+        }
+        Origin::DeviceOnly => {
+            "Kept on this device alone: an app update or uninstall deletes it, so keep a second \
+             sign-in method."
+        }
+    }
+}
+
+/// The other key origin.
+const fn other_origin(origin: Origin) -> Origin {
+    match origin {
+        Origin::SeedRecoverable => Origin::DeviceOnly,
+        Origin::DeviceOnly => Origin::SeedRecoverable,
+    }
+}
+
+/// A number of at most five digits, written into `buffer`.
+fn number(value: usize, buffer: &mut [u8; 5]) -> &str {
+    let mut at = buffer.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        // A digit, 0 to 9.
+        buffer[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 || at == 0 {
+            break;
+        }
+    }
+    // ASCII digits.
+    core::str::from_utf8(&buffer[at..]).unwrap_or("?")
+}
+
 unsafe extern "C" fn choice_callback(confirm: bool) {
     OUTCOME.store(
         if confirm { CONFIRMED } else { REJECTED },
@@ -107,18 +172,16 @@ unsafe extern "C" fn choice_callback(confirm: bool) {
     );
 }
 
-/// How the wait for a screen ended.
-enum Wait {
-    /// The screen's callback set this outcome.
-    Answered(u8),
-    /// The host cancelled the request, or it was aborted with its channel.
-    Cancelled,
-    /// The timeout passed.
-    TimedOut,
+/// The four strings of a choice screen.
+struct Choices {
+    message: *const c_char,
+    sub_message: *const c_char,
+    confirm: *const c_char,
+    reject: *const c_char,
 }
 
 /// The screens of a waiting ceremony, drawn over the home screen and replaced by it again when
-/// the wait ends.
+/// the ceremony ends.
 pub struct DeviceUi<'a> {
     comm: &'a mut Comm,
     home: &'a mut NbglHomeAndSettings,
@@ -173,68 +236,82 @@ impl<'a> DeviceUi<'a> {
         }
     }
 
-    /// Takes events until the shown screen answers, the request ends or `timeout_ms` passes,
-    /// with the request's transport saying that the user is needed meanwhile.
-    fn wait(&mut self, timeout_ms: u32) -> Wait {
+    /// Starts a ceremony that may take `timeout_ms`: the transport says that the user is needed,
+    /// and the returned deadline bounds every screen of the ceremony together.
+    fn begin(&mut self, timeout_ms: u32) -> u64 {
         self.waiting_for_user(true);
-        let mut waited_ms: u64 = 0;
-        let ended = loop {
-            let outcome = OUTCOME.load(Ordering::Relaxed);
-            if outcome != PENDING {
-                break Wait::Answered(outcome);
-            }
-            if self.request_ended() {
-                break Wait::Cancelled;
-            }
-            // The first tick can come right after the screen appeared, so `k` ticks are only
-            // `k - 1` full intervals: one more tick than the timeout holds keeps the wait at
-            // least that long, and at most one interval longer.
-            if waited_ms > u64::from(timeout_ms) {
-                break Wait::TimedOut;
-            }
-            waited_ms = waited_ms
-                .checked_add(self.take_event())
-                .expect("a wait of 30 seconds is far from the u64 range");
-        };
-        // Only an answered screen leaves work after it, which the keepalives and status updates
-        // then report as processing; a cancelled or timed-out request is answered at once, and a
-        // keepalive in front of that answer would tell the host nothing.
-        if matches!(ended, Wait::Answered(_)) {
+        hid::now_ms()
+            .checked_add(u64::from(timeout_ms))
+            .expect("a u64 millisecond clock outlives the device")
+    }
+
+    /// Ends a ceremony: back to the home screen. Only an answered ceremony leaves work after it,
+    /// which the keepalives and status updates then report as processing; a cancelled or
+    /// timed-out request is answered at once, and a keepalive in front of that answer would tell
+    /// the host nothing.
+    fn end(&mut self, answered: bool) {
+        if answered {
             self.waiting_for_user(false);
         }
         self.home.show_and_return();
-        ended
     }
 
-    /// Takes one event for the shown screen and the FIDO interfaces; returns the milliseconds it
-    /// moved the clock.
-    fn take_event(&mut self) -> u64 {
-        let moved = match self.comm.next_command_or_event() {
-            CommandOrEvent::Event(DecodedEventType::Ticker) => {
-                hid::tick();
-                hid::TICK_MS
+    /// Shows one choice screen and takes events until it is answered, the request ends or the
+    /// deadline passes.
+    fn choose(&mut self, choices: &Choices, deadline_ms: u64) -> Answer {
+        OUTCOME.store(PENDING, Ordering::Relaxed);
+        let icon = self.icon();
+        // SAFETY: the strings are NUL-terminated, static or composed in the caller's frame, and
+        // they and `icon` outlive the screen, which the wait below ends before the caller returns.
+        unsafe {
+            nbgl_useCaseChoice(
+                &icon,
+                choices.message,
+                choices.sub_message,
+                choices.confirm,
+                choices.reject,
+                Some(choice_callback),
+            );
+        }
+        loop {
+            match OUTCOME.load(Ordering::Relaxed) {
+                PENDING => {}
+                CONFIRMED => return Answer::Confirmed,
+                _ => return Answer::Rejected,
             }
+            if self.request_ended() {
+                return Answer::Cancelled;
+            }
+            // The first tick can come right after the screen appeared, so the deadline is passed
+            // once the clock is beyond it: the wait is at least as long as asked, and at most one
+            // tick longer.
+            if hid::now_ms() > deadline_ms {
+                return Answer::TimedOut;
+            }
+            self.take_event();
+        }
+    }
+
+    /// Takes one event for the shown screen and the FIDO interfaces.
+    fn take_event(&mut self) {
+        match self.comm.next_command_or_event() {
+            CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
             // The applet answers its polls and deselection; a new request over NFC while this
             // one waits is refused as busy.
             #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
             CommandOrEvent::Command(command) if command.transport() == Some(ApduTransport::Nfc) => {
                 self.interfaces.nfc.command(command, hid::now_ms(), true);
-                0
             }
             // The management channel waits until the screen is gone.
-            CommandOrEvent::Command(command) => {
-                crate::management(command, true);
-                0
-            }
-            CommandOrEvent::Event(_) => 0,
-        };
+            CommandOrEvent::Command(command) => crate::management(command, true),
+            CommandOrEvent::Event(_) => {}
+        }
         // A HID request that arrived during this event, while the screen is for a request over
         // NFC, is refused as busy; the HID transport refuses the other direction itself.
         #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
         if matches!(self.link, Link::Nfc) {
             hid::refuse_request();
         }
-        moved
     }
 
     fn icon(&self) -> nbgl_icon_details_t {
@@ -242,33 +319,43 @@ impl<'a> DeviceUi<'a> {
     }
 }
 
+/// The answer of a ceremony as the choice it ended in.
+const fn unanswered<T>(answer: Answer) -> Choice<T> {
+    match answer {
+        Answer::Cancelled => Choice::Cancelled,
+        Answer::TimedOut => Choice::TimedOut,
+        Answer::Confirmed | Answer::Rejected => Choice::Rejected,
+    }
+}
+
 impl Ui for DeviceUi<'_> {
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer {
         // Kept in this frame until the screen is gone.
-        let composed;
-        let (mut confirm, mut reject) = (c"Allow".as_ptr(), c"Don't allow".as_ptr());
-        let (message, sub_message): (*const c_char, *const c_char) = match prompt {
+        let message;
+        let sub_message;
+        let choices = match prompt {
             // authenticatorSelection carries no RP or user (CTAP 2.2 §6.9), so the screen says
             // why it names none.
-            Prompt::Selection => (
-                c"Allow security key access?".as_ptr(),
-                c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
-            ),
+            Prompt::Selection => Choices {
+                message: c"Allow security key access?".as_ptr(),
+                sub_message: c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
+                confirm: c"Allow".as_ptr(),
+                reject: c"Don't allow".as_ptr(),
+            },
             // What a reset erases, and that passkeys from the recovery phrase are only revoked
             // while this application's data lasts: reinstalling it without restoring a backup
             // brings them back.
-            Prompt::Reset => {
-                (confirm, reject) = (c"Reset".as_ptr(), c"Cancel".as_ptr());
-                (
-                    c"Reset the security key?".as_ptr(),
-                    c"Erases the passkeys kept only on this device, the security key PIN and its settings, and stops passkeys from your recovery phrase working. Those come back if the app is reinstalled without restoring its backup.".as_ptr(),
-                )
-            }
+            Prompt::Reset => Choices {
+                message: c"Reset the security key?".as_ptr(),
+                sub_message: c"Erases the passkeys kept only on this device, the security key PIN and its settings, and stops passkeys from your recovery phrase working. Those come back if the app is reinstalled without restoring its backup.".as_ptr(),
+                confirm: c"Reset".as_ptr(),
+                reject: c"Cancel".as_ptr(),
+            },
             // The platform asks for a pinUvAuthToken, with the client PIN or the device unlock;
             // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
             // §6.5.5.7.3 step 9).
             Prompt::Token { permissions, rp_id } => {
-                composed = Text::new(&[
+                sub_message = Text::new(&[
                     "Your browser or system asks to ",
                     purposes(permissions),
                     match rp_id {
@@ -278,29 +365,145 @@ impl Ui for DeviceUi<'_> {
                     rp_id.unwrap_or_default(),
                     ".",
                 ]);
-                (c"Allow security key use?".as_ptr(), composed.as_ptr())
+                Choices {
+                    message: c"Allow security key use?".as_ptr(),
+                    sub_message: sub_message.as_ptr(),
+                    confirm: c"Allow".as_ptr(),
+                    reject: c"Don't allow".as_ptr(),
+                }
+            }
+            // A sign-in names the RP, the account and the origin of its key (CTAP 2.2 §6.2.2
+            // step 11: an authenticator with a display shows the rpId).
+            Prompt::Assertion { rp_id, account } => {
+                message = Text::new(&["Sign in to ", rp_id, "?"]);
+                sub_message = Text::new(&[
+                    "As ",
+                    account_name(&account),
+                    ".\n",
+                    account.origin.map_or("", origin_name),
+                ]);
+                Choices {
+                    message: message.as_ptr(),
+                    sub_message: sub_message.as_ptr(),
+                    confirm: c"Sign in".as_ptr(),
+                    reject: c"Don't sign in".as_ptr(),
+                }
+            }
+            // An excluded credential is reported only after this screen (§6.1.2 step 16), and
+            // either answer ends the registration.
+            Prompt::Excluded { rp_id } => {
+                sub_message = Text::new(&[
+                    "This security key already has a passkey for ",
+                    rp_id,
+                    ".",
+                ]);
+                Choices {
+                    message: c"Already registered".as_ptr(),
+                    sub_message: sub_message.as_ptr(),
+                    confirm: c"OK".as_ptr(),
+                    reject: c"Close".as_ptr(),
+                }
             }
         };
-        OUTCOME.store(PENDING, Ordering::Relaxed);
-        let icon = self.icon();
-        // SAFETY: the strings are NUL-terminated, static or composed in this frame, and they and
-        // `icon` outlive the screen, which the wait below ends before this function returns.
-        unsafe {
-            nbgl_useCaseChoice(
-                &icon,
-                message,
-                sub_message,
-                confirm,
-                reject,
-                Some(choice_callback),
-            );
+        let deadline_ms = self.begin(timeout_ms);
+        let answer = self.choose(&choices, deadline_ms);
+        self.end(matches!(answer, Answer::Confirmed | Answer::Rejected));
+        answer
+    }
+
+    /// A registration names the RP and the account and offers the key origin, starting on the
+    /// default: "Key type" turns to the other origin, whose screen confirms the switch or ends
+    /// the registration.
+    fn register(&mut self, registration: Registration<'_>, timeout_ms: u32) -> Choice<Origin> {
+        let deadline_ms = self.begin(timeout_ms);
+        let mut origin = registration.default_origin;
+        let outcome = loop {
+            let message = Text::new(&["Create a passkey for ", registration.rp_id, "?"]);
+            let sub_message = Text::new(&[
+                "For ",
+                account_name(&registration.account),
+                ".\n",
+                origin_name(origin),
+                ": ",
+                origin_meaning(origin),
+            ]);
+            let summary = Choices {
+                message: message.as_ptr(),
+                sub_message: sub_message.as_ptr(),
+                confirm: c"Create passkey".as_ptr(),
+                reject: c"Key type".as_ptr(),
+            };
+            match self.choose(&summary, deadline_ms) {
+                Answer::Confirmed => break Choice::Chose(origin),
+                Answer::Rejected => {}
+                answer => break unanswered(answer),
+            }
+            let other = other_origin(origin);
+            let message = Text::new(&["Use ", origin_name(other), "?"]);
+            let sub_message = Text::new(&[origin_meaning(other)]);
+            let switch = Choices {
+                message: message.as_ptr(),
+                sub_message: sub_message.as_ptr(),
+                confirm: c"Use this key type".as_ptr(),
+                reject: c"Don't create".as_ptr(),
+            };
+            match self.choose(&switch, deadline_ms) {
+                Answer::Confirmed => origin = other,
+                answer => break unanswered(answer),
+            }
+        };
+        self.end(matches!(outcome, Choice::Chose(_) | Choice::Rejected));
+        outcome
+    }
+
+    /// The accounts, most recently created first, one screen each: "Sign in" picks it, "Other
+    /// account" shows the next, and the last one's refusal ends the sign-in.
+    fn pick(&mut self, rp_id: &str, accounts: &[Account<'_>], timeout_ms: u32) -> Choice<usize> {
+        let deadline_ms = self.begin(timeout_ms);
+        let total = accounts.len();
+        let mut total_buffer = [0u8; 5];
+        let total_text = number(total, &mut total_buffer);
+        let mut outcome = Choice::Rejected;
+        for (index, account) in accounts.iter().enumerate() {
+            let mut position_buffer = [0u8; 5];
+            // `index` is below `total`, a slice length, so the next one fits.
+            let position = number(index + 1, &mut position_buffer);
+            let last = index + 1 == total;
+            let message = Text::new(&["Sign in to ", rp_id, "?"]);
+            let sub_message = Text::new(&[
+                "As ",
+                account_name(account),
+                ".\n",
+                account.origin.map_or("", origin_name),
+                "\nAccount ",
+                position,
+                " of ",
+                total_text,
+            ]);
+            let choices = Choices {
+                message: message.as_ptr(),
+                sub_message: sub_message.as_ptr(),
+                confirm: c"Sign in".as_ptr(),
+                reject: if last {
+                    c"Don't sign in".as_ptr()
+                } else {
+                    c"Other account".as_ptr()
+                },
+            };
+            match self.choose(&choices, deadline_ms) {
+                Answer::Confirmed => {
+                    outcome = Choice::Chose(index);
+                    break;
+                }
+                Answer::Rejected if !last => {}
+                answer => {
+                    outcome = unanswered(answer);
+                    break;
+                }
+            }
         }
-        match self.wait(timeout_ms) {
-            Wait::Answered(CONFIRMED) => Answer::Confirmed,
-            Wait::Answered(_) => Answer::Rejected,
-            Wait::Cancelled => Answer::Cancelled,
-            Wait::TimedOut => Answer::TimedOut,
-        }
+        self.end(matches!(outcome, Choice::Chose(_) | Choice::Rejected));
+        outcome
     }
 
     fn device_unlocked(&mut self) -> bool {

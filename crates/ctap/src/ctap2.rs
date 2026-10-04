@@ -14,7 +14,8 @@
 //! };
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
-//! use structured_passkeys_ctap::ui::{Answer, Prompt, Ui};
+//! use structured_passkeys_ctap::credential_id::Origin;
+//! use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
 //!
 //! /// A user who confirms everything on an unlocked device.
 //! struct Present;
@@ -22,6 +23,12 @@
 //! impl Ui for Present {
 //!     fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
 //!         Answer::Confirmed
+//!     }
+//!     fn register(&mut self, registration: Registration<'_>, _timeout_ms: u32) -> Choice<Origin> {
+//!         Choice::Chose(registration.default_origin)
+//!     }
+//!     fn pick(&mut self, _rp_id: &str, _accounts: &[Account<'_>], _timeout_ms: u32) -> Choice<usize> {
+//!         Choice::Chose(0)
 //!     }
 //!     fn device_unlocked(&mut self) -> bool {
 //!         true
@@ -43,8 +50,14 @@
 //! ```
 
 mod client_pin;
+mod credential;
+mod get_assertion;
+mod make_credential;
 
 pub use client_pin::{ClientPinRequest, FEATURES, SubCommand};
+pub use credential::Options;
+pub use get_assertion::{GetAssertionRequest, NEXT_ASSERTION_TIMEOUT_MS};
+pub use make_credential::{MakeCredentialRequest, UserEntity};
 
 use crate::cbor::{self, Encoder, Full};
 use crate::crypto::Crypto;
@@ -326,12 +339,13 @@ pub const NFC_PRESENCE_MS: u64 = 120_000;
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
 /// material, which exists once and is wiped when the request is dropped.
 #[derive(Debug, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a command is moved once, from parsing to execution; boxing it would put every \
-              request on the device's 8 KiB heap instead"
-)]
 pub enum Command {
+    /// authenticatorMakeCredential (§6.1).
+    MakeCredential(MakeCredentialRequest),
+    /// authenticatorGetAssertion (§6.2).
+    GetAssertion(GetAssertionRequest),
+    /// authenticatorGetNextAssertion (§6.3).
+    GetNextAssertion,
     /// authenticatorGetInfo (§6.4).
     GetInfo,
     /// authenticatorClientPIN (§6.5).
@@ -359,6 +373,11 @@ pub struct Authenticator<C, S> {
     /// When the device was last placed in an NFC field with the applet selected, the tap that
     /// establishes user presence over NFC; `None` once the platform ended CTAP.
     nfc_tap_ms: Option<u64>,
+    /// The tap a credential operation used up: a tap counts for one registration or assertion.
+    nfc_tap_used: Option<u64>,
+    /// What authenticatorGetNextAssertion continues from; any other command discards it (§6.3:
+    /// a stateful command continues only the command right before it).
+    next_assertions: Option<get_assertion::NextAssertions>,
 }
 
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
@@ -373,6 +392,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             store,
             client_pin,
             nfc_tap_ms: None,
+            nfc_tap_used: None,
+            next_assertions: None,
         }
     }
 
@@ -424,14 +445,20 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // A CTAPHID_CBOR message carries at least the command byte (§11.2.9.1.2).
         let (&code, parameters) = request.split_first().ok_or(StatusCode::InvalidLength)?;
         match CommandCode::try_from(code) {
-            // §6.4, §6.6 and §6.9 define no parameters.
-            Ok(command @ (CommandCode::GetInfo | CommandCode::Reset | CommandCode::Selection)) => {
+            // §6.3, §6.4, §6.6 and §6.9 define no parameters.
+            Ok(
+                command @ (CommandCode::GetInfo
+                | CommandCode::Reset
+                | CommandCode::Selection
+                | CommandCode::GetNextAssertion),
+            ) => {
                 if !parameters.is_empty() {
                     return Err(StatusCode::InvalidLength);
                 }
                 Ok(match command {
                     CommandCode::Selection => Command::Selection,
                     CommandCode::Reset => Command::Reset,
+                    CommandCode::GetNextAssertion => Command::GetNextAssertion,
                     _ => Command::GetInfo,
                 })
             }
@@ -439,13 +466,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 client_pin::parse(&self.client_pin, &self.crypto, parameters)
                     .map(Command::ClientPin)
             }
+            Ok(CommandCode::MakeCredential) => {
+                make_credential::parse(parameters).map(Command::MakeCredential)
+            }
+            Ok(CommandCode::GetAssertion) => {
+                get_assertion::parse(parameters).map(Command::GetAssertion)
+            }
             // §8.1: a command code the authenticator does not implement is
             // CTAP1_ERR_INVALID_COMMAND.
             Ok(
-                CommandCode::MakeCredential
-                | CommandCode::GetAssertion
-                | CommandCode::GetNextAssertion
-                | CommandCode::BioEnrollment
+                CommandCode::BioEnrollment
                 | CommandCode::CredentialManagement
                 | CommandCode::LargeBlobs
                 | CommandCode::Config,
@@ -469,6 +499,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return 0;
         };
         let mut encoder = Encoder::new(body);
+        // §6.3: authenticatorGetNextAssertion continues only the command right before it; any
+        // other request, a refused one included, ends what it would continue.
+        if !matches!(command, Ok(Command::GetNextAssertion)) {
+            self.next_assertions = None;
+        }
         let outcome = command.and_then(|command| self.run(command, link, ui, &mut encoder));
         let written = encoder.len();
         match outcome {
@@ -493,6 +528,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         encoder: &mut Encoder<'_>,
     ) -> Result<(), StatusCode> {
         match command {
+            Command::MakeCredential(request) => self.make_credential(&request, link, ui, encoder),
+            Command::GetAssertion(request) => self.get_assertion(&request, link, ui, encoder),
+            Command::GetNextAssertion => self.get_next_assertion(ui, encoder),
             Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
             Command::ClientPin(request) => self.client_pin(&request, ui, encoder),
             Command::Reset => self.reset(ui),
@@ -543,22 +581,37 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     }
 
     /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
-    /// until a version's command set exists and passes its conformance tests: §6.4 requires the
-    /// member but not a non-empty list, and a version string is a promise platforms act on, so
-    /// an empty list is the truthful answer rather than an error for the command. The options
-    /// `clientPin`, `pinUvAuthToken` and `uv`, and `minPINLength`, come with makeCredential and
-    /// getAssertion, the commands the tokens are for: a platform reading them now would start
-    /// PIN/UV flows that end in commands this authenticator does not have yet.
+    /// until a version's command set passes its conformance tests: §6.4 requires the member but
+    /// not a non-empty list, and a version string is a promise platforms act on, so an empty list
+    /// is the truthful answer rather than an error for the command.
+    ///
+    /// Options: `rk` and `up`; `uv`, since built-in user verification is the device unlock and
+    /// always present; `clientPin`, true once a client PIN is set (§6.4 option IDs); and
+    /// `pinUvAuthToken`, the token commands being implemented.
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         let transports = self.settings.transports.names();
+        let pin_set = self.store.config().pin.is_some();
         encoder
-            .map(5)?
+            .map(6)?
             // versions (0x01), required.
             .unsigned(0x01)?
             .array(0)?
             // aaguid (0x03), required.
             .unsigned(0x03)?
             .bytes(&AAGUID)?
+            // options (0x04), keys in canonical order: shorter first, then bytewise.
+            .unsigned(0x04)?
+            .map(5)?
+            .text("rk")?
+            .bool(true)?
+            .text("up")?
+            .bool(true)?
+            .text("uv")?
+            .bool(true)?
+            .text("clientPin")?
+            .bool(pin_set)?
+            .text("pinUvAuthToken")?
+            .bool(true)?
             // maxMsgSize (0x05).
             .unsigned(0x05)?
             .unsigned(u64::from(self.settings.max_msg_size.get()))?

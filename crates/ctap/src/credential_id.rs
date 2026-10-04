@@ -46,6 +46,26 @@ const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
 /// Longest credential ID, reported as `maxCredentialIdLength`.
 pub const MAX_CREDENTIAL_ID_LEN: usize = 1 + NONCE_LEN + MAX_PLAINTEXT_LEN + TAG_LEN;
 
+/// The origin of a credential's key, which the user chooses at registration: what the recovery
+/// phrase can reproduce, and so what the backup flags report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// From the device's TRNG, kept only in this device's NVM: not reproducible from the
+    /// recovery phrase, gone with an application update or uninstall.
+    DeviceOnly,
+    /// Derived from the device seed: reproducible from the recovery phrase.
+    SeedRecoverable,
+}
+
+impl Origin {
+    /// Whether the credential is backup eligible and backed up, the BE and BS flags (WebAuthn L3
+    /// §6.1, "Credential Backup State"): the recovery phrase is a backup of a seed-recoverable
+    /// key by construction, and nothing can back up a device-only one.
+    pub const fn backed_up(self) -> bool {
+        matches!(self, Origin::SeedRecoverable)
+    }
+}
+
 /// Where the private key of a credential comes from. Its `Debug` output never prints the
 /// credential seed.
 #[derive(Clone, PartialEq, Eq)]
@@ -76,6 +96,16 @@ impl fmt::Debug for KeySource {
                 .field("index", index)
                 .field("tag", tag)
                 .finish(),
+        }
+    }
+}
+
+impl KeySource {
+    /// The origin of a key from this source.
+    pub const fn origin(&self) -> Origin {
+        match self {
+            KeySource::Seed(_) => Origin::SeedRecoverable,
+            KeySource::Device(_) | KeySource::Slot { .. } => Origin::DeviceOnly,
         }
     }
 }
