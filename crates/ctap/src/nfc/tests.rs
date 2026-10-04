@@ -248,6 +248,23 @@ fn a_waiting_request_answers_status_updates() {
     assert_eq!(answer(&mut applet, &poll), Some((vec![], 0x6985)));
 }
 
+/// NFCCTAP_GETRESPONSE with P1 0x11 cancels the waiting request, as python-fido2 sends it: the
+/// request ends like one cancelled over HID (§11.2.9.1.5), its response, CTAP2_ERR_KEEPALIVE_CANCEL,
+/// still goes to the next poll, and the cancelling poll itself gets a status update.
+#[test]
+fn a_poll_can_cancel_the_request() {
+    let mut applet = selected();
+    applet.command(&apdu(0x80, 0x10, 0x80, 0x00, &[0x0B]));
+    applet.wait_for_user(true);
+    assert!(!applet.cancelled());
+    let cancel = apdu(0x80, 0x11, 0x11, 0x00, &[]);
+    assert_eq!(answer(&mut applet, &cancel), Some((vec![0x02], 0x9100)));
+    assert!(applet.cancelled());
+    assert_eq!(applet.respond(&[0x2D]), None);
+    let poll = apdu(0x80, 0x11, 0x00, 0x00, &[]);
+    assert_eq!(answer(&mut applet, &poll), Some((vec![0x2D], 0x9000)));
+}
+
 /// Without P1 0x80 the client cannot poll, so its NFCCTAP_MSG is answered with the response alone
 /// (§11.3.7.1), however long the user takes.
 #[test]

@@ -61,6 +61,8 @@ const CONTROL_END: u8 = 0x01;
 
 /// NFCCTAP_MSG P1: the client supports NFCCTAP_GETRESPONSE (§11.3.7.1); the other bits are RFU.
 const P1_GETRESPONSE: u8 = 0x80;
+/// NFCCTAP_GETRESPONSE P1 with which platforms cancel the request.
+const P1_CANCEL: u8 = 0x11;
 
 /// Response data bytes a short response carries at most (ISO/IEC 7816-4 5.1: Le 00 is 256).
 const SHORT_NE: usize = 256;
@@ -187,6 +189,8 @@ enum State {
         /// The NFCCTAP_MSG was answered with a status update; the response goes in answer to
         /// NFCCTAP_GETRESPONSE.
         deferred: bool,
+        /// The platform cancelled the request with a poll; its response still goes out.
+        cancel: bool,
         status: KeepaliveStatus,
         frame: Frame,
     },
@@ -370,6 +374,7 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
             len,
             updates: apdu.p1 & P1_GETRESPONSE != 0,
             deferred: false,
+            cancel: false,
             status: KeepaliveStatus::Processing,
             frame: apdu.frame(),
         };
@@ -378,18 +383,28 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
 
     /// The commands a running request accepts.
     fn while_running(&mut self, apdu: &Apdu<'_>) -> Reply<'static> {
-        let State::Running {
-            deferred, status, ..
-        } = self.state
-        else {
-            return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
-        };
         match (apdu.cla, apdu.ins) {
-            // §11.3.7.2: a status update until the response is ready.
-            (CLA_FIDO, INS_NFC_GETRESPONSE) if deferred => Reply {
-                data: status_byte(status),
-                sw: StatusWord::STATUS_UPDATE,
-            },
+            // §11.3.7.2: a status update until the response is ready. Its P1 is RFU there;
+            // platforms (python-fido2) send 0x11 to cancel the request, which ends it like
+            // CTAPHID_CANCEL (§11.2.9.1.5) rather than leaving it to time out.
+            (CLA_FIDO, INS_NFC_GETRESPONSE) => {
+                let State::Running {
+                    deferred: true,
+                    cancel,
+                    status,
+                    ..
+                } = &mut self.state
+                else {
+                    return Reply::status(StatusWord::CONDITIONS_NOT_SATISFIED);
+                };
+                if apdu.p1 == P1_CANCEL {
+                    *cancel = true;
+                }
+                Reply {
+                    data: status_byte(*status),
+                    sw: StatusWord::STATUS_UPDATE,
+                }
+            }
             // The platform ends CTAP: the request is cancelled with the applet.
             (CLA_FIDO, INS_CONTROL) => self.control(apdu),
             // One request at a time: the platform waits for the response of this one.
@@ -452,9 +467,13 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Applet<N, S> {
         self.state != State::Deselected
     }
 
-    /// Whether the request being run is gone: the platform deselected or reselected the applet.
+    /// Whether the request being run is to end: the platform cancelled it with a poll, or it is
+    /// gone with the applet deselected or reselected.
     pub const fn cancelled(&self) -> bool {
-        self.cancelled || !matches!(self.state, State::Running { .. })
+        match self.state {
+            State::Running { cancel, .. } => cancel || self.cancelled,
+            _ => true,
+        }
     }
 
     /// The request being run now waits for the user (`true`) or processes again (`false`). The
