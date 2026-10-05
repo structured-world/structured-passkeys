@@ -54,6 +54,9 @@ run scripts/fuzz.sh
 # Every device build then runs in Speculos (scripts/speculos-check.sh).
 case "$(uname -s)" in
     Linux)
+        # The check host script (scripts/linux/check.sh) against a fake host here; on macOS
+        # the check host runs it.
+        run scripts/linux/check-test.sh
         run scripts/device-build.sh
         run scripts/speculos-check.sh
         ;;

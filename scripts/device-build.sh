@@ -14,8 +14,15 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 image=$("$root/scripts/dev-tools-image.sh")
 
+# A run of scripts/linux/check.sh names its containers, so stopping it removes them.
+name=()
+if [[ -n "${CHECK_CONTAINER_PREFIX:-}" ]]; then
+    name=(--name "$CHECK_CONTAINER_PREFIX-build")
+fi
+
 docker pull --quiet "$image" >/dev/null
-docker run --rm \
+# The expansion stays nounset-safe for an empty array on Bash before 4.4.
+docker run --rm ${name[@]+"${name[@]}"} \
     --volume "$root:/app" \
     --workdir /app/app \
     --env OWNER="$(id -u):$(id -g)" \
