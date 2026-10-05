@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod crypto;
 mod hid;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]

@@ -15,7 +15,7 @@
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
 //! use structured_passkeys_ctap::credential_id::Origin;
-//! use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
+//! use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Prompt, Registration, Ui};
 //!
 //! /// A user who confirms everything on an unlocked device.
 //! struct Present;
@@ -27,7 +27,7 @@
 //!     fn register(&mut self, registration: Registration<'_>, _timeout_ms: u32) -> Choice<Origin> {
 //!         Choice::Chose(registration.default_origin)
 //!     }
-//!     fn pick(&mut self, _rp_id: &str, _accounts: &[Account<'_>], _timeout_ms: u32) -> Choice<usize> {
+//!     fn pick<A: Accounts>(&mut self, _rp_id: &str, _accounts: &mut A, _timeout_ms: u32) -> Choice<usize> {
 //!         Choice::Chose(0)
 //!     }
 //!     fn device_unlocked(&mut self) -> bool {
@@ -359,14 +359,6 @@ pub struct NfcTap {
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
 /// material, which exists once and is wiped when the request is dropped.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(
-    target_pointer_width = "32",
-    expect(
-        clippy::large_enum_variant,
-        reason = "a command is moved once, from parsing to execution; boxing it would put every \
-                  request on the device's 8 KiB heap instead"
-    )
-)]
 pub enum Command {
     /// authenticatorMakeCredential (§6.1).
     MakeCredential(MakeCredentialRequest),
@@ -524,15 +516,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         ui: &mut U,
         response: &mut [u8],
     ) -> usize {
+        // §6.3: authenticatorGetNextAssertion continues only the command right before it; any
+        // other request, a refused one or one with no room to answer included, ends what it
+        // would continue.
+        if !matches!(command, Ok(Command::GetNextAssertion)) {
+            self.next_assertions = None;
+        }
         let Some((status, body)) = response.split_first_mut() else {
             return 0;
         };
         let mut encoder = Encoder::new(body);
-        // §6.3: authenticatorGetNextAssertion continues only the command right before it; any
-        // other request, a refused one included, ends what it would continue.
-        if !matches!(command, Ok(Command::GetNextAssertion)) {
-            self.next_assertions = None;
-        }
         let outcome = command.and_then(|command| self.run(command, link, ui, &mut encoder));
         let written = encoder.len();
         match outcome {

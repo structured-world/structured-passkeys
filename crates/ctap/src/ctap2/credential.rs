@@ -14,7 +14,7 @@ use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
 use crate::keys::{DeviceKeys, KeyRing};
 use crate::pin::{Permissions, Protocol};
 use crate::storage::{MAX_RP_ID_LEN, Storage, stored_rp_id};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{Answer, MAX_SHOWN_LEN, Prompt, RP_ID_FINGERPRINT_LEN, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// Authenticator data flag UP, user present (WebAuthn L3 §6.1).
 pub(super) const UP: u8 = 0x01;
@@ -88,33 +88,73 @@ pub(super) fn shown(text: &str, max: usize) -> String {
     let kept = truncate_on_char_boundary(text, max);
     let mut shown = String::with_capacity(kept.len());
     for character in kept.chars() {
-        match character {
-            ' '..='~' if character != '<' => shown.push(character),
-            _ => {
-                let code = u32::from(character);
-                // At most six hex digits for a code point, without leading zeros.
-                let digits = (u32::BITS - code.leading_zeros()).div_ceil(4).max(1);
-                shown.push('<');
-                for shift in (0..digits).rev() {
-                    let nibble = (code >> (shift * 4)) & 0xF;
-                    let digit = char::from_digit(nibble, 16).expect("a nibble is a hex digit");
-                    shown.push(digit.to_ascii_uppercase());
-                }
-                shown.push('>');
-            }
+        let digits = escape_digits(character);
+        if digits == 0 {
+            shown.push(character);
+            continue;
         }
+        let code = u32::from(character);
+        shown.push('<');
+        for shift in (0..digits).rev() {
+            shown.push(hex_digit((code >> (shift * 4)) & 0xF));
+        }
+        shown.push('>');
     }
     shown
 }
 
-/// The RP ID as a screen shows it: the 64-byte form of CTAP 2.2 §6.8.7, made safe by [`shown`].
-pub(super) fn shown_rp_id(rp_id: &str) -> String {
+/// The hex digits [`shown`] writes `character` with, without leading zeros: none for a printable
+/// ASCII character other than `<`, which stays as it is, at most six for a code point.
+fn escape_digits(character: char) -> usize {
+    match (character, u32::from(character)) {
+        (' '..='~', _) if character != '<' => 0,
+        (_, ..0x10) => 1,
+        (_, ..0x100) => 2,
+        (_, ..0x1000) => 3,
+        (_, ..0x1_0000) => 4,
+        (_, ..0x10_0000) => 5,
+        _ => 6,
+    }
+}
+
+/// The upper-case hex digit of `nibble`, below 16.
+fn hex_digit(nibble: u32) -> char {
+    char::from_digit(nibble, 16)
+        .expect("a nibble is a hex digit")
+        .to_ascii_uppercase()
+}
+
+/// The RP ID as a screen shows it, made safe by [`shown`]: whole while that takes at most
+/// [`MAX_SHOWN_LEN`] characters, which a web RP ID always does (a domain, at most 253 ASCII
+/// characters, RFC 1035 §2.3.4). A longer one is shown in its 64-byte form of CTAP 2.2 §6.8.7, which
+/// keeps only its end, followed by ` #` and the first 8 bytes of the SHA-256 of the whole RP ID in
+/// hex, so RP IDs that keep the same form still look different. Eight bytes leave a second
+/// preimage at 2^64 work, out of reach for an RP that wants to look like another.
+pub(super) fn shown_rp_id<C: Crypto>(crypto: &C, rp_id: &str) -> String {
+    let shown_len: usize = rp_id
+        .chars()
+        .map(|character| match escape_digits(character) {
+            0 => 1,
+            // `<`, the digits, `>`.
+            digits => 2 + digits,
+        })
+        .sum();
+    if shown_len <= MAX_SHOWN_LEN {
+        return shown(rp_id, rp_id.len());
+    }
     let (stored, length) = stored_rp_id(rp_id);
     // The stored form is cut on character boundaries, so it is text.
-    shown(
+    let mut text = shown(
         core::str::from_utf8(&stored[..length]).unwrap_or_default(),
         MAX_RP_ID_LEN,
-    )
+    );
+    text.push_str(" #");
+    let digest = crypto.sha256(&[rp_id.as_bytes()]);
+    for byte in &digest[..(RP_ID_FINGERPRINT_LEN - 2) / 2] {
+        text.push(hex_digit(u32::from(byte >> 4)));
+        text.push(hex_digit(u32::from(byte & 0xF)));
+    }
+    text
 }
 
 /// The authenticator options a request carries (§6.1 and §6.2 option keys); an option the

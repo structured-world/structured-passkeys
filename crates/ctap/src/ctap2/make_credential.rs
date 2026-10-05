@@ -328,7 +328,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // Every path that gets here verified the user.
         let uv = true;
         let keys = KeyRing::new(&mut self.crypto);
-        let shown_rp = shown_rp_id(&request.rp_id);
+        let shown_rp = shown_rp_id(&self.crypto, &request.rp_id);
         // Step 16: a credential of the excludeList is reported only after user presence, so the
         // answer cannot probe for registrations unnoticed. Credentials are created with
         // credProtect level 1, so none is skipped for want of user verification.

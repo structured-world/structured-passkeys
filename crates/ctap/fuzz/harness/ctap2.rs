@@ -18,7 +18,7 @@ use structured_passkeys_ctap::ctap2::{
 };
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
-use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
+use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Prompt, Registration, Ui};
 
 /// Authenticator data flags UP and UV (WebAuthn L3 §6.1).
 const UP: u8 = 0x01;
@@ -68,9 +68,21 @@ impl Ui for Fuzzed {
         })
     }
 
-    fn pick(&mut self, _rp_id: &str, accounts: &[Account<'_>], _timeout_ms: u32) -> Choice<usize> {
+    fn pick<A: Accounts>(
+        &mut self,
+        _rp_id: &str,
+        accounts: &mut A,
+        _timeout_ms: u32,
+    ) -> Choice<usize> {
+        // Every account the picker offers reads, as the screen reads each one it shows.
+        for index in 0..accounts.count() {
+            assert!(
+                accounts.read(index, |_| ()).is_some(),
+                "account {index} unreadable"
+            );
+        }
         let wanted = usize::from((self.0 >> 3) & 0x03);
-        self.choice(wanted % accounts.len().max(1))
+        self.choice(wanted % accounts.count().max(1))
     }
 
     fn device_unlocked(&mut self) -> bool {

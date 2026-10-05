@@ -305,7 +305,7 @@ pub(in crate::ctap2) fn pin_token(
     protocol: Protocol,
     pin: &[u8],
     permissions: Option<u64>,
-    rp_id: Option<&'static str>,
+    rp_id: Option<&str>,
 ) -> (Vec<u8>, Session) {
     let session = Session::start(authenticator, protocol);
     let mut members = vec![
@@ -321,7 +321,10 @@ pub(in crate::ctap2) fn pin_token(
         members.push((0x09, Value::Uint(permissions)));
     }
     if let Some(rp_id) = rp_id {
-        members.push((0x0A, Value::Text(rp_id)));
+        let text = encoded(|encoder| {
+            encoder.text(rp_id).expect("room");
+        });
+        members.push((0x0A, Value::Raw(text)));
     }
     let response = run(authenticator, ui, &request(&members));
     (response, session)
@@ -988,6 +991,24 @@ fn control_characters_in_the_rp_id_are_shown() {
         .crypto
         .sha256(&[b"example.com\x00\n.evil.test"]);
     assert!(authenticator.client_pin.permits_rp_id(&sent));
+
+    // A domain longer than the 64 bytes kept for it is still shown whole.
+    let domain = format!("{}example.com", "a.".repeat(121));
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let (response, _) = pin_token(
+        &mut authenticator,
+        &mut ui,
+        Protocol::Two,
+        b"1234",
+        Some(0x02),
+        Some(&domain),
+    );
+    assert_eq!(response[0], OK);
+    assert!(
+        matches!(&ui.asked[..], [(Asked::Token { rp_id: Some(shown), .. }, _)] if *shown == domain),
+        "{:?}",
+        ui.asked
+    );
 }
 
 /// A token the platform does not use within the initial usage time limit stops verifying

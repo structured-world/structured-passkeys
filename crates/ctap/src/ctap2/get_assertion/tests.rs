@@ -2,6 +2,9 @@
 //! end to end through the authenticator. Signatures are checked here with the RustCrypto crates
 //! against the public keys the registrations returned.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
 use sha2::{Digest, Sha256};
 
 use super::super::client_pin::tests::{Value, command, hmac, parse_response, run, uv_token};
@@ -19,7 +22,7 @@ use crate::crypto::KEY_LEN;
 use crate::pin::MAX_USAGE_TIME_PERIOD_MS;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, Store};
-use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS};
+use crate::ui::{Accounts, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui};
 
 const OPERATION_DENIED: u8 = 0x27;
 const UNSUPPORTED_OPTION: u8 = 0x2B;
@@ -471,6 +474,27 @@ fn a_tap_lists_no_accounts_for_an_assertion_without_presence() {
     assert_eq!(asserted(&response[1..length]).flags(), UP);
 }
 
+/// Another command ends the continuation even when its caller gives no room for a response:
+/// §6.3 continues only the command right before it, whatever became of the one in between.
+#[test]
+fn a_command_without_room_still_ends_the_continuation() {
+    let mut authenticator = authenticator();
+    for user in [b"user-1", b"user-2"] {
+        register(&mut authenticator, RP_ID, user, true, None);
+    }
+    let mut ui = Scripted::new(Answer::Confirmed);
+    assert_eq!(
+        run(
+            &mut authenticator,
+            &mut ui,
+            &assertion(None, &[("up", false)])
+        )[0],
+        OK
+    );
+    authenticator.process(&[0x04], Link::Usb, &mut ui, &mut []);
+    assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
+}
+
 /// Nothing to sign with is CTAP2_ERR_NO_CREDENTIALS: an RP without credentials, an allowList of
 /// IDs this device did not create or created for another RP. A platform never sends `rk`, which
 /// is CTAP2_ERR_UNSUPPORTED_OPTION (§6.2.2 step 5.4).
@@ -611,6 +635,136 @@ fn a_token_with_ga_verifies_the_user() {
     assert_eq!(
         run(&mut authenticator, &mut ui, &command(0x02, &members)),
         [PIN_AUTH_INVALID]
+    );
+}
+
+/// Counts the heap the thread that measures holds, and its peak; other threads pass through.
+struct Counting;
+
+thread_local! {
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
+    static HELD: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
+}
+
+fn count(change: isize) {
+    if MEASURING.try_with(Cell::get).unwrap_or(false) {
+        let held = HELD.get() + change;
+        HELD.set(held);
+        PEAK.set(PEAK.get().max(held));
+    }
+}
+
+fn size(layout: Layout) -> isize {
+    isize::try_from(layout.size()).expect("an allocation is at most isize::MAX bytes")
+}
+
+// SAFETY: every call goes to the system allocator with the caller's arguments; counting touches
+// only thread-local cells, which never allocate.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract, passed on.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            count(size(layout));
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { System.dealloc(pointer, layout) };
+        count(-size(layout));
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+
+/// The most heap `run` held at once, beyond what was held before it.
+fn peak_heap(run: impl FnOnce()) -> isize {
+    HELD.set(0);
+    PEAK.set(0);
+    MEASURING.set(true);
+    run();
+    MEASURING.set(false);
+    PEAK.get()
+}
+
+/// A user who reads every account the picker offers and takes the first.
+struct Reader;
+
+impl Ui for Reader {
+    fn confirm(&mut self, _prompt: Prompt<'_>, _timeout_ms: u32) -> Answer {
+        Answer::Confirmed
+    }
+
+    fn register(&mut self, _registration: Registration<'_>, _timeout_ms: u32) -> Choice<Origin> {
+        Choice::Rejected
+    }
+
+    fn pick<A: Accounts>(
+        &mut self,
+        _rp_id: &str,
+        accounts: &mut A,
+        _timeout_ms: u32,
+    ) -> Choice<usize> {
+        for index in 0..accounts.count() {
+            let name = accounts.read(index, |account| account.name == Some("alice"));
+            assert_eq!(name, Some(true));
+        }
+        Choice::Chose(0)
+    }
+
+    fn device_unlocked(&mut self) -> bool {
+        true
+    }
+
+    fn now_ms(&self) -> u64 {
+        0
+    }
+}
+
+/// The heap a sign-in with `credentials` discoverable credentials for the RP holds at its peak,
+/// the user picking an account.
+fn sign_in_heap(credentials: usize) -> isize {
+    let mut authenticator = Authenticator::new(
+        super::super::tests::settings(Transports::Usb),
+        SoftCrypto::new([0x11; KEY_LEN], [0x22; KEY_LEN]),
+        Store::open(MemoryStorage::new(credentials, 4)),
+    );
+    for user in 0..credentials {
+        let user_id = format!("user-{user}");
+        register(
+            &mut authenticator,
+            RP_ID,
+            user_id.as_bytes(),
+            true,
+            Some(Origin::SeedRecoverable),
+        );
+    }
+    let request = assertion(None, &[]);
+    let mut response = [0u8; 1024];
+    let mut status = None;
+    let peak = peak_heap(|| {
+        authenticator.process(&request, Link::Usb, &mut Reader, &mut response);
+        status = Some(response[0]);
+    });
+    assert_eq!(status, Some(OK));
+    peak
+}
+
+/// A sign-in to an RP that holds every index slot fits the device's small heap: the credentials
+/// are read one at a time, for the picker and for the signature, so each one adds only its place
+/// in the index lists to the peak, not its decoded credential and names.
+#[test]
+fn a_sign_in_holds_one_credential_at_a_time() {
+    let few = sign_in_heap(2);
+    let many = sign_in_heap(64);
+    let per_credential = (many - few) / 62;
+    assert!(
+        per_credential <= 96,
+        "{per_credential} bytes per credential ({few} for 2, {many} for 64)"
     );
 }
 

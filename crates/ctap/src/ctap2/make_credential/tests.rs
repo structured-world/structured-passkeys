@@ -929,3 +929,44 @@ fn names_are_shown_safely() {
     assert_eq!(longest.0.map(|name| name.len()), Some(MAX_SHOWN_LEN));
     assert_eq!(longest.1.map(|name| name.len()), Some(MAX_SHOWN_LEN));
 }
+
+/// An RP ID is shown whole while its shown form fits [`MAX_SHOWN_LEN`], as every web RP ID does: a
+/// domain is at most 253 ASCII characters (RFC 1035 §2.3.4). A longer one is shown in the form kept
+/// for it (CTAP 2.2 §6.8.7) followed by a fingerprint of the whole RP ID, so RP IDs that keep the
+/// same form still look different.
+#[test]
+fn long_rp_ids_are_shown_apart() {
+    let shown = |rp_id: &str| {
+        let mut authenticator = authenticator();
+        let mut ui = Scripted::new(Answer::Confirmed);
+        let members = registration(rp_id, b"user-1", &[("rk", false), ("uv", true)]);
+        assert_eq!(
+            run(&mut authenticator, &mut ui, &command(0x01, &members))[0],
+            OK
+        );
+        let [(Asked::Registration { rp_id, .. }, _)] = &ui.asked[..] else {
+            panic!("a registration screen: {:?}", ui.asked);
+        };
+        rp_id.clone()
+    };
+    let domain = format!("{}example.com", "a.".repeat(121));
+    assert_eq!(domain.len(), 253);
+    assert_eq!(shown(&domain), domain);
+
+    // Both keep the ellipsis and the last 61 bytes; shown, those are 6 + 61 * 4 characters.
+    let (first, second) = (
+        format!("x{}", "<".repeat(80)),
+        format!("y{}", "<".repeat(80)),
+    );
+    let (shown_first, shown_second) = (shown(&first), shown(&second));
+    let kept = format!("<2026>{}", "<3C>".repeat(61));
+    for shown in [&shown_first, &shown_second] {
+        let fingerprint = shown.strip_prefix(&kept).expect("the kept form first");
+        let digits = fingerprint
+            .strip_prefix(" #")
+            .expect("then the fingerprint");
+        assert_eq!(digits.len(), 16, "{shown}");
+        assert!(digits.chars().all(|digit| digit.is_ascii_hexdigit()));
+    }
+    assert_ne!(shown_first, shown_second);
+}

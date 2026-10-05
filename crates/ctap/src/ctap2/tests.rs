@@ -11,7 +11,9 @@ use crate::crypto::KEY_LEN;
 use crate::pin::Protocol;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, PIN_RETRIES, PinVerifier, Store};
-use crate::ui::{Account, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{
+    Account, Accounts, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui,
+};
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
 
@@ -165,11 +167,23 @@ impl Ui for Scripted {
         self.choice(self.origin.unwrap_or(registration.default_origin))
     }
 
-    fn pick(&mut self, rp_id: &str, accounts: &[Account<'_>], timeout_ms: u32) -> Choice<usize> {
+    fn pick<A: Accounts>(
+        &mut self,
+        rp_id: &str,
+        accounts: &mut A,
+        timeout_ms: u32,
+    ) -> Choice<usize> {
+        let shown = (0..accounts.count())
+            .map(|index| {
+                accounts
+                    .read(index, |account| Shown::from_account(&account))
+                    .expect("every offered account reads")
+            })
+            .collect();
         self.asked.push((
             Asked::Pick {
                 rp_id: String::from(rp_id),
-                accounts: accounts.iter().map(Shown::from_account).collect(),
+                accounts: shown,
             },
             timeout_ms,
         ));

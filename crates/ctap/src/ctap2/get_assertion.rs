@@ -16,7 +16,7 @@ use crate::crypto::{Crypto, KEY_LEN};
 use crate::keys::KeyRing;
 use crate::pin::Permissions;
 use crate::storage::{EntryId, Storage};
-use crate::ui::{Account, Choice, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{Account, Accounts, Choice, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// How long authenticatorGetNextAssertion continues an assertion: 30 seconds since the last call
 /// to either command (§6.3 step 3).
@@ -118,11 +118,49 @@ pub(super) struct NextAssertions {
     token: bool,
 }
 
-/// A credential that may answer the assertion, with its index entry when it was found there.
-struct Applicable {
+/// A credential that may answer the assertion, by where it is found. It is decoded again each
+/// time it is shown or signs with, so the device's small heap holds one decoded credential at a
+/// time however many the RP has.
+#[derive(Clone, Copy, Debug)]
+enum Candidate {
+    /// The allowList member at this position.
+    Listed(usize),
+    /// The discoverable credential of this index entry.
+    Indexed(EntryId),
+}
+
+/// The credential that signs, with its ID.
+struct Chosen {
     id: Vec<u8>,
     credential: Credential,
-    entry: Option<EntryId>,
+}
+
+/// The accounts of the candidates for the account picker, each decoded when the screen shows it.
+struct Offered<'a, C: Crypto, S: Storage> {
+    authenticator: &'a Authenticator<C, S>,
+    keys: &'a KeyRing,
+    request: &'a GetAssertionRequest,
+    candidates: &'a [Candidate],
+}
+
+impl<C: Crypto, S: Storage> Accounts for Offered<'_, C, S> {
+    fn count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    fn read<R>(&mut self, index: usize, show: impl FnOnce(Account<'_>) -> R) -> Option<R> {
+        let (_, credential) = self.authenticator.read_candidate(
+            self.keys,
+            self.request,
+            *self.candidates.get(index)?,
+        )?;
+        let (name, display_name) = account_names(&credential);
+        Some(show(Account {
+            name: name.as_deref(),
+            display_name: display_name.as_deref(),
+            origin: Some(credential.key.origin()),
+        }))
+    }
 }
 
 /// The names a screen shows for `credential`: those of a discoverable one, made safe.
@@ -198,11 +236,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         };
         // Step 9: the applicable credentials.
         let keys = KeyRing::new(&mut self.crypto);
-        let mut applicable = self.applicable(&keys, request, &rp_id_hash, uv);
-        if applicable.is_empty() {
+        let applicable = self.applicable(&keys, request, &rp_id_hash, uv);
+        let Some(&first) = applicable.first() else {
             return Err(StatusCode::NoCredentials);
-        }
-        let shown_rp = shown_rp_id(&request.rp_id);
+        };
+        let shown_rp = shown_rp_id(&self.crypto, &request.rp_id);
         // A live tap means the device rests on the phone: no screen is answered then, whether or
         // not the request asks for presence, which only then the tap supplies and uses up.
         let tapped = self.nfc_tap_unused(link, now_ms);
@@ -221,23 +259,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             user_selected: false,
         };
         if pick {
-            let names: Vec<_> = applicable
-                .iter()
-                .map(|candidate| account_names(&candidate.credential))
-                .collect();
-            let accounts: Vec<_> = applicable
-                .iter()
-                .zip(&names)
-                .map(|(candidate, (name, display_name))| Account {
-                    name: name.as_deref(),
-                    display_name: display_name.as_deref(),
-                    origin: Some(candidate.credential.key.origin()),
-                })
-                .collect();
-            selected = match ui.pick(shown_rp.as_str(), &accounts, USER_ACTION_TIMEOUT_MS) {
+            let mut offered = Offered {
+                authenticator: self,
+                keys: &keys,
+                request,
+                candidates: &applicable,
+            };
+            selected = match ui.pick(shown_rp.as_str(), &mut offered, USER_ACTION_TIMEOUT_MS) {
                 // An index the screen could not have offered is a bug of the screen; refusing
                 // it signs nothing.
-                Choice::Chose(index) if index < accounts.len() => index,
+                Choice::Chose(index) if index < applicable.len() => index,
                 Choice::Chose(_) => return Err(StatusCode::Other),
                 Choice::Rejected | Choice::TimedOut => return Err(StatusCode::OperationDenied),
                 Choice::Cancelled => return Err(StatusCode::KeepaliveCancel),
@@ -245,19 +276,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             extras.user_selected = true;
         } else if up && !on_tap {
             // Step 11: user presence on the device, for the credential that will sign.
-            let candidate = &applicable[0];
-            let (name, display_name) = account_names(&candidate.credential);
-            presence(ui.confirm(
-                Prompt::Assertion {
-                    rp_id: shown_rp.as_str(),
-                    account: Account {
-                        name: name.as_deref(),
-                        display_name: display_name.as_deref(),
-                        origin: Some(candidate.credential.key.origin()),
-                    },
-                },
-                USER_ACTION_TIMEOUT_MS,
-            ))?;
+            let mut offered = Offered {
+                authenticator: self,
+                keys: &keys,
+                request,
+                candidates: &[first],
+            };
+            let answer = offered
+                .read(0, |account| {
+                    ui.confirm(
+                        Prompt::Assertion {
+                            rp_id: shown_rp.as_str(),
+                            account,
+                        },
+                        USER_ACTION_TIMEOUT_MS,
+                    )
+                })
+                .ok_or(StatusCode::NoCredentials)?;
+            presence(answer)?;
         }
         if up {
             self.consume_token_flags();
@@ -270,7 +306,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             client_data_hash: request.client_data_hash,
             entries: applicable
                 .iter()
-                .filter_map(|candidate| candidate.entry)
+                .filter_map(|candidate| match candidate {
+                    Candidate::Indexed(entry) => Some(*entry),
+                    Candidate::Listed(_) => None,
+                })
                 .collect(),
             next: 1,
             last_ms: ui.now_ms(),
@@ -281,7 +320,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if continuation.is_some() {
             extras.number_of_credentials = Some(applicable.len());
         }
-        let chosen = applicable.swap_remove(selected);
+        let chosen = self
+            .read_candidate(&keys, request, applicable[selected])
+            .map(|(id, credential)| Chosen {
+                id: id.to_vec(),
+                credential,
+            })
+            .ok_or(StatusCode::NoCredentials)?;
+        drop(applicable);
         self.assert(
             &keys,
             &chosen,
@@ -308,48 +354,67 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         request: &GetAssertionRequest,
         rp_id_hash: &[u8; KEY_LEN],
         uv: bool,
-    ) -> Vec<Applicable> {
-        let mut applicable = Vec::new();
-        if let Some(allow_list) = &request.allow_list {
-            for id in allow_list {
-                if let Some(credential) = self.locate(keys, &request.rp_id, id) {
-                    applicable.push(Applicable {
-                        id: id.clone(),
-                        credential,
-                        entry: None,
-                    });
-                }
-            }
-        } else {
-            let reset_id = self.store.config().reset_id;
-            for entry in self.store.newest_first(rp_id_hash) {
-                // An entry in the index is the current credential for its user, so no overwrite
-                // check applies; its key must still be live.
-                let Ok(credential) = credential_id::open(
-                    &self.crypto,
-                    keys,
-                    &request.rp_id,
-                    entry.credential_id,
-                    reset_id,
-                ) else {
-                    continue;
-                };
-                if self.private_key(keys, &credential.key).is_some() {
-                    applicable.push(Applicable {
-                        id: entry.credential_id.to_vec(),
-                        credential,
-                        entry: Some(entry.id),
-                    });
-                }
-            }
-        }
+    ) -> Vec<Candidate> {
         let listed = request.allow_list.is_some();
-        applicable.retain(|candidate| match candidate.credential.cred_protect {
-            CredProtect::Required => uv,
-            CredProtect::OptionalWithCredentialIdList => uv || listed,
-            CredProtect::Optional => true,
+        let mut candidates: Vec<_> = match &request.allow_list {
+            Some(allow_list) => (0..allow_list.len()).map(Candidate::Listed).collect(),
+            None => self
+                .store
+                .newest_first(rp_id_hash)
+                .iter()
+                .map(|entry| Candidate::Indexed(entry.id))
+                .collect(),
+        };
+        candidates.retain(|&candidate| {
+            self.read_candidate(keys, request, candidate)
+                .is_some_and(|(_, credential)| {
+                    let protected = match credential.cred_protect {
+                        CredProtect::Required => uv,
+                        CredProtect::OptionalWithCredentialIdList => uv || listed,
+                        CredProtect::Optional => true,
+                    };
+                    // An allowList credential was located with its key; an index entry's key
+                    // must still be live.
+                    protected && (listed || self.private_key(keys, &credential.key).is_some())
+                })
         });
-        applicable
+        candidates
+    }
+
+    /// Decodes `candidate` of `request`: its credential ID and the credential, if it is still
+    /// this authenticator's for the RP.
+    fn read_candidate<'a>(
+        &'a self,
+        keys: &KeyRing,
+        request: &'a GetAssertionRequest,
+        candidate: Candidate,
+    ) -> Option<(&'a [u8], Credential)> {
+        match candidate {
+            Candidate::Listed(position) => {
+                let id = request.allow_list.as_ref()?.get(position)?;
+                Some((id, self.locate(keys, &request.rp_id, id)?))
+            }
+            Candidate::Indexed(entry_id) => self.read_entry(keys, &request.rp_id, entry_id),
+        }
+    }
+
+    /// Decodes the discoverable credential of index entry `entry_id` for `rp_id`, if the entry
+    /// still exists. An entry in the index is the current credential for its user, so no
+    /// overwrite check applies.
+    fn read_entry(
+        &self,
+        keys: &KeyRing,
+        rp_id: &str,
+        entry_id: EntryId,
+    ) -> Option<(&[u8], Credential)> {
+        let entry = self
+            .store
+            .entry(entry_id.slot)
+            .filter(|entry| entry.id == entry_id)?;
+        let reset_id = self.store.config().reset_id;
+        let credential =
+            credential_id::open(&self.crypto, keys, rp_id, entry.credential_id, reset_id).ok()?;
+        Some((entry.credential_id, credential))
     }
 
     /// Signs the assertion with `chosen` and writes the response (§6.2.2 steps 15.3 and 16): the
@@ -362,7 +427,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     fn assert(
         &mut self,
         keys: &KeyRing,
-        chosen: &Applicable,
+        chosen: &Chosen,
         rp_id_hash: &[u8; KEY_LEN],
         client_data_hash: &[u8; KEY_LEN],
         (up, uv): (bool, bool),
@@ -460,28 +525,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return Err(StatusCode::NotAllowed);
         }
         let keys = KeyRing::new(&mut self.crypto);
-        let reset_id = self.store.config().reset_id;
-        let chosen = self
-            .store
-            .entry(entry_id.slot)
-            .filter(|entry| entry.id == entry_id)
-            .and_then(|entry| {
-                let credential = credential_id::open(
-                    &self.crypto,
-                    &keys,
-                    &state.rp_id,
-                    entry.credential_id,
-                    reset_id,
-                )
-                .ok()?;
-                Some(Applicable {
-                    id: entry.credential_id.to_vec(),
-                    credential,
-                    entry: Some(entry.id),
-                })
-            });
         // A credential deleted since the assertion began has nothing to sign with.
-        let chosen = chosen.ok_or(StatusCode::NoCredentials)?;
+        let chosen = self
+            .read_entry(&keys, &state.rp_id, entry_id)
+            .map(|(id, credential)| Chosen {
+                id: id.to_vec(),
+                credential,
+            })
+            .ok_or(StatusCode::NoCredentials)?;
         let extras = Extras {
             number_of_credentials: None,
             user_selected: false,
@@ -497,7 +548,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         )?;
         // Steps 7 and 8: the timer restarts and the counter moves on.
         self.next_assertions = Some(NextAssertions {
-            next: state.next + 1,
+            next: state
+                .next
+                .checked_add(1)
+                .expect("the counter indexed `entries` above, so it is below a Vec length"),
             last_ms: now_ms,
             ..state
         });

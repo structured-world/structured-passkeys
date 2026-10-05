@@ -4,7 +4,7 @@
 use alloc::string::String;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use super::credential::shown;
+use super::credential::shown_rp_id;
 use super::{Authenticator, StatusCode};
 use crate::cbor::{self, Decoder, Encoder, Full, Key};
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
@@ -12,7 +12,7 @@ use crate::pin::{
     ClientPin, Features, MAX_CIPHERTEXT_LEN, Method, PADDED_PIN_LEN, PIN_HASH_LEN, Permissions,
     Protocol, SharedSecret, TOKEN_LEN, new_pin,
 };
-use crate::storage::{MAX_RP_ID_LEN, PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
+use crate::storage::{PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// The getInfo option IDs that decide token permissions. Credential management and
@@ -113,23 +113,12 @@ pub enum PeerKey {
     Unusable,
 }
 
-/// The permissions RP ID (`rpId`): its hash for the token, and the 64-byte form of CTAP 2.2
-/// §6.8.7 that a screen shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The permissions RP ID (`rpId`): its hash for the token, and the text the consent screen shows
+/// for it ([`shown_rp_id`]), every character readable and none hiding the rest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpId {
     hash: [u8; KEY_LEN],
-    stored: [u8; MAX_RP_ID_LEN],
-    stored_len: usize,
-}
-
-impl RpId {
-    /// The RP ID as the consent screen shows it, every character readable and none hiding the
-    /// rest (see [`shown`]).
-    fn shown(&self) -> String {
-        // The stored form is cut at UTF-8 boundaries, so it is text.
-        let stored = core::str::from_utf8(&self.stored[..self.stored_len]).unwrap_or_default();
-        shown(stored, MAX_RP_ID_LEN)
-    }
+    shown: String,
 }
 
 /// An authenticatorClientPIN request, owning its members. Not `Copy`: the byte string members
@@ -209,11 +198,9 @@ pub(super) fn parse<C: Crypto>(
                 Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
                 Key::Int(0x0A) => {
                     let rp_id = value.text()?;
-                    let (stored, stored_len) = crate::storage::stored_rp_id(rp_id);
                     request.rp_id = Some(RpId {
                         hash: crypto.sha256(&[rp_id.as_bytes()]),
-                        stored,
-                        stored_len,
+                        shown: shown_rp_id(crypto, rp_id),
                     });
                 }
                 _ => value.skip()?,
@@ -571,11 +558,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         };
         self.pin_usable()?;
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
-        let shown_rp = request.rp_id.as_ref().map(RpId::shown);
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: shown_rp.as_deref(),
+                rp_id: request.rp_id.as_ref().map(|rp_id| rp_id.shown.as_str()),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
@@ -588,7 +574,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             now_ms,
             false,
             permissions,
-            request.rp_id.map(|rp_id| rp_id.hash),
+            request.rp_id.as_ref().map(|rp_id| rp_id.hash),
         );
         self.write_token(&secret, encoder)
     }
@@ -619,11 +605,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // Checked before any screen, so a request with an unusable key never asks the user.
         let secret = decapsulate(&self.client_pin, &self.crypto, protocol, peer)?;
         // Step 9: consent to the requested permissions.
-        let shown_rp = request.rp_id.as_ref().map(RpId::shown);
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: shown_rp.as_deref(),
+                rp_id: request.rp_id.as_ref().map(|rp_id| rp_id.shown.as_str()),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
@@ -639,7 +624,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             now_ms,
             true,
             permissions,
-            request.rp_id.map(|rp_id| rp_id.hash),
+            request.rp_id.as_ref().map(|rp_id| rp_id.hash),
         );
         self.write_token(&secret, encoder)
     }

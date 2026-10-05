@@ -49,8 +49,9 @@ accounts, newest first, and the one picked signs with its user and userSelected;
 allowList shows the sign-in screen and signs with UP and UV; one without presence answers the count
 with no screen, getNextAssertion the other, and then CTAP2_ERR_NOT_ALLOWED; a registration whose
 excludeList names a credential of the device ends with CTAP2_ERR_CREDENTIAL_EXCLUDED after the
-screen. Every signature is verified with the key its registration returned. The registration, key
-type, account picker and sign-in screens are compared with their snapshots.
+screen; a registration for a 253-character domain, the longest, shows it whole. Every signature is
+verified with the key its registration returned. The registration, key type, account picker,
+sign-in and long RP ID screens are compared with their snapshots.
 
 The screens to answer come first and those to leave alone last, so at a device the person
 answers: selection "Don't allow", selection "Allow", token consent "Allow", the credential screens
@@ -61,6 +62,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import struct
 import sys
@@ -139,6 +141,10 @@ SIGN_IN = "Sign in"
 OTHER_ACCOUNT = "Other account"
 EXCLUDED_TITLE = "Already registered"
 EXCLUDED_CONFIRM = "OK"
+# The longest domain, 253 characters (RFC 1035 §2.3.4), which a screen shows whole.
+LONG_RP_ID = "a." * 121 + "example.com"
+# The start of a registration screen: a Nano heads a long one with the short question.
+REGISTER_START = "Create a passkey"
 
 
 class KeepaliveLog:
@@ -268,6 +274,10 @@ def wait_for_screen(text: str) -> None:
     raise SystemExit(f"FAILED: the screen never showed {text!r}: {screen_texts()}")
 
 
+# The next-page arrow at the right of a review's footer (NBGL `FOOTER_TEXT_AND_NAV`, its
+# `SIMPLE_FOOTER_HEIGHT` of 92, 96 and 60 pixels at the foot of the screen).
+NEXT_PAGE = {"stax": (376, 626), "flex": (456, 552), "apex_p": (284, 370)}
+
 SELECTION_LABELS = (SELECTION_CONFIRM, SELECTION_REJECT)
 RESET_LABELS = (RESET_CONFIRM, RESET_REJECT)
 
@@ -277,7 +287,31 @@ class SpeculosUser:
     and reject choices."""
 
     def __init__(self, model: str):
+        self.model = model
         self.nano = model in NANO_MODELS
+
+    def read_until(self, wanted: str) -> str:
+        """Pages through the shown screen until a page offers `wanted`, which stays shown, and
+        returns the text of every page on the way, whitespace removed: a long question is paged by
+        a Nano and by the review a touch model asks it in."""
+        seen = []
+        for _ in range(50):
+            texts = screen_texts()
+            seen.extend(event["text"] for event in texts)
+            if button(wanted) is not None:
+                return "".join("".join(seen).split())
+            if self.nano:
+                api("/button/right", {"action": "press-and-release"})
+            else:
+                x, y = NEXT_PAGE[self.model]
+                api("/finger", {"action": "press-and-release", "x": x, "y": y})
+            for _ in range(50):
+                if screen_texts() != texts:
+                    break
+                time.sleep(0.1)
+            else:
+                raise SystemExit(f"FAILED: no page offers {wanted!r}: {texts}")
+        raise SystemExit(f"FAILED: no page offers {wanted!r} after 50 pages")
 
     def answer(self, confirm: bool, labels: tuple[str, str] = SELECTION_LABELS) -> None:
         self.press(labels[0] if confirm else labels[1])
@@ -754,6 +788,40 @@ def check_credentials(device: CtapHidDevice, user, snapshot) -> None:
     check(
         status == CtapError.ERR.CREDENTIAL_EXCLUDED,
         f"makeCredential: an excluded credential after presence ({status!r})",
+    )
+    # The longest domain is shown whole: a Nano pages the choice, a touch model asks it as a
+    # review whose pages hold all of it. The first page is compared with its snapshot.
+    long_snapshot = snapshot("long_rp_id", REGISTER_START)
+
+    def long_rp_id_shown() -> None:
+        wait_for_screen(REGISTER_START)
+        if long_snapshot is not None:
+            long_snapshot()
+        shown = user.read_until(REGISTER_CONFIRM)
+        # A Nano heads every page of the details with the short question, shortened, and the
+        # page count, as in "Create...y?(2/7)"; between them the details run on.
+        shown = re.sub(r"Create\.\.\.y\?\(\d+/\d+\)", "", shown)
+        if f"Createapasskeyfor{LONG_RP_ID}?" not in shown:
+            print(f"   the pages read: {shown!r}", flush=True)
+        check(
+            f"Createapasskeyfor{LONG_RP_ID}?" in shown,
+            "makeCredential: a 253-character RP ID is shown whole",
+        )
+
+    status, _ = pressed(
+        user,
+        [(REGISTER_START, REGISTER_CONFIRM, long_rp_id_shown)],
+        lambda: ctap.make_credential(
+            client_data_hash,
+            {"id": LONG_RP_ID, "name": "Long"},
+            {"id": b"user-long", "name": "long"},
+            params,
+            options={"uv": True},
+        ),
+    )
+    check(
+        status == CtapError.ERR.SUCCESS,
+        f"makeCredential: a 253-character RP ID registers ({status!r})",
     )
 
 

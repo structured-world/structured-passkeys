@@ -8,26 +8,41 @@
 //!
 //! Every screen is one `nbgl_useCaseChoice`, which looks the same on all five devices; a ceremony
 //! that needs more than two answers (the key origin at registration, the account to sign in with)
-//! is a short chain of them within one timeout. Each screen carries the system icon Ledger's own
+//! is a short chain of them within one timeout. A question too long for its page (a long RP ID or
+//! long names) is never cut: a Nano, which pages the details of a choice but shortens its
+//! question, gets the short question with the long one moved into the details; on a touch model a
+//! choice page does not scroll, so the question is asked as a paginated review instead. Each screen carries the system icon Ledger's own
 //! applications use for that kind of question, and an answered registration, sign-in or reset
 //! ends on the system status page, as in Ledger's Security Key.
 
-use core::ffi::{CStr, c_char};
+use alloc::vec::Vec;
+use core::ffi::CStr;
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
 use ledger_device_sdk::io::ApduTransport;
 use ledger_device_sdk::io::{CommandOrEvent, DecodedEventType};
 use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
+#[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+use ledger_device_sdk::sys::{BAGL_FONT_OPEN_SANS_EXTRABOLD_11px_1bpp, nbgl_getTextNbLinesInWidth};
 use ledger_device_sdk::sys::{
     BOLOS_TRUE, nbgl_icon_details_t, nbgl_useCaseChoice, nbgl_useCaseStatus,
     os_global_pin_is_validated,
+};
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+use ledger_device_sdk::sys::{
+    CENTERED_INFO, FIRST_USER_TOKEN, INFO_BUTTON, LARGE_CASE_INFO, TUNE_TAP_CASUAL, nbgl_content_t,
+    nbgl_content_u, nbgl_contentCenteredInfo_t, nbgl_contentInfoButton_t, nbgl_genericContents_t,
+    nbgl_genericContents_t__bindgen_ty_1, nbgl_getFontLineHeight, nbgl_getTextHeightInWidth,
+    nbgl_getTextMaxLenInNbLines, nbgl_useCaseGenericReview,
 };
 use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::ctap2::Link;
 use structured_passkeys_ctap::pin::Permissions;
 use structured_passkeys_ctap::ui::{
-    Account, Answer, Choice, MAX_SHOWN_LEN, Prompt, Registration, Ui,
+    Account, Accounts, Answer, Choice, MAX_SHOWN_LEN, MAX_SHOWN_RP_ID_LEN, Prompt, Registration, Ui,
 };
 
 use crate::{Comm, hid};
@@ -185,10 +200,17 @@ enum Ending {
     },
 }
 
-/// Room for a composed screen text: the longest sentence around an RP ID or a name shown at its
-/// longest, [`MAX_SHOWN_LEN`], with the NUL; the check below holds every screen to it, so a screen
-/// shows every byte a credential keeps and names that differ never look alike.
-const TEXT_LEN: usize = 384;
+/// Room for a composed screen text: the longest sentence around an RP ID shown at its longest,
+/// [`MAX_SHOWN_RP_ID_LEN`], or an account label at its longest, [`ACCOUNT_LABEL_LEN`], with the
+/// NUL; the check below holds every screen to it, so a screen shows every character of the text it
+/// is given and RP IDs or names that differ never look alike.
+const TEXT_LEN: usize = 640;
+
+/// The brackets around the user name in an account label ([`account_label`]).
+const LABEL_OPEN: &str = " (";
+const LABEL_CLOSE: &str = ")";
+/// The longest account label: both names at their longest, with the brackets.
+const ACCOUNT_LABEL_LEN: usize = 2 * MAX_SHOWN_LEN + LABEL_OPEN.len() + LABEL_CLOSE.len();
 
 /// What a token may do, as the consent screen says it ([`purposes`]).
 const PURPOSES: [&str; 6] = [
@@ -220,11 +242,13 @@ const _: () = {
         index += 1;
     }
     // The token consent: what it allows, on which RP.
-    assert!(TOKEN_ASKS.len() + longest_purpose + TOKEN_ON.len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    assert!(
+        TOKEN_ASKS.len() + longest_purpose + TOKEN_ON.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN
+    );
     // An excluded registration.
-    assert!(EXCLUDED_HAS.len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    assert!(EXCLUDED_HAS.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     // The titles: "Create a passkey for <RP>?" is the longest.
-    assert!("Create a passkey for ".len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    assert!("Create a passkey for ".len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     let origins = [Origin::DeviceOnly, Origin::SeedRecoverable];
     let mut index = 0;
     while index < origins.len() {
@@ -232,7 +256,7 @@ const _: () = {
         // The registration summary.
         assert!(
             REGISTER_FOR.len()
-                + MAX_SHOWN_LEN
+                + ACCOUNT_LABEL_LEN
                 + 2
                 + name
                 + 2
@@ -242,7 +266,7 @@ const _: () = {
         // The account picker, which carries the most around a name.
         assert!(
             SIGN_IN_AS.len()
-                + MAX_SHOWN_LEN
+                + ACCOUNT_LABEL_LEN
                 + 2
                 + name
                 + ACCOUNT.len()
@@ -296,8 +320,8 @@ impl Text {
     }
 
     /// The C string, valid while the text lives.
-    fn as_ptr(&self) -> *const c_char {
-        self.0.as_ptr().cast()
+    fn as_c_str(&self) -> &CStr {
+        CStr::from_bytes_until_nul(&self.0).expect("the last byte of a text stays NUL")
     }
 }
 
@@ -318,12 +342,17 @@ fn purposes(permissions: Permissions) -> &'static str {
     }
 }
 
-/// The name a screen gives an account: the user name, else the display name.
-fn account_name<'a>(account: &Account<'a>) -> &'a str {
-    account
-        .name
-        .or(account.display_name)
-        .unwrap_or("an unnamed account")
+/// The account as a screen names it, in parts to compose: the display name and, when it differs,
+/// the user name in brackets, so accounts that share either one still look different; one of them
+/// alone when the other is missing.
+fn account_label<'a>(account: &Account<'a>) -> [&'a str; 4] {
+    match (account.display_name, account.name) {
+        (Some(display_name), Some(name)) if display_name != name => {
+            [display_name, LABEL_OPEN, name, LABEL_CLOSE]
+        }
+        (Some(only), _) | (None, Some(only)) => [only, "", "", ""],
+        (None, None) => ["an unnamed account", "", "", ""],
+    }
 }
 
 /// The key origin as a badge on a sign-in screen and as the option at registration.
@@ -378,13 +407,216 @@ unsafe extern "C" fn choice_callback(confirm: bool) {
     );
 }
 
-/// The icon and the four strings of a choice screen.
-struct Choices {
+/// What a choice screen asks: its icon, the question with the RP ID, the details under it and the
+/// two answers. `title` is the question without the RP ID, which ends a paginated review on a
+/// touch model and heads the pages of a long question on a Nano.
+struct Choices<'a> {
     icon: Icon,
-    message: *const c_char,
-    sub_message: *const c_char,
-    confirm: *const c_char,
-    reject: *const c_char,
+    title: &'static CStr,
+    message: &'a CStr,
+    sub_message: &'a CStr,
+    confirm: &'static CStr,
+    reject: &'static CStr,
+}
+
+/// The geometry of NBGL's pages on the touch models, from Ledger's secure SDK
+/// (`lib_nbgl/include/nbgl_types.h`, `nbgl_obj.h`, `nbgl_layout.h`, `nbgl_fonts.h` and the footer
+/// heights in `lib_nbgl/src/nbgl_layout.c`), which decides whether a choice fits one page.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+mod page {
+    use ledger_device_sdk::sys::nbgl_font_id_e;
+    #[cfg(target_os = "stax")]
+    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_32px, BAGL_FONT_INTER_REGULAR_24px};
+    #[cfg(target_os = "flex")]
+    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_36px, BAGL_FONT_INTER_REGULAR_28px};
+    #[cfg(target_os = "apex_p")]
+    use ledger_device_sdk::sys::{
+        BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp, BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp,
+    };
+
+    #[cfg(target_os = "stax")]
+    mod model {
+        use super::*;
+        pub const WIDTH: u16 = 400;
+        pub const HEIGHT: u16 = 672;
+        pub const BORDER_MARGIN: u16 = 24;
+        /// `ROUNDED_AND_FOOTER_FOOTER_HEIGHT`: the confirm button and the reject footer.
+        pub const CHOICE_FOOTER: u16 = 192;
+        /// `SIMPLE_FOOTER_HEIGHT`: the reject text and the page navigation of a review.
+        pub const REVIEW_FOOTER: u16 = 92;
+        pub const ICON_TITLE_MARGIN: u16 = 24;
+        pub const TITLE_DESC_MARGIN: u16 = 16;
+        /// `LARGE_MEDIUM_FONT`, the question.
+        pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_32px;
+        /// `SMALL_REGULAR_FONT`, the details.
+        pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_24px;
+    }
+
+    #[cfg(target_os = "flex")]
+    mod model {
+        use super::*;
+        pub const WIDTH: u16 = 480;
+        pub const HEIGHT: u16 = 600;
+        pub const BORDER_MARGIN: u16 = 32;
+        pub const CHOICE_FOOTER: u16 = 208;
+        pub const REVIEW_FOOTER: u16 = 96;
+        pub const ICON_TITLE_MARGIN: u16 = 24;
+        pub const TITLE_DESC_MARGIN: u16 = 16;
+        pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_36px;
+        pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_28px;
+    }
+
+    #[cfg(target_os = "apex_p")]
+    mod model {
+        use super::*;
+        pub const WIDTH: u16 = 300;
+        pub const HEIGHT: u16 = 400;
+        pub const BORDER_MARGIN: u16 = 16;
+        pub const CHOICE_FOOTER: u16 = 128;
+        pub const REVIEW_FOOTER: u16 = 60;
+        pub const ICON_TITLE_MARGIN: u16 = 16;
+        pub const TITLE_DESC_MARGIN: u16 = 12;
+        pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp;
+        pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp;
+    }
+
+    pub use model::*;
+
+    /// `AVAILABLE_WIDTH`: the width of a text.
+    pub const TEXT_WIDTH: u16 = WIDTH - 2 * BORDER_MARGIN;
+    /// The height a choice page gives its icon and texts: everything above its buttons. Its
+    /// header is empty and only centres the content, which may use that space, as the reset
+    /// screen does on the Flex.
+    pub const CHOICE_HEIGHT: u16 = HEIGHT - CHOICE_FOOTER;
+    /// The height a review page gives its text: above its footer, with `VERTICAL_BORDER_MARGIN`
+    /// (24 on every touch model) above and below.
+    pub const REVIEW_HEIGHT: u16 = HEIGHT - REVIEW_FOOTER - 2 * 24;
+}
+
+/// Whether a Nano shows `message` whole as the first page of a choice. The Nano choice shows the
+/// message beside its icon on the first page and repeats it, reduced to one line, above every page
+/// of the details, which it pages in full (`displayChoicePage` in
+/// `lib_nbgl/src/nbgl_use_case_nanos.c`); a message longer than the first page would lose its
+/// middle. Two bold lines of the step width (`AVAILABLE_WIDTH`, 128 - 2 * 7) fit beside the icon.
+#[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+fn fits_nano_header(message: &CStr) -> bool {
+    // SAFETY: the string is NUL-terminated and outlives the call, which only reads it.
+    let lines = unsafe {
+        nbgl_getTextNbLinesInWidth(
+            BAGL_FONT_OPEN_SANS_EXTRABOLD_11px_1bpp,
+            message.as_ptr(),
+            128 - 2 * 7,
+            true,
+        )
+    };
+    lines <= 2
+}
+
+/// `first`, a blank line and `second` as one C string.
+#[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+fn joined(first: &CStr, second: &CStr) -> Vec<u8> {
+    let mut text = Vec::with_capacity(first.count_bytes() + 2 + second.count_bytes() + 1);
+    text.extend_from_slice(first.to_bytes());
+    text.extend_from_slice(b"\n\n");
+    text.extend_from_slice(second.to_bytes_with_nul());
+    text
+}
+
+/// The token of the confirming button that ends a paginated review.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+const CONFIRM_TOKEN: u8 = FIRST_USER_TOKEN as u8;
+
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+unsafe extern "C" fn review_action(token: c_int, _index: u8, _page: c_int) {
+    if token == c_int::from(CONFIRM_TOKEN) {
+        OUTCOME.store(CONFIRMED, Ordering::Relaxed);
+    }
+}
+
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+unsafe extern "C" fn review_rejected() {
+    OUTCOME.store(REJECTED, Ordering::Relaxed);
+}
+
+/// Whether `choices` with `icon` fits one choice page, measured as NBGL lays it out
+/// (`addContentCenter` in `lib_nbgl/src/nbgl_layout.c`): the icon, the question in the title font,
+/// the details in the text font and the margins between them. A choice page does not scroll, so
+/// text beyond this height would slide under its buttons or off the screen.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+fn fits_one_page(icon: &nbgl_icon_details_t, choices: &Choices<'_>) -> bool {
+    // SAFETY: both strings are NUL-terminated and outlive the calls, which only read them.
+    let (title, text) = unsafe {
+        (
+            nbgl_getTextHeightInWidth(
+                page::TITLE_FONT,
+                choices.message.as_ptr(),
+                page::TEXT_WIDTH,
+                true,
+            ),
+            nbgl_getTextHeightInWidth(
+                page::TEXT_FONT,
+                choices.sub_message.as_ptr(),
+                page::TEXT_WIDTH,
+                true,
+            ),
+        )
+    };
+    let height = u32::from(icon.height)
+        + u32::from(page::ICON_TITLE_MARGIN)
+        + u32::from(title)
+        + u32::from(page::TITLE_DESC_MARGIN)
+        + u32::from(text);
+    height <= u32::from(page::CHOICE_HEIGHT)
+}
+
+/// The question and the details of `choices` cut into review pages that each fit the screen,
+/// NUL-separated, every character shown: nothing is cut off, and a page break moves before a
+/// `<…>` code, never into it.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+fn review_pages(choices: &Choices<'_>) -> Vec<u8> {
+    let mut text = Vec::with_capacity(
+        choices.message.count_bytes() + 2 + choices.sub_message.count_bytes() + 1,
+    );
+    text.extend_from_slice(choices.message.to_bytes());
+    text.extend_from_slice(b"\n\n");
+    text.extend_from_slice(choices.sub_message.to_bytes_with_nul());
+    // SAFETY: a font query without pointers.
+    let line_height = u16::from(unsafe { nbgl_getFontLineHeight(page::TEXT_FONT) }).max(1);
+    let lines = (page::REVIEW_HEIGHT / line_height).max(1);
+    let mut pages = Vec::with_capacity(text.len() + 8);
+    let mut rest = &text[..];
+    while rest.first().is_some_and(|&byte| byte != 0) {
+        let mut fitting = 0u16;
+        // SAFETY: `rest` is NUL-terminated, the end of `text`; the call writes only `fitting`.
+        unsafe {
+            nbgl_getTextMaxLenInNbLines(
+                page::TEXT_FONT,
+                rest.as_ptr().cast(),
+                page::TEXT_WIDTH,
+                lines,
+                &mut fitting,
+                true,
+            );
+        }
+        // Without its NUL; at least one byte, so the pages always move on.
+        let available = rest.len() - 1;
+        let mut take = usize::from(fitting).clamp(1, available);
+        if take < available
+            && let Some(open) = rest[..take].iter().rposition(|&byte| byte == b'<')
+            && !rest[open..take].contains(&b'>')
+            && open > 0
+        {
+            take = open;
+        }
+        pages.extend_from_slice(&rest[..take]);
+        pages.push(0);
+        rest = &rest[take..];
+        // A page starts with its text, not with the line break that ended the last one.
+        while rest.first() == Some(&b'\n') {
+            rest = &rest[1..];
+        }
+    }
+    pages
 }
 
 /// The screens of a waiting ceremony, drawn over the home screen and replaced by it again when
@@ -474,8 +706,9 @@ impl<'a> DeviceUi<'a> {
     }
 
     /// Shows one choice screen, with the transport saying that the user is needed, and takes
-    /// events until it is answered, the request ends or the deadline passes.
-    fn choose(&mut self, choices: &Choices, deadline_ms: u64) -> Answer {
+    /// events until it is answered, the request ends or the deadline passes. On a touch model a
+    /// choice whose text does not fit one page becomes a paginated review of the same question.
+    fn choose(&mut self, choices: &Choices<'_>, deadline_ms: u64) -> Answer {
         OUTCOME.store(PENDING, Ordering::Relaxed);
         let icon: nbgl_icon_details_t = match choices.icon {
             Icon::App => self.glyph.into(),
@@ -489,18 +722,100 @@ impl<'a> DeviceUi<'a> {
             Icon::Warning => (&system::WARNING).into(),
             Icon::Notice => (&system::NOTICE).into(),
         };
-        // SAFETY: the strings are NUL-terminated, static or composed in the caller's frame, and
-        // they and `icon` outlive the screen, which the wait below ends before the caller returns.
+        #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+        if !fits_one_page(&icon, choices) {
+            return self.review(&icon, choices, deadline_ms);
+        }
+        #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+        let (message, sub_message) = (choices.message, choices.sub_message);
+        // A long question moves into the details, which a Nano pages whole, under the short one.
+        #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+        let details;
+        #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+        let (message, sub_message) = if fits_nano_header(choices.message) {
+            (choices.message, choices.sub_message)
+        } else {
+            details = joined(choices.message, choices.sub_message);
+            (
+                choices.title,
+                CStr::from_bytes_until_nul(&details).expect("joined ends with a NUL"),
+            )
+        };
+        // SAFETY: the strings are NUL-terminated, static or composed in this or the caller's
+        // frame, and they and `icon` outlive the screen, which the wait below ends before the
+        // caller returns.
         unsafe {
             nbgl_useCaseChoice(
                 &icon,
-                choices.message,
-                choices.sub_message,
-                choices.confirm,
-                choices.reject,
+                message.as_ptr(),
+                sub_message.as_ptr(),
+                choices.confirm.as_ptr(),
+                choices.reject.as_ptr(),
                 Some(choice_callback),
             );
         }
+        self.wait(deadline_ms)
+    }
+
+    /// Asks the question of `choices` as a review: pages with its whole text, then a last page
+    /// with the icon, the question without the RP ID and the confirming button; the reject answer
+    /// stays at the foot of every page.
+    #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+    fn review(
+        &mut self,
+        icon: &nbgl_icon_details_t,
+        choices: &Choices<'_>,
+        deadline_ms: u64,
+    ) -> Answer {
+        let pages = review_pages(choices);
+        let mut contents: Vec<nbgl_content_t> = pages
+            .split_inclusive(|&byte| byte == 0)
+            .map(|page| nbgl_content_t {
+                type_: CENTERED_INFO,
+                content: nbgl_content_u {
+                    centeredInfo: nbgl_contentCenteredInfo_t {
+                        text2: page.as_ptr().cast(),
+                        style: LARGE_CASE_INFO,
+                        ..Default::default()
+                    },
+                },
+                contentActionCallback: None,
+            })
+            .collect();
+        contents.push(nbgl_content_t {
+            type_: INFO_BUTTON,
+            content: nbgl_content_u {
+                infoButton: nbgl_contentInfoButton_t {
+                    text: choices.title.as_ptr(),
+                    icon,
+                    buttonText: choices.confirm.as_ptr(),
+                    buttonToken: CONFIRM_TOKEN,
+                    tuneId: TUNE_TAP_CASUAL,
+                },
+            },
+            contentActionCallback: Some(review_action),
+        });
+        let generic = nbgl_genericContents_t {
+            callbackCallNeeded: false,
+            __bindgen_anon_1: nbgl_genericContents_t__bindgen_ty_1 {
+                contentsList: contents.as_ptr(),
+            },
+            nbContents: u8::try_from(contents.len()).expect(
+                "a page holds several lines of the two texts of at most TEXT_LEN bytes, far \
+                 fewer than 255 pages",
+            ),
+        };
+        // SAFETY: the contents, their texts and `icon` live in this frame or in the caller's
+        // until the wait below ends the review; NBGL copies `generic` itself.
+        unsafe {
+            nbgl_useCaseGenericReview(&generic, choices.reject.as_ptr(), Some(review_rejected));
+        }
+        self.wait(deadline_ms)
+    }
+
+    /// Takes events for the screen just drawn until it is answered, the request ends or the
+    /// deadline passes.
+    fn wait(&mut self, deadline_ms: u64) -> Answer {
         // Said once the screen is drawn: the status change sends a keepalive at once, and a
         // drawing after it would stretch the gap to the next one. Later screens of the ceremony
         // leave the status unchanged, which sends nothing.
@@ -582,20 +897,22 @@ impl Ui for DeviceUi<'_> {
             // why it names none.
             Prompt::Selection => Choices {
                 icon: Icon::Shield,
-                message: c"Allow security key access?".as_ptr(),
-                sub_message: c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.".as_ptr(),
-                confirm: c"Allow".as_ptr(),
-                reject: c"Don't allow".as_ptr(),
+                title: c"Allow security key access?",
+                message: c"Allow security key access?",
+                sub_message: c"Your browser or system is choosing a security key. If a website is involved, it is shown in the next step.",
+                confirm: c"Allow",
+                reject: c"Don't allow",
             },
             // What a reset erases, and that passkeys from the recovery phrase are only revoked
             // while this application's data lasts: reinstalling it without restoring a backup
             // brings them back.
             Prompt::Reset => Choices {
                 icon: Icon::Warning,
-                message: c"Reset the security key?".as_ptr(),
-                sub_message: c"Erases this device's passkeys, the PIN and settings, and stops your recovery phrase passkeys. Reinstalling the app without its backup brings those back.".as_ptr(),
-                confirm: c"Reset".as_ptr(),
-                reject: c"Cancel".as_ptr(),
+                title: c"Reset the security key?",
+                message: c"Reset the security key?",
+                sub_message: c"Erases this device's passkeys, the PIN and settings, and stops your recovery phrase passkeys. Reinstalling the app without its backup brings those back.",
+                confirm: c"Reset",
+                reject: c"Cancel",
             },
             // The platform asks for a pinUvAuthToken, with the client PIN or the device unlock;
             // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
@@ -613,28 +930,34 @@ impl Ui for DeviceUi<'_> {
                 ]);
                 Choices {
                     icon: Icon::Shield,
-                    message: c"Allow security key use?".as_ptr(),
-                    sub_message: sub_message.as_ptr(),
-                    confirm: c"Allow".as_ptr(),
-                    reject: c"Don't allow".as_ptr(),
+                    title: c"Allow security key use?",
+                    message: c"Allow security key use?",
+                    sub_message: sub_message.as_c_str(),
+                    confirm: c"Allow",
+                    reject: c"Don't allow",
                 }
             }
             // A sign-in names the RP, the account and the origin of its key (CTAP 2.2 §6.2.2
             // step 11: an authenticator with a display shows the rpId).
             Prompt::Assertion { rp_id, account } => {
                 message = Text::new(&["Sign in to ", rp_id, "?"]);
+                let label = account_label(&account);
                 sub_message = Text::new(&[
                     SIGN_IN_AS,
-                    account_name(&account),
+                    label[0],
+                    label[1],
+                    label[2],
+                    label[3],
                     ".\n",
                     account.origin.map_or("", origin_name),
                 ]);
                 Choices {
                     icon: Icon::Login,
-                    message: message.as_ptr(),
-                    sub_message: sub_message.as_ptr(),
-                    confirm: c"Sign in".as_ptr(),
-                    reject: c"Don't sign in".as_ptr(),
+                    title: c"Sign in?",
+                    message: message.as_c_str(),
+                    sub_message: sub_message.as_c_str(),
+                    confirm: c"Sign in",
+                    reject: c"Don't sign in",
                 }
             }
             // An excluded credential is reported only after this screen (§6.1.2 step 16), and
@@ -643,10 +966,11 @@ impl Ui for DeviceUi<'_> {
                 sub_message = Text::new(&[EXCLUDED_HAS, rp_id, "."]);
                 Choices {
                     icon: Icon::Notice,
-                    message: c"Already registered".as_ptr(),
-                    sub_message: sub_message.as_ptr(),
-                    confirm: c"OK".as_ptr(),
-                    reject: c"Close".as_ptr(),
+                    title: c"Already registered",
+                    message: c"Already registered",
+                    sub_message: sub_message.as_c_str(),
+                    confirm: c"OK",
+                    reject: c"Close",
                 }
             }
         };
@@ -679,9 +1003,13 @@ impl Ui for DeviceUi<'_> {
         let mut origin = registration.default_origin;
         let outcome = loop {
             let message = Text::new(&["Create a passkey for ", registration.rp_id, "?"]);
+            let label = account_label(&registration.account);
             let sub_message = Text::new(&[
                 REGISTER_FOR,
-                account_name(&registration.account),
+                label[0],
+                label[1],
+                label[2],
+                label[3],
                 ".\n",
                 origin_name(origin),
                 ": ",
@@ -689,10 +1017,11 @@ impl Ui for DeviceUi<'_> {
             ]);
             let summary = Choices {
                 icon: Icon::App,
-                message: message.as_ptr(),
-                sub_message: sub_message.as_ptr(),
-                confirm: c"Create passkey".as_ptr(),
-                reject: c"Key type".as_ptr(),
+                title: c"Create a passkey?",
+                message: message.as_c_str(),
+                sub_message: sub_message.as_c_str(),
+                confirm: c"Create passkey",
+                reject: c"Key type",
             };
             match self.choose(&summary, deadline_ms) {
                 Answer::Confirmed => break Choice::Chose(origin),
@@ -709,10 +1038,11 @@ impl Ui for DeviceUi<'_> {
                     Origin::SeedRecoverable => Icon::Backup,
                     Origin::DeviceOnly => Icon::Warning,
                 },
-                message: message.as_ptr(),
-                sub_message: sub_message.as_ptr(),
-                confirm: c"Use this key type".as_ptr(),
-                reject: c"Don't create".as_ptr(),
+                title: c"Use this key type?",
+                message: message.as_c_str(),
+                sub_message: sub_message.as_c_str(),
+                confirm: c"Use this key type",
+                reject: c"Don't create",
             };
             match self.choose(&switch, deadline_ms) {
                 Answer::Confirmed => origin = other,
@@ -735,37 +1065,52 @@ impl Ui for DeviceUi<'_> {
 
     /// The accounts, most recently created first, one screen each: "Sign in" picks it, "Other
     /// account" shows the next, and the last one's refusal ends the sign-in.
-    fn pick(&mut self, rp_id: &str, accounts: &[Account<'_>], timeout_ms: u32) -> Choice<usize> {
+    fn pick<A: Accounts>(
+        &mut self,
+        rp_id: &str,
+        accounts: &mut A,
+        timeout_ms: u32,
+    ) -> Choice<usize> {
         let deadline_ms = self.begin(timeout_ms);
-        let total = accounts.len();
+        let total = accounts.count();
         let mut total_buffer = [0u8; NUMBER_LEN];
         let total_text = number(total, &mut total_buffer);
         let mut outcome = Choice::Rejected;
-        for (index, account) in accounts.iter().enumerate() {
+        for index in 0..total {
             let mut position_buffer = [0u8; NUMBER_LEN];
-            // `index` is below `total`, a slice length, so the next one fits.
+            // `index` is below `total`, a count of index entries, so the next one fits.
             let position = number(index + 1, &mut position_buffer);
             let last = index + 1 == total;
             let message = Text::new(&["Sign in to ", rp_id, "?"]);
-            let sub_message = Text::new(&[
-                SIGN_IN_AS,
-                account_name(account),
-                ".\n",
-                account.origin.map_or("", origin_name),
-                ACCOUNT,
-                position,
-                ACCOUNT_OF,
-                total_text,
-            ]);
+            // The account's names live only while its screen is composed.
+            let Some(sub_message) = accounts.read(index, |account| {
+                let label = account_label(&account);
+                Text::new(&[
+                    SIGN_IN_AS,
+                    label[0],
+                    label[1],
+                    label[2],
+                    label[3],
+                    ".\n",
+                    account.origin.map_or("", origin_name),
+                    ACCOUNT,
+                    position,
+                    ACCOUNT_OF,
+                    total_text,
+                ])
+            }) else {
+                break;
+            };
             let choices = Choices {
                 icon: Icon::Accounts,
-                message: message.as_ptr(),
-                sub_message: sub_message.as_ptr(),
-                confirm: c"Sign in".as_ptr(),
+                title: c"Sign in with this account?",
+                message: message.as_c_str(),
+                sub_message: sub_message.as_c_str(),
+                confirm: c"Sign in",
                 reject: if last {
-                    c"Don't sign in".as_ptr()
+                    c"Don't sign in"
                 } else {
-                    c"Other account".as_ptr()
+                    c"Other account"
                 },
             };
             match self.choose(&choices, deadline_ms) {
