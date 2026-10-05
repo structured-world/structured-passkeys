@@ -796,6 +796,30 @@ fn a_tap_registers_without_a_screen_once() {
     assert_eq!(ui.asked.len(), 1, "the tap was used");
 }
 
+/// A registration that fails after the tap gave its presence, here for a response that does not
+/// fit, still uses the tap up: the tap is the presence of one credential operation, whatever
+/// became of it, and the next registration asks on the screen.
+#[test]
+fn a_failed_registration_uses_the_tap() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
+    let request = command(
+        0x01,
+        &registration(RP_ID, b"user-1", &[("rk", false), ("uv", true)]),
+    );
+    let mut short = [0u8; 16];
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut short);
+    assert_ne!(short[0], OK, "the response cannot fit 16 bytes");
+    assert_eq!(ui.asked, [], "no screen on the tap");
+    let mut response = [0u8; 1024];
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut response);
+    assert_eq!(ui.asked.len(), 1, "the tap was used");
+}
+
 /// A registration the excludeList ends takes its presence from the tap, which then counts as
 /// used: the tap is the presence of one credential operation, and the next one asks on the
 /// screen.

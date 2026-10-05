@@ -298,6 +298,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if up {
             self.consume_token_flags();
         }
+        // The tap is this assertion's presence from here on, whether or not the signature is
+        // then written: it counts for one credential operation.
+        if on_tap {
+            self.use_nfc_tap();
+        }
         // Step 15.2.2: the platform gets the count and the rest with getNextAssertion, which
         // continues only once this response has been written (§6.3 follows a received assertion).
         let continuation = (several && !pick).then(|| NextAssertions {
@@ -338,9 +343,6 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             encoder,
         )?;
         self.next_assertions = continuation;
-        if on_tap {
-            self.use_nfc_tap();
-        }
         Ok(())
     }
 

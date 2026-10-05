@@ -166,6 +166,10 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
                 Key::Int(0x02) => rp_id = Some(rp_entity(value)?),
                 Key::Int(0x03) => user = Some(user_entity(value)?),
                 Key::Int(0x04) => algorithm_chosen = Some(algorithm(value, &mut missing)?),
+                // §6.1 says a present excludeList "MUST NOT be empty", a rule for the platform:
+                // no step of §6.1.2 nor §8 gives the authenticator an error for it. An empty list
+                // excludes nothing, as an omitted one, so it is accepted rather than failing a
+                // registration that loses nothing by going ahead.
                 Key::Int(0x05) => exclude_list = descriptors(value, &mut missing)?,
                 // An extension this authenticator does not support is ignored (§6.1.2 step
                 // 19.1); the member must still be a map.
@@ -366,8 +370,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         } else {
             Origin::SeedRecoverable
         };
-        let on_tap = self.nfc_tap_unused(link, now_ms);
-        let origin = if on_tap {
+        let origin = if self.nfc_tap_unused(link, now_ms) {
+            // The tap is this operation's presence from here on, whether or not the
+            // registration then succeeds: it counts for one credential operation.
+            self.use_nfc_tap();
             default_origin
         } else {
             let (name, display_name) = names(&request.user);
@@ -403,9 +409,6 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 return Err(status);
             }
             (Err(status), None) => return Err(status),
-        }
-        if on_tap {
-            self.use_nfc_tap();
         }
         Ok(())
     }

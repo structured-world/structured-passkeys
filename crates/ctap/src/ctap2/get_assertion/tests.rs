@@ -442,6 +442,27 @@ fn a_continuation_ends_with_its_token() {
     assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
 }
 
+/// An assertion that fails after the tap gave its presence, here for a response that does not
+/// fit, still uses the tap up, and the next sign-in asks on the screen.
+#[test]
+fn a_failed_assertion_uses_the_tap() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    let made = register(&mut authenticator, RP_ID, b"user-1", false, None);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let request = assertion(Some(&[&made.id]), &[]);
+    let mut short = [0u8; 16];
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut short);
+    assert_ne!(short[0], OK, "the response cannot fit 16 bytes");
+    assert_eq!(ui.asked, [], "no screen on the tap");
+    let mut response = [0u8; 1024];
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut response);
+    assert_eq!(ui.asked.len(), 1, "the tap was used");
+}
+
 /// Over a live NFC tap an assertion without presence but with user verification lists no
 /// accounts either: the device rests on the phone, so the platform gets the count and goes on
 /// with getNextAssertion. UP stays clear, as no presence was asked for, and the tap is not used.
