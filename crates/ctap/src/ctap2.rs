@@ -352,8 +352,9 @@ pub const NFC_PRESENCE_MS: u64 = 120_000;
 pub struct NfcTap {
     /// When the applet was selected, on the device clock.
     pub at_ms: u64,
-    /// The selection's number, which tells taps apart when the clock is too coarse to.
-    pub selection: u32,
+    /// The selection's number, which tells taps apart when the clock is too coarse to; it never
+    /// repeats while the application runs.
+    pub selection: u64,
 }
 
 /// A parsed request, owning everything its execution needs. Not `Clone`: a request can carry PIN
@@ -395,7 +396,7 @@ pub struct Authenticator<C, S> {
     nfc_tap: Option<NfcTap>,
     /// The selection a credential operation used up: a tap counts for one registration or
     /// assertion.
-    nfc_tap_used: Option<u32>,
+    nfc_tap_used: Option<u64>,
     /// What authenticatorGetNextAssertion continues from; any other command discards it (§6.3:
     /// a stateful command continues only the command right before it).
     next_assertions: Option<get_assertion::NextAssertions>,

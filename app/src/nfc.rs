@@ -27,7 +27,7 @@ pub struct Nfc {
     /// The last selection of the applet: the NFC tap, until CTAP ends.
     tap: Option<NfcTap>,
     /// The number of the last selection, which tells taps in one tick of the clock apart.
-    selections: u32,
+    selections: u64,
 }
 
 impl Nfc {
@@ -72,9 +72,12 @@ impl Nfc {
                 send(command.reply(reply.data, Reply(reply.sw.0)));
             }
             Outcome::Selected(reply) => {
-                // Wraps after 2^32 selections: a number only has to differ from the one the last
-                // credential operation used.
-                self.selections = self.selections.wrapping_add(1);
+                // A number never repeats, so a new tap never looks used: even one selection a
+                // millisecond would take half a billion years to exhaust a u64.
+                self.selections = self
+                    .selections
+                    .checked_add(1)
+                    .expect("a u64 count of NFC selections outlives the device");
                 self.tap = Some(NfcTap {
                     at_ms: now_ms,
                     selection: self.selections,
