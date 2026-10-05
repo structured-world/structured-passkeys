@@ -439,6 +439,38 @@ fn a_continuation_ends_with_its_token() {
     assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
 }
 
+/// Over a live NFC tap an assertion without presence but with user verification lists no
+/// accounts either: the device rests on the phone, so the platform gets the count and goes on
+/// with getNextAssertion. UP stays clear, as no presence was asked for, and the tap is not used.
+#[test]
+fn a_tap_lists_no_accounts_for_an_assertion_without_presence() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    for user in [b"user-1", b"user-2"] {
+        register(&mut authenticator, RP_ID, user, true, None);
+    }
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut response = [0u8; 1024];
+    let length = authenticator.process(
+        &assertion(None, &[("up", false), ("uv", true)]),
+        Link::Nfc,
+        &mut ui,
+        &mut response,
+    );
+    assert_eq!(response[0], OK);
+    let first = asserted(&response[1..length]);
+    assert_eq!(first.number_of_credentials, Some(2));
+    assert_eq!(first.flags(), UV, "UV, no UP");
+    assert_eq!(ui.asked, [], "no screen on the tap");
+    let length = authenticator.process(&assertion(None, &[]), Link::Nfc, &mut ui, &mut response);
+    assert_eq!(response[0], OK);
+    assert_eq!(ui.asked, [], "the tap is still unused");
+    assert_eq!(asserted(&response[1..length]).flags(), UP);
+}
+
 /// Nothing to sign with is CTAP2_ERR_NO_CREDENTIALS: an RP without credentials, an allowList of
 /// IDs this device did not create or created for another RP. A platform never sends `rk`, which
 /// is CTAP2_ERR_UNSUPPORTED_OPTION (§6.2.2 step 5.4).

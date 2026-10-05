@@ -82,7 +82,8 @@ pub(super) fn authenticator_data(
 /// `text` as a screen shows it: cut to `max` bytes on a character boundary, in the printable ASCII
 /// the device fonts hold. Any other character, and `<` itself, is written as `<` its code point in
 /// upper-case hex `>`, so the mapping is one to one: two different texts never look alike, and a
-/// NUL or a line break can neither end the text nor push the rest off the screen.
+/// NUL or a line break can neither end the text nor push the rest off the screen. Each kept byte
+/// takes at most four characters, the bound [`crate::ui::MAX_SHOWN_LEN`] gives screens.
 pub(super) fn shown(text: &str, max: usize) -> String {
     let kept = truncate_on_char_boundary(text, max);
     let mut shown = String::with_capacity(kept.len());

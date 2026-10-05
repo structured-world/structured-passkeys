@@ -14,7 +14,7 @@ use super::super::{AAGUID, Link, NfcTap, Transports};
 use crate::cbor::{Decoder, Key};
 use crate::credential_id::Origin;
 use crate::pin::Protocol;
-use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS};
+use crate::ui::{Answer, MAX_SHOWN_LEN, USER_ACTION_TIMEOUT_MS};
 
 pub(in crate::ctap2) const OK: u8 = 0x00;
 const INVALID_PARAMETER: u8 = 0x02;
@@ -796,6 +796,29 @@ fn a_tap_registers_without_a_screen_once() {
     assert_eq!(ui.asked.len(), 1, "the tap was used");
 }
 
+/// A registration the excludeList ends takes its presence from the tap, which then counts as
+/// used: the tap is the presence of one credential operation, and the next one asks on the
+/// screen.
+#[test]
+fn an_excluded_registration_uses_the_tap() {
+    let mut authenticator = authenticator_with(Transports::UsbAndNfc);
+    let existing = register(&mut authenticator, RP_ID, b"user-1", false, None);
+    let mut ui = Scripted::new(Answer::Confirmed);
+    authenticator.nfc_tap(NfcTap {
+        at_ms: 0,
+        selection: 0,
+    });
+    let mut members = registration(RP_ID, b"user-2", &[("uv", true)]);
+    members.insert(4, (0x05, descriptors(&[&existing.id])));
+    let mut response = [0u8; 1024];
+    authenticator.process(&command(0x01, &members), Link::Nfc, &mut ui, &mut response);
+    assert_eq!(response[0], CREDENTIAL_EXCLUDED);
+    assert_eq!(ui.asked, [], "the tap is the presence");
+    let request = command(0x01, &registration(RP_ID, b"user-2", &[("uv", true)]));
+    authenticator.process(&request, Link::Nfc, &mut ui, &mut response);
+    assert_eq!(ui.asked.len(), 1, "the tap was used");
+}
+
 /// A new selection of the applet is a new tap even within the same tick of the 100 ms device
 /// clock: after NFCCTAP_CONTROL ends CTAP and the platform selects the applet again, the next
 /// registration takes the new tap without a screen.
@@ -893,4 +916,16 @@ fn names_are_shown_safely() {
         (Some("<418><432><430><43D>".into()), Some("<3C>418>".into()))
     );
     assert_eq!(shown("Петр", "x").0, Some("<41F><435><442><440>".into()));
+    // The longest shown name, every kept byte at four characters, is MAX_SHOWN_LEN, so a screen
+    // with that much room tells names apart in their last byte too.
+    let (a, b) = (
+        format!("{}a", "<".repeat(63)),
+        format!("{}b", "<".repeat(63)),
+    );
+    let (shown_a, shown_b) = (shown(&a, "x").0.unwrap(), shown(&b, "x").0.unwrap());
+    assert_ne!(shown_a, shown_b);
+    assert_eq!(shown_a.len(), 63 * 4 + 1);
+    let longest = shown(&"<".repeat(64), &"\u{7F}".repeat(64));
+    assert_eq!(longest.0.map(|name| name.len()), Some(MAX_SHOWN_LEN));
+    assert_eq!(longest.1.map(|name| name.len()), Some(MAX_SHOWN_LEN));
 }

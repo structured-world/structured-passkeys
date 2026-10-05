@@ -2,8 +2,19 @@
 //! asks, the platform shows its screen and answers; while it waits it keeps the transport going
 //! (keepalives, CANCEL) and gives up after the timeout it was given.
 
-use crate::credential_id::Origin;
+use crate::credential_id::{MAX_NAME_LEN, Origin};
 use crate::pin::Permissions;
+use crate::storage::MAX_RP_ID_LEN;
+
+/// The longest text a screen receives for a name or an RP ID: they are kept to 64 bytes, and each
+/// byte is shown as at most four printable ASCII characters (a byte below 0x80 outside printable
+/// ASCII, or `<`, as `<XX>`; a longer UTF-8 sequence as fewer characters per byte). A screen with
+/// room for this length shows every kept byte, so names that differ there never look alike.
+pub const MAX_SHOWN_LEN: usize = 4 * if MAX_NAME_LEN > MAX_RP_ID_LEN {
+    MAX_NAME_LEN
+} else {
+    MAX_RP_ID_LEN
+};
 
 /// How long a ceremony waits for the user before the request ends with
 /// CTAP2_ERR_USER_ACTION_TIMEOUT. CTAP 2.2 ("User action timeout", Terminology) leaves the value

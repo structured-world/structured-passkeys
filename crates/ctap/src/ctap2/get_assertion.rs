@@ -203,12 +203,15 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return Err(StatusCode::NoCredentials);
         }
         let shown_rp = shown_rp_id(&request.rp_id);
-        let on_tap = up && self.nfc_tap_unused(link, now_ms);
+        // A live tap means the device rests on the phone: no screen is answered then, whether or
+        // not the request asks for presence, which only then the tap supplies and uses up.
+        let tapped = self.nfc_tap_unused(link, now_ms);
+        let on_tap = up && tapped;
         let several = request.allow_list.is_none() && applicable.len() > 1;
         // Step 15.2.3: a display lists the accounts when the request asks for presence or
-        // verification. Over NFC the tap is the presence and no screen is answered, so the
-        // platform gets the count and goes on with getNextAssertion, as without a display.
-        let pick = several && !on_tap && (up || uv);
+        // verification. Over the tap the platform gets the count and goes on with
+        // getNextAssertion, as without a display.
+        let pick = several && !tapped && (up || uv);
         let mut selected = 0;
         let mut extras = Extras {
             number_of_credentials: None,

@@ -26,7 +26,9 @@ use ledger_device_sdk::sys::{
 use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::ctap2::Link;
 use structured_passkeys_ctap::pin::Permissions;
-use structured_passkeys_ctap::ui::{Account, Answer, Choice, Prompt, Registration, Ui};
+use structured_passkeys_ctap::ui::{
+    Account, Answer, Choice, MAX_SHOWN_LEN, Prompt, Registration, Ui,
+};
 
 use crate::{Comm, hid};
 
@@ -183,8 +185,75 @@ enum Ending {
     },
 }
 
-/// Room for a composed screen text: the longest sentence with a 64-byte RP ID and a 64-byte name.
-const TEXT_LEN: usize = 256;
+/// Room for a composed screen text: the longest sentence around an RP ID or a name shown at its
+/// longest, [`MAX_SHOWN_LEN`], with the NUL; the check below holds every screen to it, so a screen
+/// shows every byte a credential keeps and names that differ never look alike.
+const TEXT_LEN: usize = 384;
+
+/// What a token may do, as the consent screen says it ([`purposes`]).
+const PURPOSES: [&str; 6] = [
+    "sign in with a passkey",
+    "create a passkey",
+    "sign in and create passkeys",
+    "list and delete your passkeys",
+    "change the security key's settings",
+    "sign in, manage passkeys and change settings",
+];
+/// The words around the shown RP ID and names, shared by the screens and the check below.
+const TOKEN_ASKS: &str = "Your browser or system asks to ";
+const TOKEN_ON: &str = " on ";
+const EXCLUDED_HAS: &str = "This security key already has a passkey for ";
+const REGISTER_FOR: &str = "For ";
+const SIGN_IN_AS: &str = "As ";
+const ACCOUNT: &str = "\nAccount ";
+const ACCOUNT_OF: &str = " of ";
+/// Digits of an account position or count ([`number`]).
+const NUMBER_LEN: usize = 5;
+
+const _: () = {
+    let mut longest_purpose = 0;
+    let mut index = 0;
+    while index < PURPOSES.len() {
+        if PURPOSES[index].len() > longest_purpose {
+            longest_purpose = PURPOSES[index].len();
+        }
+        index += 1;
+    }
+    // The token consent: what it allows, on which RP.
+    assert!(TOKEN_ASKS.len() + longest_purpose + TOKEN_ON.len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    // An excluded registration.
+    assert!(EXCLUDED_HAS.len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    // The titles: "Create a passkey for <RP>?" is the longest.
+    assert!("Create a passkey for ".len() + MAX_SHOWN_LEN + 1 < TEXT_LEN);
+    let origins = [Origin::DeviceOnly, Origin::SeedRecoverable];
+    let mut index = 0;
+    while index < origins.len() {
+        let name = origin_name(origins[index]).len();
+        // The registration summary.
+        assert!(
+            REGISTER_FOR.len()
+                + MAX_SHOWN_LEN
+                + 2
+                + name
+                + 2
+                + origin_meaning(origins[index]).len()
+                < TEXT_LEN
+        );
+        // The account picker, which carries the most around a name.
+        assert!(
+            SIGN_IN_AS.len()
+                + MAX_SHOWN_LEN
+                + 2
+                + name
+                + ACCOUNT.len()
+                + NUMBER_LEN
+                + ACCOUNT_OF.len()
+                + NUMBER_LEN
+                < TEXT_LEN
+        );
+        index += 1;
+    }
+};
 
 /// A NUL-terminated text composed for a screen. It lives in the frame of the call that shows the
 /// screen and waits for it, so it outlives the screen without taking RAM between screens, which
@@ -240,16 +309,12 @@ fn purposes(permissions: Permissions) -> &'static str {
     let sign_in = bits & Permissions::GET_ASSERTION.bits() != 0;
     let others = bits & !(Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits());
     match (create, sign_in, others) {
-        (false, true, 0) => "sign in with a passkey",
-        (true, false, 0) => "create a passkey",
-        (true, true, 0) => "sign in and create passkeys",
-        (false, false, bits) if bits == Permissions::CREDENTIAL_MANAGEMENT.bits() => {
-            "list and delete your passkeys"
-        }
-        (false, false, bits) if bits == Permissions::AUTHENTICATOR_CONFIG.bits() => {
-            "change the security key's settings"
-        }
-        _ => "sign in, manage passkeys and change settings",
+        (false, true, 0) => PURPOSES[0],
+        (true, false, 0) => PURPOSES[1],
+        (true, true, 0) => PURPOSES[2],
+        (false, false, bits) if bits == Permissions::CREDENTIAL_MANAGEMENT.bits() => PURPOSES[3],
+        (false, false, bits) if bits == Permissions::AUTHENTICATOR_CONFIG.bits() => PURPOSES[4],
+        _ => PURPOSES[5],
     }
 }
 
@@ -290,7 +355,7 @@ const fn other_origin(origin: Origin) -> Origin {
 }
 
 /// A number of at most five digits, written into `buffer`.
-fn number(value: usize, buffer: &mut [u8; 5]) -> &str {
+fn number(value: usize, buffer: &mut [u8; NUMBER_LEN]) -> &str {
     let mut at = buffer.len();
     let mut rest = value;
     loop {
@@ -537,10 +602,10 @@ impl Ui for DeviceUi<'_> {
             // §6.5.5.7.3 step 9).
             Prompt::Token { permissions, rp_id } => {
                 sub_message = Text::new(&[
-                    "Your browser or system asks to ",
+                    TOKEN_ASKS,
                     purposes(permissions),
                     match rp_id {
-                        Some(_) => " on ",
+                        Some(_) => TOKEN_ON,
                         None => " on any website",
                     },
                     rp_id.unwrap_or_default(),
@@ -559,7 +624,7 @@ impl Ui for DeviceUi<'_> {
             Prompt::Assertion { rp_id, account } => {
                 message = Text::new(&["Sign in to ", rp_id, "?"]);
                 sub_message = Text::new(&[
-                    "As ",
+                    SIGN_IN_AS,
                     account_name(&account),
                     ".\n",
                     account.origin.map_or("", origin_name),
@@ -575,11 +640,7 @@ impl Ui for DeviceUi<'_> {
             // An excluded credential is reported only after this screen (§6.1.2 step 16), and
             // either answer ends the registration.
             Prompt::Excluded { rp_id } => {
-                sub_message = Text::new(&[
-                    "This security key already has a passkey for ",
-                    rp_id,
-                    ".",
-                ]);
+                sub_message = Text::new(&[EXCLUDED_HAS, rp_id, "."]);
                 Choices {
                     icon: Icon::Notice,
                     message: c"Already registered".as_ptr(),
@@ -619,7 +680,7 @@ impl Ui for DeviceUi<'_> {
         let outcome = loop {
             let message = Text::new(&["Create a passkey for ", registration.rp_id, "?"]);
             let sub_message = Text::new(&[
-                "For ",
+                REGISTER_FOR,
                 account_name(&registration.account),
                 ".\n",
                 origin_name(origin),
@@ -677,23 +738,23 @@ impl Ui for DeviceUi<'_> {
     fn pick(&mut self, rp_id: &str, accounts: &[Account<'_>], timeout_ms: u32) -> Choice<usize> {
         let deadline_ms = self.begin(timeout_ms);
         let total = accounts.len();
-        let mut total_buffer = [0u8; 5];
+        let mut total_buffer = [0u8; NUMBER_LEN];
         let total_text = number(total, &mut total_buffer);
         let mut outcome = Choice::Rejected;
         for (index, account) in accounts.iter().enumerate() {
-            let mut position_buffer = [0u8; 5];
+            let mut position_buffer = [0u8; NUMBER_LEN];
             // `index` is below `total`, a slice length, so the next one fits.
             let position = number(index + 1, &mut position_buffer);
             let last = index + 1 == total;
             let message = Text::new(&["Sign in to ", rp_id, "?"]);
             let sub_message = Text::new(&[
-                "As ",
+                SIGN_IN_AS,
                 account_name(account),
                 ".\n",
                 account.origin.map_or("", origin_name),
-                "\nAccount ",
+                ACCOUNT,
                 position,
-                " of ",
+                ACCOUNT_OF,
                 total_text,
             ]);
             let choices = Choices {

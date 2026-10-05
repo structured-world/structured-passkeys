@@ -337,7 +337,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             if credential.cred_protect == CredProtect::Required && !uv {
                 continue;
             }
-            if !self.nfc_tap_unused(link, now_ms) {
+            if self.nfc_tap_unused(link, now_ms) {
+                // The tap was this operation's presence, so it is used like a registration's.
+                self.use_nfc_tap();
+            } else {
                 // Step 16.1.4.2: excluded whether presence came or the wait timed out.
                 let answer = ui.confirm(
                     Prompt::Excluded {
