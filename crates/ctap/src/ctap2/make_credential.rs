@@ -305,7 +305,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         }
         // A discoverable credential stores the user handle, at most 64 bytes (WebAuthn L3
         // §5.4.3), refused before anything asks the user; an empty one is valid (CTAP 2.2 §6.1,
-        // user: "an empty account identifier is valid").
+        // user: "an empty account identifier is valid"). CTAP sets the authenticator no length
+        // for user.id, the 64 bytes being the client's check (WebAuthn L3 §5.1.3 step 5), and a
+        // non-discoverable credential keeps no handle, so only the stored one is bounded here.
         if rk && request.user.id.len() > MAX_USER_ID_LEN {
             return Err(StatusCode::InvalidParameter);
         }

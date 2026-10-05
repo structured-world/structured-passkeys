@@ -210,7 +210,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let several = request.allow_list.is_none() && applicable.len() > 1;
         // Step 15.2.3: a display lists the accounts when the request asks for presence or
         // verification. Over the tap the platform gets the count and goes on with
-        // getNextAssertion, as without a display.
+        // getNextAssertion, as without a display. A request with neither asks for no screen at
+        // all: up=false is the platform's pre-flight of an allowList or excludeList (§6.2, note
+        // on "up"), and its assertion without UP is not valid at the WebAuthn layer, so a screen
+        // would interrupt every pre-flight and give the user nothing to decide.
         let pick = several && !tapped && (up || uv);
         let mut selected = 0;
         let mut extras = Extras {
