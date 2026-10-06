@@ -191,16 +191,17 @@ diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/te
 diff --git a/tests/standard/transport/test_hid.py b/tests/standard/transport/test_hid.py
 --- a/tests/standard/transport/test_hid.py
 +++ b/tests/standard/transport/test_hid.py
-@@ -85,4 +85,7 @@
+@@ -85,4 +85,8 @@
      def test_skip_sequence_number(self, device):
          r = device.send_data(CTAPHID.PING, "\x44" * 200)
 -        device.send_raw("\x81\x04\x90")
 +        # A message longer than the device's buffer, the 1024-byte maxMsgSize it reports
 +        # (CTAP 2.2 section 6.4), is ERR_INVALID_LEN before any sequence check; 256 bytes
-+        # still take the continuation packets 0, 1 and 2.
++        # take continuation packets 0 to 3 (57 + 3 * 59 < 256), so the 0, 1 and then 3
++        # sent below skip sequence 2 in the middle of the message.
 +        device.send_raw("\x81\x01\x00")
          device.send_raw("\x00")
-@@ -102,10 +105,15 @@
+@@ -102,10 +106,15 @@
          oldcid = device.cid()
          newcid = "\x11\x22\x33\x44"
 -        device.send_raw("\x81\x10\x00")
@@ -227,7 +228,7 @@ diff --git a/tests/standard/transport/test_hid.py b/tests/standard/transport/tes
          device.set_cid(oldcid)
 +        device.send_data(CTAPHID.INIT, "\x11\x22\x33\x44\x55\x66\x77\x88")
          if check_timeouts:
-@@ -228,12 +236,16 @@
+@@ -228,12 +237,16 @@
      def test_keep_alive(self, device, check_timeouts=False):
 
 +        # getInfo reports built-in user verification without makeCredUvNotRqd, so a
