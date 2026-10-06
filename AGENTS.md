@@ -45,6 +45,16 @@ application runs inside a Ledger wallet, where the operating system owns all thr
     makes NFC unusable. The tap is the selection of the FIDO applet with the application open, as
     no field event reaches the application, and counts for 120 seconds or until NFCCTAP_CONTROL
     ends CTAP. Consent screens and the reset confirmation still show over NFC.
+  - The tap counts for one registration or sign-in. A registration on it takes the default key
+    origin, and several discoverable accounts go to the platform as `numberOfCredentials` with
+    getNextAssertion, as for an authenticator without a display: no screen is answered while the
+    device rests on the phone.
+  - Every registration and sign-in shows its screen, also when the platform's token carries cached
+    user presence, since the user chooses the key origin there and sees which site and account a
+    signature is for; a token's cached presence never replaces that screen.
+  - Every credential needs user verification (`makeCredUvNotRqd` is false): built-in user
+    verification is always present, so a registration without it is refused as CTAP 2.2 §6.1.2
+    step 10 says.
   - Every transport takes the same 1024-byte messages, the CTAP minimum, so getInfo reports one
     `maxMsgSize` whichever transport carries it; the HID buffer is no larger than the NFC one.
 - A new mapping is a decision about the product, not a review fix: it comes with its reason in

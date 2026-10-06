@@ -338,19 +338,21 @@ fn long_names_are_cut_on_a_character_boundary() {
     );
 }
 
-/// A user ID must be 1..=64 bytes (WebAuthn L3 §5.1.3 step 5).
+/// A user ID is at most 64 bytes (WebAuthn L3 §5.4.3): a longer one is refused, and an empty one,
+/// a valid account identifier (CTAP 2.2 §6.1), seals and opens again.
 #[test]
-fn user_ids_outside_one_to_64_bytes_are_refused() {
+fn user_ids_are_at_most_64_bytes_and_may_be_empty() {
     let (mut crypto, keys) = platform();
-    for length in [0, MAX_USER_ID_LEN + 1] {
-        let mut credential = slot_credential();
-        credential.user.as_mut().expect("user").id = vec![0x55; length];
-        assert_eq!(
-            seal(&mut crypto, &keys, RP, &credential),
-            Err(SealError::TooLong),
-            "{length}"
-        );
-    }
+    let mut credential = slot_credential();
+    credential.user.as_mut().expect("user").id = vec![0x55; MAX_USER_ID_LEN + 1];
+    assert_eq!(
+        seal(&mut crypto, &keys, RP, &credential),
+        Err(SealError::TooLong)
+    );
+    credential.user.as_mut().expect("user").id = Vec::new();
+    let id = seal(&mut crypto, &keys, RP, &credential).expect("an empty ID seals");
+    let opened = open(&crypto, &keys, RP, &id).expect("and opens");
+    assert_eq!(opened.user.expect("user").id, Vec::<u8>::new());
 }
 
 /// A slot key belongs to a discoverable credential, whose entry can delete it, and a key under

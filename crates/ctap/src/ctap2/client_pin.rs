@@ -1,8 +1,10 @@
 //! authenticatorClientPIN (CTAP 2.2 §6.5.5): parsing a request into what its execution needs,
 //! and the subcommands.
 
+use alloc::string::String;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use super::credential::shown_rp_id;
 use super::{Authenticator, StatusCode};
 use crate::cbor::{self, Decoder, Encoder, Full, Key};
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
@@ -10,7 +12,7 @@ use crate::pin::{
     ClientPin, Features, MAX_CIPHERTEXT_LEN, Method, PADDED_PIN_LEN, PIN_HASH_LEN, Permissions,
     Protocol, SharedSecret, TOKEN_LEN, new_pin,
 };
-use crate::storage::{MAX_RP_ID_LEN, PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
+use crate::storage::{PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// The getInfo option IDs that decide token permissions. Credential management and
@@ -80,7 +82,7 @@ impl<const N: usize> Drop for Bytes<N> {
 impl<const N: usize> ZeroizeOnDrop for Bytes<N> {}
 
 impl<const N: usize> Bytes<N> {
-    fn new(value: &[u8]) -> Self {
+    pub(super) fn new(value: &[u8]) -> Self {
         let mut bytes = [0u8; N];
         if let Some(target) = bytes.get_mut(..value.len()) {
             target.copy_from_slice(value);
@@ -111,19 +113,12 @@ pub enum PeerKey {
     Unusable,
 }
 
-/// The permissions RP ID (`rpId`): its hash for the token, and its display form.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The permissions RP ID (`rpId`): its hash for the token, and the text the consent screen shows
+/// for it ([`shown_rp_id`]), every character readable and none hiding the rest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RpId {
     hash: [u8; KEY_LEN],
-    shown: [u8; MAX_RP_ID_LEN],
-    shown_len: usize,
-}
-
-impl RpId {
-    fn shown(&self) -> &str {
-        // The display form is cut at UTF-8 boundaries, so it is text.
-        core::str::from_utf8(&self.shown[..self.shown_len]).unwrap_or_default()
-    }
+    shown: String,
 }
 
 /// An authenticatorClientPIN request, owning its members. Not `Copy`: the byte string members
@@ -203,18 +198,9 @@ pub(super) fn parse<C: Crypto>(
                 Key::Int(0x09) => request.permissions = Some(value.unsigned()?),
                 Key::Int(0x0A) => {
                     let rp_id = value.text()?;
-                    let (mut shown, shown_len) = crate::storage::stored_rp_id(rp_id);
-                    // A screen would end the text at a NUL or break the line at a control
-                    // character, hiding the rest of an RP ID the consent is for.
-                    for byte in &mut shown[..shown_len] {
-                        if byte.is_ascii_control() {
-                            *byte = b'?';
-                        }
-                    }
                     request.rp_id = Some(RpId {
                         hash: crypto.sha256(&[rp_id.as_bytes()]),
-                        shown,
-                        shown_len,
+                        shown: shown_rp_id(crypto, rp_id),
                     });
                 }
                 _ => value.skip()?,
@@ -384,7 +370,7 @@ fn decapsulate<C: Crypto>(
 /// The answer to a consent screen: approval goes on; a refusal or no answer is consent not
 /// approved, CTAP2_ERR_OPERATION_DENIED (§6.5.5.7.1 and §6.5.5.7.2 step 7); a request the host
 /// cancelled is CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
-fn consent(answer: Answer) -> Result<(), StatusCode> {
+pub(super) fn consent(answer: Answer) -> Result<(), StatusCode> {
     match answer {
         Answer::Confirmed => Ok(()),
         Answer::Rejected | Answer::TimedOut => Err(StatusCode::OperationDenied),
@@ -451,7 +437,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// the device PIN is validated, none once the client PIN is blocked, since a blocked PIN
     /// disables built-in user verification too (performBuiltInUv step 3), and none on a device
     /// the operating system does not hold unlocked.
-    fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
+    pub(super) fn uv_retries<U: Ui>(&self, ui: &mut U) -> u8 {
         let config = self.store.config();
         if config.pin.is_some() && config.pin_retries == 0 {
             return 0;
@@ -575,7 +561,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: request.rp_id.as_ref().map(RpId::shown),
+                rp_id: request.rp_id.as_ref().map(|rp_id| rp_id.shown.as_str()),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
@@ -588,7 +574,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             now_ms,
             false,
             permissions,
-            request.rp_id.map(|rp_id| rp_id.hash),
+            request.rp_id.as_ref().map(|rp_id| rp_id.hash),
         );
         self.write_token(&secret, encoder)
     }
@@ -622,7 +608,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         consent(ui.confirm(
             Prompt::Token {
                 permissions,
-                rp_id: request.rp_id.as_ref().map(RpId::shown),
+                rp_id: request.rp_id.as_ref().map(|rp_id| rp_id.shown.as_str()),
             },
             USER_ACTION_TIMEOUT_MS,
         ))?;
@@ -638,7 +624,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             now_ms,
             true,
             permissions,
-            request.rp_id.map(|rp_id| rp_id.hash),
+            request.rp_id.as_ref().map(|rp_id| rp_id.hash),
         );
         self.write_token(&secret, encoder)
     }
@@ -756,9 +742,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
 }
 
 /// A response that does not fit the buffer is CTAP1_ERR_OTHER.
-fn write_full<T>(result: Result<T, Full>) -> Result<(), StatusCode> {
+pub(super) fn write_full<T>(result: Result<T, Full>) -> Result<(), StatusCode> {
     result.map(|_| ()).map_err(|Full| StatusCode::Other)
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

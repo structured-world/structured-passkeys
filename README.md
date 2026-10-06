@@ -29,10 +29,17 @@ security key's own mechanics onto the device:
   application opens.
 - **Consent on the screen.** Every token the platform asks for is shown first with what it allows
   and for which site; the person allows or refuses it on the device.
+- **Every registration and sign-in is confirmed on the device.** The screen names the site and the
+  account, also when the platform holds a token with cached presence. A registration offers the
+  key origin, starting on device-only for a discoverable credential with user verification and on
+  the recovery phrase otherwise; a sign-in shows the origin of the key, and with several accounts
+  for a site the person picks one on the device.
 - **The NFC tap is presence.** On Stax, Flex and Nano Gen5, holding the unlocked device with the
   application open to a phone selects the FIDO applet, and that tap counts as user presence for
-  two minutes, so nothing has to be pressed while the device rests on the phone. Consent screens
-  still show over NFC; the phone polls while the person answers on the device.
+  two minutes and one registration or sign-in, so nothing has to be pressed while the device
+  rests on the phone: a registration takes the default key origin, and several accounts go to the
+  phone to choose from. Consent screens still show over NFC; the phone polls while the person
+  answers on the device.
 
 ## Layout
 

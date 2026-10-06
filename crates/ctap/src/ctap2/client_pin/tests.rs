@@ -29,7 +29,7 @@ const INVALID_SUBCOMMAND: u8 = 0x3E;
 const UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 /// A member value of a request.
-enum Value {
+pub(in crate::ctap2) enum Value {
     Uint(u64),
     Bytes(Vec<u8>),
     Text(&'static str),
@@ -38,8 +38,8 @@ enum Value {
 }
 
 /// One item written by `write`, encoded.
-fn encoded(write: impl FnOnce(&mut Encoder<'_>)) -> Vec<u8> {
-    let mut buffer = [0u8; 512];
+pub(in crate::ctap2) fn encoded(write: impl FnOnce(&mut Encoder<'_>)) -> Vec<u8> {
+    let mut buffer = [0u8; 1024];
     let mut encoder = Encoder::new(&mut buffer);
     write(&mut encoder);
     encoder.as_bytes().to_vec()
@@ -47,7 +47,12 @@ fn encoded(write: impl FnOnce(&mut Encoder<'_>)) -> Vec<u8> {
 
 /// An authenticatorClientPIN request with `members`, given in canonical key order.
 fn request(members: &[(u64, Value)]) -> Vec<u8> {
-    let mut message = vec![0x06];
+    command(0x06, members)
+}
+
+/// A request of command `code` with `members`, given in canonical key order.
+pub(in crate::ctap2) fn command(code: u8, members: &[(u64, Value)]) -> Vec<u8> {
+    let mut message = vec![code];
     message.extend(encoded(|encoder| {
         encoder.map(members.len()).expect("room");
     }));
@@ -71,23 +76,27 @@ fn request(members: &[(u64, Value)]) -> Vec<u8> {
     message
 }
 
-fn run(authenticator: &mut TestAuthenticator, ui: &mut Scripted, request: &[u8]) -> Vec<u8> {
-    let mut response = [0u8; 512];
+pub(in crate::ctap2) fn run(
+    authenticator: &mut TestAuthenticator,
+    ui: &mut Scripted,
+    request: &[u8],
+) -> Vec<u8> {
+    let mut response = [0u8; 1024];
     let length = authenticator.process(request, Link::Usb, ui, &mut response);
     response[..length].to_vec()
 }
 
 /// The response map's members: COSE key points, byte strings, integers and booleans by key.
 #[derive(Debug, Default)]
-struct Response {
+pub(in crate::ctap2) struct Response {
     key_agreement: Option<[u8; 65]>,
-    token: Option<Vec<u8>>,
+    pub(in crate::ctap2) token: Option<Vec<u8>>,
     pin_retries: Option<u64>,
     power_cycle: Option<bool>,
     uv_retries: Option<u64>,
 }
 
-fn parse_response(body: &[u8]) -> Response {
+pub(in crate::ctap2) fn parse_response(body: &[u8]) -> Response {
     let mut decoder = Decoder::new(body);
     let response = decoder
         .map(|entries| {
@@ -125,7 +134,7 @@ fn parse_response(body: &[u8]) -> Response {
     response
 }
 
-fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+pub(in crate::ctap2) fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("any key length");
     for part in parts {
         mac.update(part);
@@ -169,7 +178,7 @@ fn cbc(key: &[u8; 32], iv: &[u8; 16], data: &[u8], encrypt: bool) -> Vec<u8> {
 
 /// The platform's half of one key agreement (§6.5.5.4): its key as a COSE_Key and the shared
 /// secret's two keys.
-struct Session {
+pub(in crate::ctap2) struct Session {
     protocol: Protocol,
     cose_key: Vec<u8>,
     hmac_key: [u8; 32],
@@ -233,7 +242,7 @@ impl Session {
         }
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> Vec<u8> {
+    pub(in crate::ctap2) fn decrypt(&self, ciphertext: &[u8]) -> Vec<u8> {
         match self.protocol {
             Protocol::One => cbc(&self.aes_key, &[0; 16], ciphertext, false),
             Protocol::Two => {
@@ -243,7 +252,7 @@ impl Session {
         }
     }
 
-    fn authenticate(&self, parts: &[&[u8]]) -> Vec<u8> {
+    pub(in crate::ctap2) fn authenticate(&self, parts: &[&[u8]]) -> Vec<u8> {
         let mac = hmac(&self.hmac_key, parts);
         mac[..self.protocol.signature_len()].to_vec()
     }
@@ -264,7 +273,11 @@ fn pin_hash(pin: &[u8]) -> Vec<u8> {
 }
 
 /// setPIN with `pin` over a fresh key agreement; returns the status.
-fn set_pin(authenticator: &mut TestAuthenticator, protocol: Protocol, pin: &[u8]) -> u8 {
+pub(in crate::ctap2) fn set_pin(
+    authenticator: &mut TestAuthenticator,
+    protocol: Protocol,
+    pin: &[u8],
+) -> u8 {
     let session = Session::start(authenticator, protocol);
     let new_pin_enc = session.encrypt(&padded(pin));
     let param = session.authenticate(&[&new_pin_enc]);
@@ -286,13 +299,13 @@ fn set_pin(authenticator: &mut TestAuthenticator, protocol: Protocol, pin: &[u8]
 
 /// getPinToken (0x05) or getPinUvAuthTokenUsingPinWithPermissions (0x09) with `pin`, for a user
 /// who gives `ui`'s answers; returns the response and the session.
-fn pin_token(
+pub(in crate::ctap2) fn pin_token(
     authenticator: &mut TestAuthenticator,
     ui: &mut Scripted,
     protocol: Protocol,
     pin: &[u8],
     permissions: Option<u64>,
-    rp_id: Option<&'static str>,
+    rp_id: Option<&str>,
 ) -> (Vec<u8>, Session) {
     let session = Session::start(authenticator, protocol);
     let mut members = vec![
@@ -308,7 +321,10 @@ fn pin_token(
         members.push((0x09, Value::Uint(permissions)));
     }
     if let Some(rp_id) = rp_id {
-        members.push((0x0A, Value::Text(rp_id)));
+        let text = encoded(|encoder| {
+            encoder.text(rp_id).expect("room");
+        });
+        members.push((0x0A, Value::Raw(text)));
     }
     let response = run(authenticator, ui, &request(&members));
     (response, session)
@@ -945,8 +961,8 @@ fn a_pin_token_with_permissions_is_bound_to_its_rp() {
 }
 
 /// The consent screen shows the whole RP ID: a control character, which would end the text at a
-/// NUL or push the rest away at a line break, is shown as `?`. The token stays bound to the RP ID
-/// as sent.
+/// NUL or push the rest away at a line break, is shown as its code point in hex between `<` and
+/// `>`. The token stays bound to the RP ID as sent.
 #[test]
 fn control_characters_in_the_rp_id_are_shown() {
     let mut authenticator = authenticator();
@@ -966,7 +982,7 @@ fn control_characters_in_the_rp_id_are_shown() {
         [(
             Asked::Token {
                 permissions: 0x02,
-                rp_id: Some("example.com??.evil.test".into())
+                rp_id: Some("example.com<0><A>.evil.test".into())
             },
             USER_ACTION_TIMEOUT_MS
         )]
@@ -975,6 +991,24 @@ fn control_characters_in_the_rp_id_are_shown() {
         .crypto
         .sha256(&[b"example.com\x00\n.evil.test"]);
     assert!(authenticator.client_pin.permits_rp_id(&sent));
+
+    // A domain longer than the 64 bytes kept for it is still shown whole.
+    let domain = format!("{}example.com", "a.".repeat(121));
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let (response, _) = pin_token(
+        &mut authenticator,
+        &mut ui,
+        Protocol::Two,
+        b"1234",
+        Some(0x02),
+        Some(&domain),
+    );
+    assert_eq!(response[0], OK);
+    assert!(
+        matches!(&ui.asked[..], [(Asked::Token { rp_id: Some(shown), .. }, _)] if *shown == domain),
+        "{:?}",
+        ui.asked
+    );
 }
 
 /// A token the platform does not use within the initial usage time limit stops verifying
@@ -1069,7 +1103,7 @@ fn change_pin_replaces_the_pin_and_its_tokens() {
 }
 
 /// getPinUvAuthTokenUsingUvWithPermissions with `ui` for `permissions` and `rp_id`.
-fn uv_token(
+pub(in crate::ctap2) fn uv_token(
     authenticator: &mut TestAuthenticator,
     ui: &mut Scripted,
     permissions: Option<u64>,

@@ -46,6 +46,26 @@ const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
 /// Longest credential ID, reported as `maxCredentialIdLength`.
 pub const MAX_CREDENTIAL_ID_LEN: usize = 1 + NONCE_LEN + MAX_PLAINTEXT_LEN + TAG_LEN;
 
+/// The origin of a credential's key, which the user chooses at registration: what the recovery
+/// phrase can reproduce, and so what the backup flags report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// From the device's TRNG, kept only in this device's NVM: not reproducible from the
+    /// recovery phrase, gone with an application update or uninstall.
+    DeviceOnly,
+    /// Derived from the device seed: reproducible from the recovery phrase.
+    SeedRecoverable,
+}
+
+impl Origin {
+    /// Whether the credential is backup eligible and backed up, the BE and BS flags (WebAuthn L3
+    /// §6.1, "Credential Backup State"): the recovery phrase is a backup of a seed-recoverable
+    /// key by construction, and nothing can back up a device-only one.
+    pub const fn backed_up(self) -> bool {
+        matches!(self, Origin::SeedRecoverable)
+    }
+}
+
 /// Where the private key of a credential comes from. Its `Debug` output never prints the
 /// credential seed.
 #[derive(Clone, PartialEq, Eq)]
@@ -76,6 +96,16 @@ impl fmt::Debug for KeySource {
                 .field("index", index)
                 .field("tag", tag)
                 .finish(),
+        }
+    }
+}
+
+impl KeySource {
+    /// The origin of a key from this source.
+    pub const fn origin(&self) -> Origin {
+        match self {
+            KeySource::Seed(_) => Origin::SeedRecoverable,
+            KeySource::Device(_) | KeySource::Slot { .. } => Origin::DeviceOnly,
         }
     }
 }
@@ -254,7 +284,7 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
 ///
 /// # Errors
 ///
-/// [`SealError::TooLong`] for a user ID outside 1..=64 bytes, [`SealError::KeySource`] for a
+/// [`SealError::TooLong`] for a user ID over 64 bytes, [`SealError::KeySource`] for a
 /// key source that does not fit the credential's discoverability.
 pub fn seal<C: Crypto>(
     crypto: &mut C,
@@ -267,8 +297,8 @@ pub fn seal<C: Crypto>(
     }
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
-        // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
-        if user.id.is_empty() || user.id.len() > MAX_USER_ID_LEN {
+        // A user ID is at most 64 bytes (WebAuthn L3 §5.4.3) and may be empty (CTAP 2.2 §6.1).
+        if user.id.len() > MAX_USER_ID_LEN {
             return Err(SealError::TooLong);
         }
         for name in [&mut user.name, &mut user.display_name]
@@ -444,8 +474,8 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
                 return Err(NOT_A_CREDENTIAL);
             }
             let id = entries.value().bytes()?.to_vec();
-            // WebAuthn L3 §5.1.3 step 5: a user ID is 1..=64 bytes.
-            if id.is_empty() || id.len() > MAX_USER_ID_LEN {
+            // A user ID is at most 64 bytes (WebAuthn L3 §5.4.3) and may be empty (CTAP 2.2 §6.1).
+            if id.len() > MAX_USER_ID_LEN {
                 return Err(NOT_A_CREDENTIAL);
             }
             next = next_int_key(entries)?;

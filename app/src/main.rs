@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod crypto;
 mod hid;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
@@ -117,6 +119,9 @@ extern "C" fn sample_main(_arg0: u32) {
             CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
             CommandOrEvent::Event(_) => {}
         }
+        if ui::home_due() {
+            home.show_and_return();
+        }
         // Parsed while the transport holds the request; run once it is released, so the screen
         // of a waiting command can take events.
         if let Some(command) = hid::take_request(|request| authenticator.parse(request)) {
@@ -167,8 +172,8 @@ where
     C: structured_passkeys_ctap::crypto::Crypto,
     S: structured_passkeys_ctap::storage::Storage,
 {
-    match nfc.tap_ms() {
-        Some(tap_ms) => authenticator.nfc_tap(tap_ms),
+    match nfc.tap() {
+        Some(tap) => authenticator.nfc_tap(tap),
         None => authenticator.nfc_ended(),
     }
 }
