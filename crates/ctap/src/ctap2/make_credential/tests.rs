@@ -18,6 +18,7 @@ use crate::ui::{Answer, MAX_SHOWN_LEN, USER_ACTION_TIMEOUT_MS};
 
 pub(in crate::ctap2) const OK: u8 = 0x00;
 const INVALID_PARAMETER: u8 = 0x02;
+const CBOR_UNEXPECTED_TYPE: u8 = 0x11;
 const MISSING_PARAMETER: u8 = 0x14;
 const CREDENTIAL_EXCLUDED: u8 = 0x19;
 const UNSUPPORTED_ALGORITHM: u8 = 0x26;
@@ -443,6 +444,39 @@ fn invalid_parameters_ask_nothing() {
         [INVALID_PARAMETER]
     );
     assert_eq!(ui.asked, []);
+}
+
+/// A known member of `rp` with the wrong type ends the request (CTAP 2.2 §6.1.2 step 3.1.2: "If
+/// the values of any known members have the wrong type then return an error"): an integer `name`
+/// is CTAP2_ERR_CBOR_UNEXPECTED_TYPE before any screen. `icon`, which authenticators "MUST NOT
+/// error" on (§6.1, rp), is ignored whatever its type.
+#[test]
+fn rp_members_are_type_checked() {
+    let rp_with = |key: &str, value: i64| {
+        Value::Raw(encoded(|encoder| {
+            encoder
+                .map(2)
+                .and_then(|encoder| encoder.text("id"))
+                .and_then(|encoder| encoder.text(RP_ID))
+                .and_then(|encoder| encoder.text(key))
+                .and_then(|encoder| encoder.int(value))
+                .expect("room");
+        }))
+    };
+    let mut authenticator = authenticator();
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut members = registration(RP_ID, b"user-1", &[("uv", true)]);
+    members[1].1 = rp_with("name", 8);
+    assert_eq!(
+        run(&mut authenticator, &mut ui, &command(0x01, &members)),
+        [CBOR_UNEXPECTED_TYPE]
+    );
+    assert_eq!(ui.asked, []);
+    members[1].1 = rp_with("icon", 8);
+    assert_eq!(
+        run(&mut authenticator, &mut ui, &command(0x01, &members))[0],
+        OK
+    );
 }
 
 /// An empty user handle is a valid account identifier (CTAP 2.2 §6.1, user: "while an empty

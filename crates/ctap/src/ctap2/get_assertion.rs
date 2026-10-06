@@ -92,7 +92,9 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
     Ok(GetAssertionRequest {
         rp_id: String::from(rp_id),
         client_data_hash,
-        allow_list,
+        // §6.2.2 takes credentials from the list only "If the allowList parameter is present and
+        // non-empty"; an empty one finds the discoverable credentials, as an absent one does.
+        allow_list: allow_list.filter(|list| !list.is_empty()),
         options: request_options,
         pin_uv_auth_param,
         pin_uv_auth_protocol,

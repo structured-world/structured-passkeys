@@ -426,12 +426,17 @@ struct Choices<'a> {
 mod page {
     use ledger_device_sdk::sys::nbgl_font_id_e;
     #[cfg(target_os = "stax")]
-    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_32px, BAGL_FONT_INTER_REGULAR_24px};
+    use ledger_device_sdk::sys::{
+        BAGL_FONT_INTER_MEDIUM_32px, BAGL_FONT_INTER_REGULAR_24px, BAGL_FONT_INTER_SEMIBOLD_24px,
+    };
     #[cfg(target_os = "flex")]
-    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_36px, BAGL_FONT_INTER_REGULAR_28px};
+    use ledger_device_sdk::sys::{
+        BAGL_FONT_INTER_MEDIUM_36px, BAGL_FONT_INTER_REGULAR_28px, BAGL_FONT_INTER_SEMIBOLD_28px,
+    };
     #[cfg(target_os = "apex_p")]
     use ledger_device_sdk::sys::{
-        BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp, BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp,
+        BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp, BAGL_FONT_NANOTEXT_BOLD_18px_1bpp,
+        BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp,
     };
 
     #[cfg(target_os = "stax")]
@@ -450,6 +455,10 @@ mod page {
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_32px;
         /// `SMALL_REGULAR_FONT`, the details.
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_24px;
+        /// `FOOTER_TEXT_AND_NAV_WIDTH`: the reject text left of a review's page navigation.
+        pub const FOOTER_TEXT_WIDTH: u16 = 160;
+        /// `SMALL_BOLD_FONT`, the reject text of a review.
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_INTER_SEMIBOLD_24px;
     }
 
     #[cfg(target_os = "flex")]
@@ -464,6 +473,8 @@ mod page {
         pub const TITLE_DESC_MARGIN: u16 = 16;
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_36px;
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_28px;
+        pub const FOOTER_TEXT_WIDTH: u16 = 192;
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_INTER_SEMIBOLD_28px;
     }
 
     #[cfg(target_os = "apex_p")]
@@ -478,6 +489,8 @@ mod page {
         pub const TITLE_DESC_MARGIN: u16 = 12;
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp;
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp;
+        pub const FOOTER_TEXT_WIDTH: u16 = 120;
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_NANOTEXT_BOLD_18px_1bpp;
     }
 
     pub use model::*;
@@ -617,6 +630,47 @@ fn review_pages(choices: &Choices<'_>) -> Vec<u8> {
         }
     }
     pages
+}
+
+/// `reject` with its lines broken at spaces to fit the text left of a review's page navigation:
+/// that text area breaks a line wherever it runs out of width, inside a word too, since
+/// `nbgl_layoutAddExtendedFooter` (`FOOTER_TEXT_AND_NAV`) leaves its `wrapping` unset.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+fn footer_text(reject: &CStr) -> Vec<u8> {
+    let mut text = Vec::with_capacity(reject.count_bytes() + 1);
+    let mut rest = reject.to_bytes_with_nul();
+    while rest.first().is_some_and(|&byte| byte != 0) {
+        let mut fitting = 0u16;
+        // SAFETY: `rest` is NUL-terminated, the end of `reject`; the call writes only `fitting`.
+        unsafe {
+            nbgl_getTextMaxLenInNbLines(
+                page::FOOTER_FONT,
+                rest.as_ptr().cast(),
+                page::FOOTER_TEXT_WIDTH,
+                1,
+                &mut fitting,
+                true,
+            );
+        }
+        // Without its NUL; at least one byte, so the lines always move on.
+        let available = rest.len() - 1;
+        let take = usize::from(fitting).clamp(1, available);
+        let line = &rest[..take];
+        let end = line
+            .iter()
+            .rposition(|&byte| byte != b' ')
+            .map_or(0, |last| last + 1);
+        if !text.is_empty() {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(&line[..end]);
+        rest = &rest[take..];
+        while rest.first() == Some(&b' ') {
+            rest = &rest[1..];
+        }
+    }
+    text.push(0);
+    text
 }
 
 /// The screens of a waiting ceremony, drawn over the home screen and replaced by it again when
@@ -805,10 +859,11 @@ impl<'a> DeviceUi<'a> {
                  fewer than 255 pages",
             ),
         };
-        // SAFETY: the contents, their texts and `icon` live in this frame or in the caller's
-        // until the wait below ends the review; NBGL copies `generic` itself.
+        let reject = footer_text(choices.reject);
+        // SAFETY: the contents, their texts, `reject` and `icon` live in this frame or in the
+        // caller's until the wait below ends the review; NBGL copies `generic` itself.
         unsafe {
-            nbgl_useCaseGenericReview(&generic, choices.reject.as_ptr(), Some(review_rejected));
+            nbgl_useCaseGenericReview(&generic, reject.as_ptr().cast(), Some(review_rejected));
         }
         self.wait(deadline_ms)
     }

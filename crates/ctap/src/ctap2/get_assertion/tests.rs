@@ -516,6 +516,23 @@ fn a_command_without_room_still_ends_the_continuation() {
     assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
 }
 
+/// An empty allowList is treated as an absent one: §6.2.2 locates credentials from the list only
+/// "If the allowList parameter is present and non-empty", and otherwise from the discoverable
+/// credentials of the RP, which then sign.
+#[test]
+fn an_empty_allow_list_finds_discoverable_credentials() {
+    let mut authenticator = authenticator();
+    let made = register(&mut authenticator, RP_ID, b"user-1", true, None);
+    let (response, _) = assert_with(
+        &mut authenticator,
+        &assertion(Some(&[]), &[]),
+        Answer::Confirmed,
+        0,
+    );
+    assert_eq!(response[0], OK);
+    assert!(asserted(&response[1..]).signed_by(&made));
+}
+
 /// Nothing to sign with is CTAP2_ERR_NO_CREDENTIALS: an RP without credentials, an allowList of
 /// IDs this device did not create or created for another RP. A platform never sends `rk`, which
 /// is CTAP2_ERR_UNSUPPORTED_OPTION (§6.2.2 step 5.4).
