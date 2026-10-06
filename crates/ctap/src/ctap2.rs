@@ -617,7 +617,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let pin_set = self.store.config().pin.is_some();
         encoder
             .map(7)?
-            // versions (0x01), required.
+            // versions (0x01), required. Requests are processed by the CTAP 2.2 rules whatever
+            // versions are listed: "FIDO_2_0" names the CTAP 2.0 command set (§6.4), and where
+            // CTAP 2.2 changed a 2.0 rule (`up` in makeCredential, a zero-length pinUvAuthParam)
+            // it did so for requests a CTAP 2.0 platform never sends, as other CTAP 2.1
+            // authenticators that list "FIDO_2_0" do.
             .unsigned(0x01)?
             .array(1)?
             .text("FIDO_2_0")?
