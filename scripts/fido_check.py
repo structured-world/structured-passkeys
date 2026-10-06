@@ -17,7 +17,8 @@ every transport); getInfo parses with strict CBOR checks and reports the applica
 
 authenticatorSelection (CTAP 2.2 §6.9), a request waiting for the user: while it waits, keepalives
 with status UPNEEDED arrive about every 100 ms (§11.2.9.1.7); CTAPHID_CANCEL ends it with
-CTAP2_ERR_KEEPALIVE_CANCEL; no answer ends it with CTAP2_ERR_USER_ACTION_TIMEOUT after 30 seconds;
+CTAP2_ERR_KEEPALIVE_CANCEL; no answer ends it with CTAP2_ERR_USER_ACTION_TIMEOUT after 30 seconds
+without input, and in Speculos an input that answers nothing restarts those 30 seconds;
 confirming answers CTAP2_OK and refusing CTAP2_ERR_OPERATION_DENIED. In Speculos the script
 answers the screen itself through the Speculos API and compares the selection screen with the
 snapshot of the model in `--snapshots` (`--golden` writes it instead); on a device it asks the
@@ -417,6 +418,32 @@ def check_selection_unanswered(device: CtapHidDevice, keepalives: KeepaliveLog) 
         status == CtapError.ERR.USER_ACTION_TIMEOUT
         and USER_ACTION_TIMEOUT_S <= waited <= USER_ACTION_TIMEOUT_S + TIMEOUT_SLACK_S,
         f"selection: no answer times out after {waited:.1f} s ({status!r})",
+    )
+
+
+def check_input_restarts_timeout(device: CtapHidDevice, user: SpeculosUser) -> None:
+    """authenticatorSelection with an input that answers nothing two thirds into the timeout (a
+    page turn on a Nano, a touch outside the buttons elsewhere): the timeout runs again from the
+    input, so the request ends a full timeout after it, not after the first."""
+    ctap = Ctap2(device)
+    input_at = USER_ACTION_TIMEOUT_S * 2 / 3
+
+    def touch() -> None:
+        if user.nano:
+            api("/button/right", {"action": "press-and-release"})
+        else:
+            api("/finger", {"action": "press-and-release", "x": 4, "y": 4})
+
+    threading.Timer(input_at, touch).start()
+    started = time.monotonic()
+    status = selection(ctap)
+    waited = time.monotonic() - started
+    expected = input_at + USER_ACTION_TIMEOUT_S
+    check(
+        status == CtapError.ERR.USER_ACTION_TIMEOUT
+        and expected <= waited <= expected + TIMEOUT_SLACK_S,
+        f"selection: an input at {input_at:.0f} s restarts the timeout, which ends it after "
+        f"{waited:.1f} s ({status!r})",
     )
 
 
@@ -907,6 +934,7 @@ def main() -> None:
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
     check_selection_unanswered(device, keepalives)
     if args.speculos:
+        check_input_restarts_timeout(device, user)
         # The selection timeout alone outlasts the reset window.
         check_reset_window_closed(device)
     device.close()

@@ -26,11 +26,13 @@ pub const RP_ID_FINGERPRINT_LEN: usize = 2 + 16;
 /// the fingerprint, so RP IDs that keep the same form never look alike.
 pub const MAX_SHOWN_RP_ID_LEN: usize = MAX_SHOWN_LEN + RP_ID_FINGERPRINT_LEN;
 
-/// How long a ceremony waits for the user before the request ends with
-/// CTAP2_ERR_USER_ACTION_TIMEOUT. CTAP 2.2 ("User action timeout", Terminology) leaves the value
-/// to the authenticator, at least 10 seconds, and calls thirty seconds reasonable: long enough to
-/// read the screen, find the device and answer, short enough that a request nobody answers frees
-/// the device for the next one.
+/// How long a ceremony waits without user input before the request ends with
+/// CTAP2_ERR_USER_ACTION_TIMEOUT; each button press or touch restarts it. CTAP 2.2 ("User action
+/// timeout", Terminology) leaves the value to the authenticator, at least 10 seconds, and calls
+/// thirty seconds reasonable: long enough to read the screen, find the device and answer, short
+/// enough that a request nobody answers frees the device for the next one. A wait for the user's
+/// action, not for the whole ceremony: a user paging through long details or many accounts keeps
+/// acting.
 pub const USER_ACTION_TIMEOUT_MS: u32 = 30_000;
 
 /// A user account as the screens show it: the names the relying party gave, as received after
@@ -125,12 +127,13 @@ pub enum Choice<T> {
     Rejected,
     /// The platform cancelled the request.
     Cancelled,
-    /// Nobody answered within the timeout.
+    /// The timeout passed without user input.
     TimedOut,
 }
 
 /// The device's screens and clock. Screen calls block until the user answers, the platform
-/// cancels, or the timeout passes.
+/// cancels, or `timeout_ms` passes without user input: every button press or touch on the device
+/// restarts it, across all the screens of one call.
 pub trait Ui {
     /// Asks the user to confirm `prompt` within `timeout_ms`.
     fn confirm(&mut self, prompt: Prompt<'_>, timeout_ms: u32) -> Answer;
