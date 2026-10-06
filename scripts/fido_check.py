@@ -434,8 +434,10 @@ def check_input_restarts_timeout(device: CtapHidDevice, user: SpeculosUser) -> N
         else:
             api("/finger", {"action": "press-and-release", "x": 4, "y": 4})
 
-    threading.Timer(input_at, touch).start()
+    # The origin is taken before the timer starts, so the input never lands earlier than
+    # `input_at` after it and the lower bound below holds.
     started = time.monotonic()
+    threading.Timer(input_at, touch).start()
     status = selection(ctap)
     waited = time.monotonic() - started
     expected = input_at + USER_ACTION_TIMEOUT_S

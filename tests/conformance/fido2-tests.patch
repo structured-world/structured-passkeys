@@ -126,7 +126,7 @@ diff --git a/tests/standard/fido2/pin/test_pin.py b/tests/standard/fido2/pin/tes
 diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/test_resident_key.py
 --- a/tests/standard/fido2/test_resident_key.py
 +++ b/tests/standard/fido2/test_resident_key.py
-@@ -106,5 +106,9 @@
+@@ -106,5 +106,12 @@
          assert MC_RK_Res.request.user["id"] == GA_RK_Res.user["id"]
 -        if not MC_RK_Res.request.pin_protocol or not GA_RK_Res.number_of_credentials:
 +        if not (MC_RK_Res.request.pin_protocol or MC_RK_Res.request.pin):
@@ -135,10 +135,13 @@ diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/te
 -            assert MC_RK_Res.request.user == GA_RK_Res.user
 +            # CTAP 2.2 section 6.2.2 step 15.3: the response carries the credential's user
 +            # entity, its names withheld only without user verification; WebAuthn removed icon.
++            assert all(
++                key in GA_RK_Res.user for key in MC_RK_Res.request.user if key != "icon"
++            )
 +            for key, value in GA_RK_Res.user.items():
 +                assert MC_RK_Res.request.user[key] == value
 
-@@ -181,5 +185,9 @@
+@@ -181,5 +188,9 @@
          """
          Test replacing resident keys.
          """
@@ -146,7 +149,7 @@ diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/te
 +        # CTAP2_ERR_PUAT_REQUIRED (CTAP 2.2 section 6.1.2): the test starts on a reset device.
 +        device.reset()
          user1 = generate_user()
-@@ -336,14 +336,23 @@
+@@ -336,14 +347,23 @@
          """
 -        RK_CAPACITY = 16
          device.reset()
@@ -176,7 +179,7 @@ diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/te
 -        assert e.value.code == CtapError.ERR.KEY_STORE_FULL
 -
          for i, reg in enumerate(reversed(regs)):
-@@ -399,6 +408,9 @@
+@@ -399,6 +419,9 @@
          # Should overwrite the first credential.
          mc_res2 = resetDevice.sendMC(*req.toMC())
 

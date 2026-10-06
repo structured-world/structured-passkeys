@@ -148,7 +148,10 @@ class SpeculosHid(fido2._pyu2f.base.HidDevice):
     """Speculos' U2F transport: 64-byte HID reports, each behind a 4-byte length."""
 
     def __init__(self):
-        self.sock = socket.create_connection(("127.0.0.1", 9999))
+        # A read that waits 30 seconds for nothing means Speculos stalled: while a request waits
+        # for the user the application sends a keepalive every 100 ms. The bound also covers
+        # the reads at collection time, where the per-test timeout does not run.
+        self.sock = socket.create_connection(("127.0.0.1", 9999), timeout=30)
 
     def GetInReportDataLength(self):
         return 64
