@@ -8,7 +8,8 @@
 //!
 //! Every screen is one `nbgl_useCaseChoice`, which looks the same on all five devices; a ceremony
 //! that needs more than two answers (the key origin at registration, the account to sign in with)
-//! is a short chain of them within one timeout. A question too long for its page (a long RP ID or
+//! is a short chain of them under one user action timeout, which every button press or touch
+//! restarts. A question too long for its page (a long RP ID or
 //! long names) is never cut: a Nano, which pages the details of a choice but shortens its
 //! question, gets the short question with the long one moved into the details; on a touch model a
 //! choice page does not scroll, so the question is asked as a paginated review instead. Each screen carries the system icon Ledger's own
@@ -426,12 +427,17 @@ struct Choices<'a> {
 mod page {
     use ledger_device_sdk::sys::nbgl_font_id_e;
     #[cfg(target_os = "stax")]
-    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_32px, BAGL_FONT_INTER_REGULAR_24px};
+    use ledger_device_sdk::sys::{
+        BAGL_FONT_INTER_MEDIUM_32px, BAGL_FONT_INTER_REGULAR_24px, BAGL_FONT_INTER_SEMIBOLD_24px,
+    };
     #[cfg(target_os = "flex")]
-    use ledger_device_sdk::sys::{BAGL_FONT_INTER_MEDIUM_36px, BAGL_FONT_INTER_REGULAR_28px};
+    use ledger_device_sdk::sys::{
+        BAGL_FONT_INTER_MEDIUM_36px, BAGL_FONT_INTER_REGULAR_28px, BAGL_FONT_INTER_SEMIBOLD_28px,
+    };
     #[cfg(target_os = "apex_p")]
     use ledger_device_sdk::sys::{
-        BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp, BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp,
+        BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp, BAGL_FONT_NANOTEXT_BOLD_18px_1bpp,
+        BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp,
     };
 
     #[cfg(target_os = "stax")]
@@ -450,6 +456,10 @@ mod page {
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_32px;
         /// `SMALL_REGULAR_FONT`, the details.
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_24px;
+        /// `FOOTER_TEXT_AND_NAV_WIDTH`: the reject text left of a review's page navigation.
+        pub const FOOTER_TEXT_WIDTH: u16 = 160;
+        /// `SMALL_BOLD_FONT`, the reject text of a review.
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_INTER_SEMIBOLD_24px;
     }
 
     #[cfg(target_os = "flex")]
@@ -464,6 +474,8 @@ mod page {
         pub const TITLE_DESC_MARGIN: u16 = 16;
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_INTER_MEDIUM_36px;
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_INTER_REGULAR_28px;
+        pub const FOOTER_TEXT_WIDTH: u16 = 192;
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_INTER_SEMIBOLD_28px;
     }
 
     #[cfg(target_os = "apex_p")]
@@ -478,6 +490,8 @@ mod page {
         pub const TITLE_DESC_MARGIN: u16 = 12;
         pub const TITLE_FONT: nbgl_font_id_e = BAGL_FONT_NANODISPLAY_SEMIBOLD_24px_1bpp;
         pub const TEXT_FONT: nbgl_font_id_e = BAGL_FONT_NANOTEXT_MEDIUM_18px_1bpp;
+        pub const FOOTER_TEXT_WIDTH: u16 = 120;
+        pub const FOOTER_FONT: nbgl_font_id_e = BAGL_FONT_NANOTEXT_BOLD_18px_1bpp;
     }
 
     pub use model::*;
@@ -619,6 +633,47 @@ fn review_pages(choices: &Choices<'_>) -> Vec<u8> {
     pages
 }
 
+/// `reject` with its lines broken at spaces to fit the text left of a review's page navigation:
+/// that text area breaks a line wherever it runs out of width, inside a word too, since
+/// `nbgl_layoutAddExtendedFooter` (`FOOTER_TEXT_AND_NAV`) leaves its `wrapping` unset.
+#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+fn footer_text(reject: &CStr) -> Vec<u8> {
+    let mut text = Vec::with_capacity(reject.count_bytes() + 1);
+    let mut rest = reject.to_bytes_with_nul();
+    while rest.first().is_some_and(|&byte| byte != 0) {
+        let mut fitting = 0u16;
+        // SAFETY: `rest` is NUL-terminated, the end of `reject`; the call writes only `fitting`.
+        unsafe {
+            nbgl_getTextMaxLenInNbLines(
+                page::FOOTER_FONT,
+                rest.as_ptr().cast(),
+                page::FOOTER_TEXT_WIDTH,
+                1,
+                &mut fitting,
+                true,
+            );
+        }
+        // Without its NUL; at least one byte, so the lines always move on.
+        let available = rest.len() - 1;
+        let take = usize::from(fitting).clamp(1, available);
+        let line = &rest[..take];
+        let end = line
+            .iter()
+            .rposition(|&byte| byte != b' ')
+            .map_or(0, |last| last + 1);
+        if !text.is_empty() {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(&line[..end]);
+        rest = &rest[take..];
+        while rest.first() == Some(&b' ') {
+            rest = &rest[1..];
+        }
+    }
+    text.push(0);
+    text
+}
+
 /// The screens of a waiting ceremony, drawn over the home screen and replaced by it again when
 /// the ceremony ends.
 pub struct DeviceUi<'a> {
@@ -675,12 +730,10 @@ impl<'a> DeviceUi<'a> {
         }
     }
 
-    /// Starts a ceremony that may take `timeout_ms`: the returned deadline bounds every screen of
-    /// the ceremony together.
-    fn begin(&mut self, timeout_ms: u32) -> u64 {
-        hid::now_ms()
-            .checked_add(u64::from(timeout_ms))
-            .expect("a u64 millisecond clock outlives the device")
+    /// Starts a ceremony whose screens wait `timeout_ms` for user input: the returned deadline
+    /// spans every screen of the ceremony and restarts with each button press or touch.
+    fn begin(&mut self, timeout_ms: u32) -> Deadline {
+        Deadline::new(timeout_ms)
     }
 
     /// Ends a ceremony with the home screen or a status page, which the main loop replaces with
@@ -708,7 +761,7 @@ impl<'a> DeviceUi<'a> {
     /// Shows one choice screen, with the transport saying that the user is needed, and takes
     /// events until it is answered, the request ends or the deadline passes. On a touch model a
     /// choice whose text does not fit one page becomes a paginated review of the same question.
-    fn choose(&mut self, choices: &Choices<'_>, deadline_ms: u64) -> Answer {
+    fn choose(&mut self, choices: &Choices<'_>, deadline: &mut Deadline) -> Answer {
         OUTCOME.store(PENDING, Ordering::Relaxed);
         let icon: nbgl_icon_details_t = match choices.icon {
             Icon::App => self.glyph.into(),
@@ -724,7 +777,7 @@ impl<'a> DeviceUi<'a> {
         };
         #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
         if !fits_one_page(&icon, choices) {
-            return self.review(&icon, choices, deadline_ms);
+            return self.review(&icon, choices, deadline);
         }
         #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
         let (message, sub_message) = (choices.message, choices.sub_message);
@@ -754,7 +807,7 @@ impl<'a> DeviceUi<'a> {
                 Some(choice_callback),
             );
         }
-        self.wait(deadline_ms)
+        self.wait(deadline)
     }
 
     /// Asks the question of `choices` as a review: pages with its whole text, then a last page
@@ -765,7 +818,7 @@ impl<'a> DeviceUi<'a> {
         &mut self,
         icon: &nbgl_icon_details_t,
         choices: &Choices<'_>,
-        deadline_ms: u64,
+        deadline: &mut Deadline,
     ) -> Answer {
         let pages = review_pages(choices);
         let mut contents: Vec<nbgl_content_t> = pages
@@ -805,17 +858,18 @@ impl<'a> DeviceUi<'a> {
                  fewer than 255 pages",
             ),
         };
-        // SAFETY: the contents, their texts and `icon` live in this frame or in the caller's
-        // until the wait below ends the review; NBGL copies `generic` itself.
+        let reject = footer_text(choices.reject);
+        // SAFETY: the contents, their texts, `reject` and `icon` live in this frame or in the
+        // caller's until the wait below ends the review; NBGL copies `generic` itself.
         unsafe {
-            nbgl_useCaseGenericReview(&generic, choices.reject.as_ptr(), Some(review_rejected));
+            nbgl_useCaseGenericReview(&generic, reject.as_ptr().cast(), Some(review_rejected));
         }
-        self.wait(deadline_ms)
+        self.wait(deadline)
     }
 
     /// Takes events for the screen just drawn until it is answered, the request ends or the
     /// deadline passes.
-    fn wait(&mut self, deadline_ms: u64) -> Answer {
+    fn wait(&mut self, deadline: &mut Deadline) -> Answer {
         // Said once the screen is drawn: the status change sends a keepalive at once, and a
         // drawing after it would stretch the gap to the next one. Later screens of the ceremony
         // leave the status unchanged, which sends nothing.
@@ -829,20 +883,22 @@ impl<'a> DeviceUi<'a> {
             if self.request_ended() {
                 return Answer::Cancelled;
             }
-            // The first tick can come right after the screen appeared, so the deadline is passed
-            // once the clock is beyond it: the wait is at least as long as asked, and at most one
-            // tick longer.
-            if hid::now_ms() > deadline_ms {
+            if deadline.passed() {
                 return Answer::TimedOut;
             }
-            self.take_event();
+            self.take_event(deadline);
         }
     }
 
-    /// Takes one event for the shown screen and the FIDO interfaces.
-    fn take_event(&mut self) {
+    /// Takes one event for the shown screen and the FIDO interfaces; a button press or touch
+    /// restarts `deadline`.
+    fn take_event(&mut self, deadline: &mut Deadline) {
         match self.comm.next_command_or_event() {
             CommandOrEvent::Event(DecodedEventType::Ticker) => hid::tick(),
+            #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
+            CommandOrEvent::Event(DecodedEventType::Button(_)) => deadline.restart(),
+            #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+            CommandOrEvent::Event(DecodedEventType::Touch) => deadline.restart(),
             // The applet answers its polls and deselection; a new request over NFC while this
             // one waits is refused as busy.
             #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
@@ -859,6 +915,43 @@ impl<'a> DeviceUi<'a> {
         if matches!(self.link, Link::Nfc) {
             hid::refuse_request();
         }
+    }
+}
+
+/// The user action timeout of a ceremony (CTAP 2.2, "User action timeout"): its screens wait
+/// for the user, and the request ends once `timeout_ms` pass without a button press or touch.
+/// A user paging through long details or many accounts keeps it waiting; only physical input
+/// restarts it, never the host.
+struct Deadline {
+    timeout_ms: u64,
+    at_ms: u64,
+}
+
+impl Deadline {
+    fn new(timeout_ms: u32) -> Self {
+        let timeout_ms = u64::from(timeout_ms);
+        Self {
+            timeout_ms,
+            at_ms: Self::after(timeout_ms),
+        }
+    }
+
+    fn after(timeout_ms: u64) -> u64 {
+        hid::now_ms()
+            .checked_add(timeout_ms)
+            .expect("a u64 millisecond clock outlives the device")
+    }
+
+    /// Gives the user the whole timeout again, from now.
+    fn restart(&mut self) {
+        self.at_ms = Self::after(self.timeout_ms);
+    }
+
+    /// Whether the timeout has passed. The first tick can come right after a screen appeared, so
+    /// the deadline is passed once the clock is beyond it: the wait is at least as long as asked,
+    /// and at most one tick longer.
+    fn passed(&self) -> bool {
+        hid::now_ms() > self.at_ms
     }
 }
 
@@ -974,8 +1067,8 @@ impl Ui for DeviceUi<'_> {
                 }
             }
         };
-        let deadline_ms = self.begin(timeout_ms);
-        let answer = self.choose(&choices, deadline_ms);
+        let mut deadline = self.begin(timeout_ms);
+        let answer = self.choose(&choices, &mut deadline);
         let ending = match (answer, prompt) {
             (Answer::Cancelled | Answer::TimedOut, _) => Ending::Unanswered,
             (answer, Prompt::Assertion { .. }) => signed_in(answer == Answer::Confirmed),
@@ -999,7 +1092,7 @@ impl Ui for DeviceUi<'_> {
     /// default: "Key type" turns to the other origin, whose screen confirms the switch or ends
     /// the registration.
     fn register(&mut self, registration: Registration<'_>, timeout_ms: u32) -> Choice<Origin> {
-        let deadline_ms = self.begin(timeout_ms);
+        let mut deadline = self.begin(timeout_ms);
         let mut origin = registration.default_origin;
         let outcome = loop {
             let message = Text::new(&["Create a passkey for ", registration.rp_id, "?"]);
@@ -1023,7 +1116,7 @@ impl Ui for DeviceUi<'_> {
                 confirm: c"Create passkey",
                 reject: c"Key type",
             };
-            match self.choose(&summary, deadline_ms) {
+            match self.choose(&summary, &mut deadline) {
                 Answer::Confirmed => break Choice::Chose(origin),
                 Answer::Rejected => {}
                 answer => break unanswered(answer),
@@ -1044,7 +1137,7 @@ impl Ui for DeviceUi<'_> {
                 confirm: c"Use this key type",
                 reject: c"Don't create",
             };
-            match self.choose(&switch, deadline_ms) {
+            match self.choose(&switch, &mut deadline) {
                 Answer::Confirmed => origin = other,
                 answer => break unanswered(answer),
             }
@@ -1071,7 +1164,7 @@ impl Ui for DeviceUi<'_> {
         accounts: &mut A,
         timeout_ms: u32,
     ) -> Choice<usize> {
-        let deadline_ms = self.begin(timeout_ms);
+        let mut deadline = self.begin(timeout_ms);
         let total = accounts.count();
         let mut total_buffer = [0u8; NUMBER_LEN];
         let total_text = number(total, &mut total_buffer);
@@ -1113,7 +1206,7 @@ impl Ui for DeviceUi<'_> {
                     c"Other account"
                 },
             };
-            match self.choose(&choices, deadline_ms) {
+            match self.choose(&choices, &mut deadline) {
                 Answer::Confirmed => {
                     outcome = Choice::Chose(index);
                     break;

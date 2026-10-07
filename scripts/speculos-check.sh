@@ -13,6 +13,11 @@
 # timeout, confirm and refuse, and authenticatorClientPIN; the reset, selection and
 # token screens are compared with tests/snapshots/<model>/; SPECULOS_GOLDEN=1 writes
 # the snapshots instead).
+# The conformance suite, with Speculos on its U2F transport: SoloKeys fido2-tests at a pinned
+# commit, patched where CTAP 2.2 differs from the CTAP 2.0 it was written for
+# (tests/conformance/fido2-tests.patch, each change with its section), in its own environment
+# with the python-fido2 it needs (tests/conformance/requirements.txt), driven by the pytest
+# plugin tests/conformance/ledger_speculos.py, which answers the screens.
 # The FIDO applet over NFC on Stax, Flex and Nano Gen5, with Speculos on its NFC
 # transport: scripts/nfc_check.py (selection and deselection of the applet,
 # short and extended APDUs, reset, selection by the tap, the consent screen with
@@ -74,6 +79,13 @@ docker run --rm ${name[@]+"${name[@]}"} \
         fido2=$(grep -oE "fido2==[0-9.]+" scripts/fido_check.py)
         python3 -m venv /tmp/fido
         /tmp/fido/bin/pip install --quiet "$fido2"
+        # The conformance suite at its pinned commit, with its own python-fido2.
+        suite=/tmp/fido2-tests
+        git clone --quiet https://github.com/solokeys/fido2-tests "$suite"
+        git -C "$suite" checkout --quiet 591d3d2279949e08de0766897f24bcfd39af1339
+        git -C "$suite" apply --recount /app/tests/conformance/fido2-tests.patch
+        python3 -m venv /tmp/conformance
+        /tmp/conformance/bin/pip install --quiet -r tests/conformance/requirements.txt
         status=0
         for target in nanosplus nanox stax flex apex_p; do
             case "$target" in
@@ -130,6 +142,15 @@ docker run --rm ${name[@]+"${name[@]}"} \
                 status=1
             fi
             stop
+            # The plugin starts and restarts Speculos itself: a reboot of the suite is a restart.
+            echo "== speculos $target, fido2-tests"
+            if ! (cd "$suite" && SPECULOS_MODEL="$model" SPECULOS_ELF="/app/$elf" \
+                PYTHONPATH="/app/tests/conformance:$suite" /tmp/conformance/bin/python -m pytest \
+                -p ledger_speculos --vendor ledger --timeout 120 -q -rfEs \
+                tests/standard/fido2 tests/standard/transport); then
+                tail -50 /tmp/speculos-conformance.log
+                status=1
+            fi
             case "$target" in
                 nanosplus | nanox) continue ;;
             esac

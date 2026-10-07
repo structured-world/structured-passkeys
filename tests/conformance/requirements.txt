@@ -1,0 +1,14 @@
+cffi==2.1.1
+cryptography==50.0.2
+ecdsa==0.19.2
+fido2==0.8.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pycparser==3.0
+Pygments==2.21.0
+pytest==9.1.1
+pytest-ordering==0.6
+pytest-timeout==2.4.0
+seedweed==1.0rc7
+six==1.17.0

@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "include_gif"
 version = "1.3.2"
-source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=bebc9afda85e470f8ced92193242409590217e70#bebc9afda85e470f8ced92193242409590217e70"
+source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=60b746f6541f12d25d3bda2322ff0e535f3e0959#60b746f6541f12d25d3bda2322ff0e535f3e0959"
 dependencies = [
  "flate2",
  "gif",
@@ -567,8 +567,8 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "ledger_device_sdk"
-version = "1.38.0"
-source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=bebc9afda85e470f8ced92193242409590217e70#bebc9afda85e470f8ced92193242409590217e70"
+version = "1.41.0"
+source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=60b746f6541f12d25d3bda2322ff0e535f3e0959#60b746f6541f12d25d3bda2322ff0e535f3e0959"
 dependencies = [
  "const-zero",
  "include_gif",
@@ -582,8 +582,8 @@ dependencies = [
 
 [[package]]
 name = "ledger_secure_sdk_sys"
-version = "1.16.4"
-source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=bebc9afda85e470f8ced92193242409590217e70#bebc9afda85e470f8ced92193242409590217e70"
+version = "1.17.0"
+source = "git+https://github.com/structured-world/ledger-device-rust-sdk?rev=60b746f6541f12d25d3bda2322ff0e535f3e0959#60b746f6541f12d25d3bda2322ff0e535f3e0959"
 dependencies = [
  "bindgen",
  "cc",

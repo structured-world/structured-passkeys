@@ -332,14 +332,17 @@ const OPTIONS_WITHOUT_PIN: [u8; 41] = [
     0xF5, // "pinUvAuthToken": true
 ];
 
-/// getInfo answers CTAP2_OK and the map {1: [], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9:
-/// ["usb"], 13: 4} in canonical order: the required versions and aaguid, the options, maxMsgSize,
-/// the PIN/UV auth protocols, two first, the transports, and minPINLength, which "MUST be present
-/// if the authenticator supports authenticatorClientPIN" (§6.4), at the 4 code points of §6.5.1.
+/// getInfo answers CTAP2_OK and the map {1: ["FIDO_2_0"], 3: AAGUID, 4: options, 5: 1024, 6:
+/// [2, 1], 9: ["usb"], 13: 4} in canonical order: the required versions, FIDO_2_0 for the CTAP 2.0
+/// command set the conformance suite covers, and aaguid, the options, maxMsgSize, the PIN/UV auth
+/// protocols, two first, the transports, and minPINLength, which "MUST be present if the
+/// authenticator supports authenticatorClientPIN" (§6.4), at the 4 code points of §6.5.1.
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA7, 0x01, 0x80, 0x03, 0x50];
+    let mut expected = vec![0x00, 0xA7, 0x01, 0x81, 0x68];
+    expected.extend_from_slice(b"FIDO_2_0");
+    expected.extend_from_slice(&[0x03, 0x50]);
     expected.extend_from_slice(&AAGUID);
     expected.extend_from_slice(&OPTIONS_WITHOUT_PIN);
     expected.extend_from_slice(&[0x05, 0x19, 0x04, 0x00, 0x06, 0x82, 0x02, 0x01]);

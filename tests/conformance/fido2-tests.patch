@@ -1,0 +1,279 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -14,9 +14,5 @@
+ from tests.utils import *
+
+-if "trezor" in sys.argv:
+-    from .vendor.trezor.udp_backend import force_udp_backend
+-else:
+-    from solo.fido2 import force_udp_backend
+-
+
+ def pytest_addoption(parser):
+@@ -94,5 +90,9 @@
+     if pytestconfig.getoption("sim"):
+         print("FORCE UDP")
++        if "trezor" in sys.argv:
++            from .vendor.trezor.udp_backend import force_udp_backend
++        else:
++            from solo.fido2 import force_udp_backend
+         force_udp_backend()
+
+     dev = TestDevice()
+@@ -131,3 +131,7 @@
+-from fido2.pcsc import CtapPcscDevice,_list_readers
++try:
++    from fido2.pcsc import CtapPcscDevice,_list_readers
++except ImportError:
++    # Without pyscard there is no NFC reader to test through.
++    CtapPcscDevice = object
+ from fido2.hid import CAPABILITY, CTAPHID
+
+
+diff --git a/tests/standard/fido2/__init__.py b/tests/standard/fido2/__init__.py
+--- a/tests/standard/fido2/__init__.py
++++ b/tests/standard/fido2/__init__.py
+@@ -81,4 +81,7 @@
+
+         elif isinstance(value, list):
+-            TestCborKeysSorted(cbor_obj[l[i]])
++            # CTAP 2.2 section 8: the canonical order is for map keys. An array keeps its
++            # order, which can carry meaning: pinUvAuthProtocols lists the protocols in
++            # decreasing preference (section 6.4). Maps inside it are checked when decoded.
++            pass
+
+diff --git a/tests/standard/fido2/test_getinfo.py b/tests/standard/fido2/test_getinfo.py
+--- a/tests/standard/fido2/test_getinfo.py
++++ b/tests/standard/fido2/test_getinfo.py
+@@ -38,6 +38,9 @@
+ def test_Check_up_option(device, info):
+     if "up" in info.options:
+         if info.options["up"]:
++            # CTAP 2.2 section 6.1, option "up": a platform may send it with the value true,
++            # and "If the up option key is false, end the operation by returning
++            # CTAP2_ERR_INVALID_OPTION". CTAP 2.0 refused the key itself.
+             with pytest.raises(CtapError) as e:
+-                device.sendMC(*FidoRequest(options={"up": True}).toMC())
++                device.sendMC(*FidoRequest(options={"up": False}).toMC())
+             assert e.value.code == CtapError.ERR.INVALID_OPTION
+
+diff --git a/tests/standard/fido2/test_make_credential.py b/tests/standard/fido2/test_make_credential.py
+--- a/tests/standard/fido2/test_make_credential.py
++++ b/tests/standard/fido2/test_make_credential.py
+@@ -106,6 +106,7 @@
+     def test_bad_type_rp_icon(self, device, MCRes):
+         req = FidoRequest(MCRes, rp={"id": "test.org", "name": "name", "icon": 8})
+
+-        with pytest.raises(CtapError) as e:
+-            device.sendMC(*req.toMC())
++        # CTAP 2.2 section 6.1, rp: "Authenticators MUST NOT error if the icon member is
++        # present"; WebAuthn removed it, so it is no known member whose type is checked.
++        device.sendMC(*req.toMC())
+
+diff --git a/tests/standard/fido2/test_get_assertion.py b/tests/standard/fido2/test_get_assertion.py
+--- a/tests/standard/fido2/test_get_assertion.py
++++ b/tests/standard/fido2/test_get_assertion.py
+@@ -18,2 +18,5 @@
+     def test_Check_that_AT_flag_is_not_set(self, GARes):
+-        assert (GARes.auth_data.flags & 0xF8) == 0
++        # WebAuthn L3 section 6.1: bits 3 and 4 are now BE and BS, which a credential whose
++        # key a recovery phrase restores sets; bit 5 stays reserved, 6 is AT, 7 is ED.
++        assert (GARes.auth_data.flags & 0xE0) == 0
+
+@@ -44,3 +47,6 @@
+
+-        l1 = 4
++        # Ten credential IDs of this authenticator would not fit the 1024-byte maxMsgSize it
++        # reports (CTAP 2.2 section 6.4), which a platform respects by sending fewer; five
++        # still mix the two RPs.
++        l1 = 2
+         for i in range(0, l1):
+@@ -53,3 +59,3 @@
+
+-        l2 = 6
++        l2 = 3
+         for i in range(0, l2):
+diff --git a/tests/standard/fido2/pin/test_pin.py b/tests/standard/fido2/pin/test_pin.py
+--- a/tests/standard/fido2/pin/test_pin.py
++++ b/tests/standard/fido2/pin/test_pin.py
+@@ -57,8 +57,10 @@
+     def test_set_pin_twice(self, device, SetPinRes):
+         """ Setting pin when a pin is already set should result in error NotAllowed. """
+         with pytest.raises(CtapError) as e:
+             device.client.pin_protocol.set_pin('1234')
+
+-        assert e.value.code == CtapError.ERR.NOT_ALLOWED
++        # CTAP 2.2 section 6.5.5.5, setPIN: "If a PIN has already been set, authenticator
++        # returns CTAP2_ERR_PIN_AUTH_INVALID error."
++        assert e.value.code == CtapError.ERR.PIN_AUTH_INVALID
+
+@@ -99,9 +101,12 @@
+     def test_zero_length_pin_auth(self, device, SetPinRes):
++        # CTAP 2.2 sections 6.1.2 and 6.2.2, step 1: a zero-length pinUvAuthParam asks for
++        # user presence and then ends with CTAP2_ERR_PIN_INVALID when a PIN is set
++        # (CTAP2_ERR_PIN_NOT_SET otherwise); CTAP 2.0 answered CTAP2_ERR_PIN_AUTH_INVALID.
+         with pytest.raises(CtapError) as e:
+             reg = device.sendMC(*FidoRequest(SetPinRes, pin_auth=b"").toMC())
+-        assert e.value.code == CtapError.ERR.PIN_AUTH_INVALID
++        assert e.value.code == CtapError.ERR.PIN_INVALID
+
+         with pytest.raises(CtapError) as e:
+             reg = device.sendGA(*FidoRequest(SetPinRes, pin_auth=b"").toGA())
+-        assert e.value.code == CtapError.ERR.PIN_AUTH_INVALID
++        assert e.value.code == CtapError.ERR.PIN_INVALID
+
+diff --git a/tests/standard/fido2/test_resident_key.py b/tests/standard/fido2/test_resident_key.py
+--- a/tests/standard/fido2/test_resident_key.py
++++ b/tests/standard/fido2/test_resident_key.py
+@@ -106,5 +106,12 @@
+         assert MC_RK_Res.request.user["id"] == GA_RK_Res.user["id"]
+-        if not MC_RK_Res.request.pin_protocol or not GA_RK_Res.number_of_credentials:
++        if not (MC_RK_Res.request.pin_protocol or MC_RK_Res.request.pin):
+             assert "id" in GA_RK_Res.user.keys() and len(GA_RK_Res.user.keys()) == 1
+         else:
+-            assert MC_RK_Res.request.user == GA_RK_Res.user
++            # CTAP 2.2 section 6.2.2 step 15.3: the response carries the credential's user
++            # entity, its names withheld only without user verification; WebAuthn removed icon.
++            assert all(
++                key in GA_RK_Res.user for key in MC_RK_Res.request.user if key != "icon"
++            )
++            for key, value in GA_RK_Res.user.items():
++                assert MC_RK_Res.request.user[key] == value
+
+@@ -181,5 +188,9 @@
+         """
+         Test replacing resident keys.
+         """
++        # A test of this class before it leaves a PIN set, and a registration without it is
++        # CTAP2_ERR_PUAT_REQUIRED (CTAP 2.2 section 6.1.2): the test starts on a reset device.
++        device.reset()
+         user1 = generate_user()
+@@ -336,14 +347,23 @@
+         """
+-        RK_CAPACITY = 16
+         device.reset()
+         req = FidoRequest(options={"rk": True})
+
++        # The capacity is the authenticator's own: this one keeps 64 discoverable credentials
++        # and reports no remainingDiscoverableCredentials (CTAP 2.2 section 6.4), so the store
++        # is filled until CTAP2_ERR_KEY_STORE_FULL instead of assuming 16.
+         regs = []
+-        for i in range(RK_CAPACITY):
++        while True:
+             req = FidoRequest(req, user=generate_user_maximum())
+-            res = device.sendMC(*req.toMC())
++            try:
++                res = device.sendMC(*req.toMC())
++            except CtapError as full:
++                assert full.code == CtapError.ERR.KEY_STORE_FULL
++                break
+             setattr(res, "request", req)
+             regs.append(res)
++            assert len(regs) <= 256
++        assert len(regs) >= 16
+
+-        req = FidoRequest(req, user=generate_user_maximum())
+-        with pytest.raises(CtapError) as e:
+-            res = device.sendMC(*req.toMC())
+-        assert e.value.code == CtapError.ERR.KEY_STORE_FULL
+-
+         for i, reg in enumerate(reversed(regs)):
+@@ -399,6 +419,9 @@
+         # Should overwrite the first credential.
+         mc_res2 = resetDevice.sendMC(*req.toMC())
+
++        # CTAP 2.2 section 6.2: getAssertion takes no rk option, and step 5 ends a request
++        # with one in CTAP2_ERR_UNSUPPORTED_OPTION; the registration's request carries it.
++        req = FidoRequest(rp = rp, user = user)
+         ga_res = resetDevice.sendGA(*req.toGA())
+
+diff --git a/tests/standard/transport/test_hid.py b/tests/standard/transport/test_hid.py
+--- a/tests/standard/transport/test_hid.py
++++ b/tests/standard/transport/test_hid.py
+@@ -85,4 +85,8 @@
+     def test_skip_sequence_number(self, device):
+         r = device.send_data(CTAPHID.PING, "\x44" * 200)
+-        device.send_raw("\x81\x04\x90")
++        # A message longer than the device's buffer, the 1024-byte maxMsgSize it reports
++        # (CTAP 2.2 section 6.4), is ERR_INVALID_LEN before any sequence check; 256 bytes
++        # take continuation packets 0 to 3 (57 + 3 * 59 < 256), so the 0, 1 and then 3
++        # sent below skip sequence 2 in the middle of the message.
++        device.send_raw("\x81\x01\x00")
+         device.send_raw("\x00")
+@@ -102,10 +106,15 @@
+         oldcid = device.cid()
+         newcid = "\x11\x22\x33\x44"
+-        device.send_raw("\x81\x10\x00")
++        # 256 bytes, within the device's 1024-byte message buffer (maxMsgSize, CTAP 2.2
++        # section 6.4), so the device is busy assembling it; a longer message is refused at
++        # once with ERR_INVALID_LEN and leaves the device idle.
++        device.send_raw("\x81\x01\x00")
+         device.send_raw("\x00")
+         device.send_raw("\x01")
+         device.set_cid(newcid)
+         device.send_raw(
+             "\x86\x00\x08\x11\x22\x33\x44\x55\x66\x77\x88"
+         )  # init from different cid
+-        print("wait for init response")
+-        cmd, r = device.recv_raw()  # init response
+-        assert cmd == 0x86
++        # CTAP 2.2 section 11.2.5.1: "If an application tries to access the device from a
++        # different channel while the device is busy with a transaction, that request will
++        # immediately fail with a busy-error message"; INIT aborts only a transaction of its
++        # own channel (section 11.2.5.3). CTAP 2.0 processed INIT from any channel.
++        cmd, r = device.recv_raw()  # busy response
++        assert cmd == 0xBF
++        assert r[0] == CtapError.ERR.CHANNEL_BUSY
+         device.set_cid(oldcid)
++        device.send_data(CTAPHID.INIT, "\x11\x22\x33\x44\x55\x66\x77\x88")
+         if check_timeouts:
+@@ -228,12 +237,16 @@
+     def test_keep_alive(self, device, check_timeouts=False):
+
++        # getInfo reports built-in user verification without makeCredUvNotRqd, so a
++        # registration asks for it (CTAP 2.2 section 6.1.2); without "uv" the request is
++        # refused before any wait, and no keepalive comes.
+         precanned_make_credential = unhexlify(
+-            '01a401582031323334353637383961626364656630313233343536373'\
++            '01a501582031323334353637383961626364656630313233343536373'\
+             '8396162636465663002a26269646b6578616d706c652e6f7267646e61'\
+             '6d65694578616d706c65525003a462696446cc2abaf119f26469636f6'\
+             'e781f68747470733a2f2f7777772e77332e6f72672f54522f77656261'\
+             '7574686e2f646e616d657256696e204f6c696d7069612047657272696'\
+             '56b646973706c61794e616d65781c446973706c617965642056696e20'\
+             '4f6c696d706961204765727269650481a263616c672664747970656a7'\
+-            '075626c69632d6b6579')
++            '075626c69632d6b6579'\
++            '07a1627576f5')
+
+         count = 0
+diff --git a/tests/standard/fido2/user_presence/test_user_presence.py b/tests/standard/fido2/user_presence/test_user_presence.py
+--- a/tests/standard/fido2/user_presence/test_user_presence.py
++++ b/tests/standard/fido2/user_presence/test_user_presence.py
+@@ -64,9 +64,6 @@
+         assert e.value.code == CtapError.ERR.INVALID_OPTION
+-        with pytest.raises(CtapError) as e:
+-            with Timeout(1.0) as event:
+-                device.sendMC(
+-                    *FidoRequest(MCRes, options={"up": True}, timeout=event).toMC()
+-                )
+-        assert e.value.code == CtapError.ERR.INVALID_OPTION
++        # CTAP 2.2 section 6.1, option "up": true is allowed and the registration asks for
++        # presence as usual; CTAP 2.0 refused the key itself.
++        device.sendMC(*FidoRequest(MCRes, options={"up": True}).toMC())
+
+diff --git a/tests/utils.py b/tests/utils.py
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -106,6 +106,10 @@
+     if param == "key_params":
+         return get_key_params()
+     if param == "allow_list":
+-        return []
++        # CTAP 2.2 section 6.2: "A platform MUST NOT send an empty allowList", it omits the
++        # member instead; a present allowList limits the assertion to the credentials it
++        # denotes, so an empty one by default would find no discoverable credential.
++        return None
+     if param == "on_keepalive":
+         return DeviceSelectCredential(1)

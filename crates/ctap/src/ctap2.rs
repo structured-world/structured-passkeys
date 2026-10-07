@@ -603,10 +603,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         Ok(())
     }
 
-    /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` stays empty
-    /// until a version's command set passes its conformance tests: §6.4 requires the member but
-    /// not a non-empty list, and a version string is a promise platforms act on, so an empty list
-    /// is the truthful answer rather than an error for the command.
+    /// authenticatorGetInfo (§6.4) with the members implemented so far. `versions` lists a version
+    /// only once its command set passes the conformance suite, since a version string is a
+    /// promise platforms act on: `FIDO_2_0`, the CTAP 2.0 commands (makeCredential, getAssertion,
+    /// getNextAssertion, getInfo, clientPIN, reset).
     ///
     /// Options: `rk` and `up`; `uv`, since built-in user verification is the device unlock and
     /// always present; `clientPin`, true once a client PIN is set (§6.4 option IDs); and
@@ -617,9 +617,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let pin_set = self.store.config().pin.is_some();
         encoder
             .map(7)?
-            // versions (0x01), required.
+            // versions (0x01), required. Requests are processed by the CTAP 2.2 rules whatever
+            // versions are listed: "FIDO_2_0" names the CTAP 2.0 command set (§6.4), and where
+            // CTAP 2.2 changed a 2.0 rule (`up` in makeCredential, a zero-length pinUvAuthParam)
+            // it did so for requests a CTAP 2.0 platform never sends, as other CTAP 2.1
+            // authenticators that list "FIDO_2_0" do.
             .unsigned(0x01)?
-            .array(0)?
+            .array(1)?
+            .text("FIDO_2_0")?
             // aaguid (0x03), required.
             .unsigned(0x03)?
             .bytes(&AAGUID)?

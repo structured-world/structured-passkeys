@@ -52,7 +52,9 @@ pub struct MakeCredentialRequest {
     attestation_none: bool,
 }
 
-/// Reads `rp` (WebAuthn L3 §5.4.2): its `id`, the RP ID; `name` and other members are not kept.
+/// Reads `rp` (WebAuthn L3 §5.4.2): its `id`, the RP ID. `name` is not kept, but as a known member
+/// it must be a text string (CTAP 2.2 §6.1.2 step 3.1.2); the removed `icon`, which authenticators
+/// "MUST NOT error" on (§6.1, rp), and any other member are skipped.
 fn rp_entity<'a>(decoder: &mut Decoder<'a>) -> Result<Option<&'a str>, crate::cbor::Error> {
     decoder.map(|entries| {
         let mut id = None;
@@ -60,6 +62,9 @@ fn rp_entity<'a>(decoder: &mut Decoder<'a>) -> Result<Option<&'a str>, crate::cb
             let value = entries.value();
             match key {
                 Key::Text("id") => id = Some(value.text()?),
+                Key::Text("name") => {
+                    value.text()?;
+                }
                 _ => value.skip()?,
             }
         }
