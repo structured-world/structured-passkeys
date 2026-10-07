@@ -107,7 +107,8 @@ pub const NAME_SLOTS: usize = 16;
 
 /// The NVM regions of the device. Each write replaces one record atomically: after a power loss
 /// the record holds the value before the write or the value written, never a mix. The device
-/// implements it with the SDK's atomic storage; [`MemoryStorage`] is the host double.
+/// implements it with the SDK's atomic storage; `MemoryStorage` (feature `soft`) is the host
+/// double.
 ///
 /// A record never written reads as all zeros. Slot numbers passed in are below the slot count.
 /// A write leaves no earlier value of the record anywhere in NVM: key slots hold private keys
