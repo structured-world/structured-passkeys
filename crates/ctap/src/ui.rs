@@ -112,9 +112,9 @@ pub enum Prompt<'a> {
         /// The RP ID of the request.
         rp_id: &'a str,
     },
-    /// Delete the discoverable credential of `account` for `rp_id`: credential management's
-    /// deleteCredential (§6.8.5) or the settings list. A device-only one cannot come back, a
-    /// seed-recoverable one only through a backup or another device.
+    /// Delete the discoverable credential of `account` for `rp_id`, chosen in the settings list.
+    /// A device-only one cannot come back, a seed-recoverable one only through the recovery
+    /// phrase on another device or after a reinstall.
     Delete {
         /// The RP ID the index keeps, shown as [`MAX_SHOWN_RP_ID_LEN`] describes.
         rp_id: &'a str,

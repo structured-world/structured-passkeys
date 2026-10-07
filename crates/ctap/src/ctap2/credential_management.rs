@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::client_pin::{Bytes, write_full};
-use super::credential::{PUBLIC_KEY, presence_or_timeout, shown_rp_id};
+use super::credential::PUBLIC_KEY;
 use super::make_credential::{UserEntity, user_entity};
 use super::{Authenticator, NEXT_ASSERTION_TIMEOUT_MS, StatusCode};
 use crate::attestation::encode_cose_key;
@@ -16,7 +16,7 @@ use crate::crypto::{Crypto, KEY_LEN};
 use crate::keys::KeyRing;
 use crate::pin::Permissions;
 use crate::storage::{EntryId, Storage, StoreError};
-use crate::ui::{Account, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::Ui;
 
 /// authenticatorCredentialManagement subcommands (§6.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +238,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 let rp_id_hash = request.rp_id_hash.ok_or(StatusCode::MissingParameter)?;
                 self.enumerate_credentials(&keys, rp_id_hash, now_ms, encoder)
             }
-            SubCommand::DeleteCredential => self.delete_credential(&keys, request, ui),
+            SubCommand::DeleteCredential => self.delete_credential(&keys, request),
             SubCommand::UpdateUserInformation => self.update_user(&keys, request),
             SubCommand::EnumerateRpsGetNextRp
             | SubCommand::EnumerateCredentialsGetNextCredential => {
@@ -275,7 +275,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         }
         let protocol = Self::param_protocol(request.protocol)?;
         let sub_command = [request.sub_command as u8];
-        let message: [&[u8]; 2] = [&sub_command, request.params.as_deref().unwrap_or_default()];
+        // getCredsMetadata and enumerateRPsBegin authenticate the subcommand alone (§6.8.2,
+        // §6.8.3), whatever parameters arrive; the others the subcommand and its parameters as
+        // received (§6.8.4 to §6.8.6).
+        let params = match request.sub_command {
+            SubCommand::GetCredsMetadata | SubCommand::EnumerateRpsBegin => &[][..],
+            _ => request.params.as_deref().unwrap_or_default(),
+        };
+        let message: [&[u8]; 2] = [&sub_command, params];
         let verified = self.client_pin.verify_token(
             &self.crypto,
             protocol,
@@ -580,51 +587,29 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         Ok(found)
     }
 
-    /// deleteCredential (§6.8.5): after the user confirms it on the device, the credential's
-    /// entry goes, and with it a device-only key and updated names; its ID no longer opens, a
-    /// seed-recoverable one included (§6.1.3, through the store ID).
-    fn delete_credential<U: Ui>(
+    /// deleteCredential (§6.8.5): the credential's entry goes, and with it a device-only key and
+    /// updated names; its ID no longer opens, a seed-recoverable one included (§6.1.3, through
+    /// the store ID). §6.8.5 asks for no user gesture beyond the token, whose consent screen
+    /// names deletion, so no screen is shown here.
+    fn delete_credential(
         &mut self,
         keys: &KeyRing,
         request: &CredentialManagementRequest,
-        ui: &mut U,
     ) -> Result<(), StatusCode> {
-        let (entry, rp_id_hash, rp_id) = self.requested_entry(request)?;
-        self.delete_entry(keys, entry, &rp_id_hash, &rp_id, ui)
+        let (entry, rp_id_hash, _) = self.requested_entry(request)?;
+        self.remove_entry(keys, entry, &rp_id_hash)
     }
 
-    /// Deletes the credential of index entry `entry` for the RP `rp_id_hash` (RP ID `rp_id` as
-    /// the index keeps it) once the user confirms it on the device: refusal is
-    /// CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT, and an entry that is
-    /// gone or no longer opens CTAP2_ERR_NO_CREDENTIALS. The entry goes, and with it a
-    /// device-only key and updated names.
-    pub(super) fn delete_entry<U: Ui>(
+    /// Removes index entry `entry` of the RP `rp_id_hash`, and with it a device-only key and
+    /// updated names; CTAP2_ERR_NO_CREDENTIALS when the entry is gone or no longer opens.
+    pub(super) fn remove_entry(
         &mut self,
         keys: &KeyRing,
         entry: EntryId,
         rp_id_hash: &[u8; KEY_LEN],
-        rp_id: &str,
-        ui: &mut U,
     ) -> Result<(), StatusCode> {
-        let (_, credential) = self
-            .indexed_credential(keys, rp_id_hash, entry)
+        self.indexed_credential(keys, rp_id_hash, entry)
             .ok_or(StatusCode::NoCredentials)?;
-        let answer = {
-            let user = credential.user.as_ref();
-            let shown_rp = shown_rp_id(&self.crypto, rp_id);
-            ui.confirm(
-                Prompt::Delete {
-                    rp_id: &shown_rp,
-                    account: Account {
-                        name: user.and_then(|user| user.name.as_deref()),
-                        display_name: user.and_then(|user| user.display_name.as_deref()),
-                        origin: Some(credential.key.origin()),
-                    },
-                },
-                USER_ACTION_TIMEOUT_MS,
-            )
-        };
-        presence_or_timeout(answer)?;
         if self.store.remove(entry) {
             Ok(())
         } else {

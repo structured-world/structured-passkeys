@@ -144,12 +144,30 @@ pub(super) fn shown_rp_id<C: Crypto>(crypto: &C, rp_id: &str) -> String {
     }
     let (stored, length) = stored_rp_id(rp_id);
     // The stored form is cut on character boundaries, so it is text.
-    let mut text = shown(
-        core::str::from_utf8(&stored[..length]).unwrap_or_default(),
-        MAX_RP_ID_LEN,
-    );
+    let kept = core::str::from_utf8(&stored[..length]).unwrap_or_default();
+    fingerprinted(kept, &crypto.sha256(&[rp_id.as_bytes()]))
+}
+
+/// The RP ID the index keeps (`kept`, for the RP whose whole RP ID hashes to `rp_id_hash`) as a
+/// screen shows it, the same way [`shown_rp_id`] shows a whole one: an RP ID that fit the index
+/// is whole, and the kept form of a longer one is followed by the fingerprint of the whole RP ID,
+/// which its hash gives, so RP IDs alike in their kept bytes still look different.
+pub(super) fn shown_kept_rp_id<C: Crypto>(
+    crypto: &C,
+    kept: &str,
+    rp_id_hash: &[u8; KEY_LEN],
+) -> String {
+    if crypto.sha256(&[kept.as_bytes()]) == *rp_id_hash {
+        return shown_rp_id(crypto, kept);
+    }
+    fingerprinted(kept, rp_id_hash)
+}
+
+/// `kept`, the 64-byte form of CTAP 2.2 §6.8.7, followed by ` #` and the first 8 bytes of `digest`,
+/// the SHA-256 of the whole RP ID, in upper-case hex.
+fn fingerprinted(kept: &str, digest: &[u8; KEY_LEN]) -> String {
+    let mut text = shown(kept, MAX_RP_ID_LEN);
     text.push_str(" #");
-    let digest = crypto.sha256(&[rp_id.as_bytes()]);
     for byte in &digest[..(RP_ID_FINGERPRINT_LEN - 2) / 2] {
         text.push(hex_digit(u32::from(byte >> 4)));
         text.push(hex_digit(u32::from(byte & 0xF)));

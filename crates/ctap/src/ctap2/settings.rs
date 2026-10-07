@@ -3,19 +3,22 @@
 
 use alloc::vec::Vec;
 
-use super::credential::shown_rp_id;
+use super::credential::{presence_or_timeout, shown_kept_rp_id};
 use super::{Authenticator, StatusCode};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::keys::KeyRing;
 use crate::storage::{Config, EntryId, Storage};
-use crate::ui::{Account, Choice, Passkey, Passkeys, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{Account, Choice, Passkey, Passkeys, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+
+/// A discoverable credential of the index: its entry and the hash of its whole RP ID.
+type Indexed = (EntryId, [u8; KEY_LEN]);
 
 /// The discoverable credentials that open, newest first, read for the settings list one at a
 /// time.
 struct Listed<'a, C, S> {
     authenticator: &'a Authenticator<C, S>,
     keys: &'a KeyRing,
-    entries: Vec<(EntryId, [u8; KEY_LEN])>,
+    entries: &'a [Indexed],
 }
 
 impl<C: Crypto, S: Storage> Passkeys for Listed<'_, C, S> {
@@ -24,11 +27,24 @@ impl<C: Crypto, S: Storage> Passkeys for Listed<'_, C, S> {
     }
 
     fn read<R>(&mut self, index: usize, show: impl FnOnce(Passkey<'_>) -> R) -> Option<R> {
-        let &(entry_id, rp_id_hash) = self.entries.get(index)?;
-        let authenticator = self.authenticator;
-        let (_, credential) = authenticator.indexed_credential(self.keys, &rp_id_hash, entry_id)?;
-        let entry = authenticator.store.entry(entry_id.slot)?;
-        let rp_id = shown_rp_id(&authenticator.crypto, entry.rp_id);
+        let &indexed = self.entries.get(index)?;
+        self.authenticator.passkey(self.keys, indexed, show)
+    }
+}
+
+impl<C: Crypto, S: Storage> Authenticator<C, S> {
+    /// Calls `show` with the discoverable credential `indexed` as the settings show it: the RP ID
+    /// the index keeps, fingerprinted when it was cut (so RP IDs alike in their kept bytes look
+    /// different), its names as updated and its key origin; `None` when it no longer opens.
+    fn passkey<R>(
+        &self,
+        keys: &KeyRing,
+        (entry_id, rp_id_hash): Indexed,
+        show: impl FnOnce(Passkey<'_>) -> R,
+    ) -> Option<R> {
+        let (_, credential) = self.indexed_credential(keys, &rp_id_hash, entry_id)?;
+        let entry = self.store.entry(entry_id.slot)?;
+        let rp_id = shown_kept_rp_id(&self.crypto, entry.rp_id, &rp_id_hash);
         let user = credential.user.as_ref();
         Some(show(Passkey {
             rp_id: &rp_id,
@@ -39,9 +55,7 @@ impl<C: Crypto, S: Storage> Passkeys for Listed<'_, C, S> {
             },
         }))
     }
-}
 
-impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// Whether `alwaysUv` is on, for the settings switch.
     pub fn always_uv(&self) -> bool {
         self.store.config().always_uv
@@ -68,7 +82,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let mut start = 0;
         loop {
             let keys = KeyRing::new(&mut self.crypto);
-            let mut entries: Vec<(EntryId, [u8; KEY_LEN])> = self
+            let mut entries: Vec<Indexed> = self
                 .store
                 .entries()
                 .map(|entry| (entry.id, *entry.rp_id_hash))
@@ -79,7 +93,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 &mut Listed {
                     authenticator: self,
                     keys: &keys,
-                    entries: entries.clone(),
+                    entries: &entries,
                 },
                 start,
                 USER_ACTION_TIMEOUT_MS,
@@ -87,17 +101,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             let Choice::Chose(index) = chosen else {
                 return;
             };
-            let Some(&(entry, rp_id_hash)) = entries.get(index) else {
+            let Some(&indexed) = entries.get(index) else {
                 return;
             };
-            let Some(rp_id) = self
-                .store
-                .entry(entry.slot)
-                .map(|kept| alloc::string::String::from(kept.rp_id))
-            else {
+            // The deletion screen names the passkey as the list did.
+            let Some(answer) = self.passkey(&keys, indexed, |passkey| {
+                ui.confirm(
+                    Prompt::Delete {
+                        rp_id: passkey.rp_id,
+                        account: passkey.account,
+                    },
+                    USER_ACTION_TIMEOUT_MS,
+                )
+            }) else {
                 return;
             };
-            match self.delete_entry(&keys, entry, &rp_id_hash, &rp_id, ui) {
+            let deleted = presence_or_timeout(answer)
+                .and_then(|()| self.remove_entry(&keys, indexed.0, &indexed.1));
+            match deleted {
                 // The list goes on at the passkey after the deleted one, or after a kept one at
                 // that one again.
                 Ok(()) | Err(StatusCode::OperationDenied) => start = index,

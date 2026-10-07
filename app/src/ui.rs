@@ -90,6 +90,7 @@ pub fn home_due() -> bool {
 }
 
 unsafe extern "C" fn status_ended() {
+    crate::home::status_over();
     HOME_DUE.store(true, Ordering::Relaxed);
 }
 
@@ -215,15 +216,26 @@ const LABEL_CLOSE: &str = ")";
 /// The longest account label: both names at their longest, with the brackets.
 const ACCOUNT_LABEL_LEN: usize = 2 * MAX_SHOWN_LEN + LABEL_OPEN.len() + LABEL_CLOSE.len();
 
-/// What a token may do, as the consent screen says it ([`purposes`]).
-const PURPOSES: [&str; 6] = [
-    "sign in with a passkey",
-    "create a passkey",
-    "sign in and create passkeys",
-    "list and delete your passkeys",
-    "change the security key's settings",
-    "sign in, manage passkeys and change settings",
-];
+/// What a token may do, as the consent screen says it ([`purposes`]): a single permission or
+/// the pair a platform asks for to register and sign in has its own sentence, any other set lists
+/// each permission it holds.
+const SIGN_IN_ONLY: &str = "sign in with a passkey";
+const CREATE_ONLY: &str = "create a passkey";
+const SIGN_IN_AND_CREATE: &str = "sign in and create passkeys";
+/// One part per permission, in the order a list names them.
+const SIGN_IN: &str = "sign in";
+const CREATE: &str = "create passkeys";
+const MANAGE: &str = "list and delete your passkeys";
+const CONFIGURE: &str = "change the security key's settings";
+const LIST_COMMA: &str = ", ";
+const LIST_AND: &str = " and ";
+/// Room for the longest purpose: every permission listed.
+const PURPOSES_LEN: usize = SIGN_IN.len()
+    + CREATE.len()
+    + MANAGE.len()
+    + CONFIGURE.len()
+    + 2 * LIST_COMMA.len()
+    + LIST_AND.len();
 /// The words around the shown RP ID and names, shared by the screens and the check below.
 const TOKEN_ASKS: &str = "Your browser or system asks to ";
 const TOKEN_ON: &str = " on ";
@@ -240,18 +252,10 @@ const ACCOUNT_OF: &str = " of ";
 const NUMBER_LEN: usize = 5;
 
 const _: () = {
-    let mut longest_purpose = 0;
-    let mut index = 0;
-    while index < PURPOSES.len() {
-        if PURPOSES[index].len() > longest_purpose {
-            longest_purpose = PURPOSES[index].len();
-        }
-        index += 1;
-    }
-    // The token consent: what it allows, on which RP.
-    assert!(
-        TOKEN_ASKS.len() + longest_purpose + TOKEN_ON.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN
-    );
+    // The token consent: what it allows, on which RP; the single sentences are shorter than a
+    // list of every permission.
+    assert!(SIGN_IN_AND_CREATE.len() < PURPOSES_LEN);
+    assert!(TOKEN_ASKS.len() + PURPOSES_LEN + TOKEN_ON.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     // An excluded registration.
     assert!(EXCLUDED_HAS.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     // The titles: "Delete the passkey for <RP>?" is the longest.
@@ -354,21 +358,48 @@ impl Text {
     }
 }
 
-/// What a token with `permissions` lets the platform do, for the consent screen: exactly the
-/// requested permissions, since the consent is to them (CTAP 2.2 §6.5.5.7.2 step 7).
-fn purposes(permissions: Permissions) -> &'static str {
-    let bits = permissions.bits();
-    let create = bits & Permissions::MAKE_CREDENTIAL.bits() != 0;
-    let sign_in = bits & Permissions::GET_ASSERTION.bits() != 0;
-    let others = bits & !(Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits());
-    match (create, sign_in, others) {
-        (false, true, 0) => PURPOSES[0],
-        (true, false, 0) => PURPOSES[1],
-        (true, true, 0) => PURPOSES[2],
-        (false, false, bits) if bits == Permissions::CREDENTIAL_MANAGEMENT.bits() => PURPOSES[3],
-        (false, false, bits) if bits == Permissions::AUTHENTICATOR_CONFIG.bits() => PURPOSES[4],
-        _ => PURPOSES[5],
+/// What a token with `permissions` lets the platform do, for the consent screen, as parts to
+/// compose: exactly the requested permissions, since the consent is to them (CTAP 2.2 §6.5.5.7.2
+/// step 7). The permissions a token may carry here are mc, ga, cm and acfg; the others are
+/// refused before consent.
+fn purposes(permissions: Permissions) -> [&'static str; 7] {
+    let mut parts = [""; 7];
+    if permissions == Permissions::GET_ASSERTION {
+        parts[0] = SIGN_IN_ONLY;
+    } else if permissions == Permissions::MAKE_CREDENTIAL {
+        parts[0] = CREATE_ONLY;
+    } else if permissions == Permissions::DEFAULT {
+        parts[0] = SIGN_IN_AND_CREATE;
+    } else {
+        let named = [
+            (Permissions::GET_ASSERTION, SIGN_IN),
+            (Permissions::MAKE_CREDENTIAL, CREATE),
+            (Permissions::CREDENTIAL_MANAGEMENT, MANAGE),
+            (Permissions::AUTHENTICATOR_CONFIG, CONFIGURE),
+        ];
+        let total = named
+            .iter()
+            .filter(|(permission, _)| permissions.contains(*permission))
+            .count();
+        let mut at = 0;
+        for (index, (_, text)) in named
+            .iter()
+            .filter(|(permission, _)| permissions.contains(*permission))
+            .enumerate()
+        {
+            if index > 0 {
+                parts[at] = if index + 1 == total {
+                    LIST_AND
+                } else {
+                    LIST_COMMA
+                };
+                at += 1;
+            }
+            parts[at] = text;
+            at += 1;
+        }
     }
+    parts
 }
 
 /// The account as a screen names it, in parts to compose: the display name and, when it differs,
@@ -813,6 +844,7 @@ impl<'a> DeviceUi<'a> {
                 // SAFETY: the message is a static NUL-terminated string; the page starts its own
                 // timer and returns at once.
                 unsafe { nbgl_useCaseStatus(message.as_ptr(), success, Some(status_ended)) };
+                crate::home::status_drawn();
             }
         }
         if !matches!(ending, Ending::Unanswered) {
@@ -1073,9 +1105,16 @@ impl Ui for DeviceUi<'_> {
             // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
             // §6.5.5.7.3 step 9).
             Prompt::Token { permissions, rp_id } => {
+                let purpose = purposes(permissions);
                 sub_message = Text::new(&[
                     TOKEN_ASKS,
-                    purposes(permissions),
+                    purpose[0],
+                    purpose[1],
+                    purpose[2],
+                    purpose[3],
+                    purpose[4],
+                    purpose[5],
+                    purpose[6],
                     match rp_id {
                         Some(_) => TOKEN_ON,
                         None => " on any website",

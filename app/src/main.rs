@@ -145,10 +145,13 @@ extern "C" fn sample_main(_arg0: u32) {
             response[..length].zeroize();
         }
         // authenticatorConfig and authenticatorReset change alwaysUv without a screen of their
-        // own: the switch is drawn again with the new state.
+        // own: the switch is drawn again with the new state, at once, or after the status page
+        // that ends a reset, which a redraw now would cut short.
         if home.always_uv() != authenticator.always_uv() {
             home.set_always_uv(authenticator.always_uv());
-            home.show_and_return();
+            if !home::status_shown() {
+                home.show_and_return();
+            }
         }
     }
 }

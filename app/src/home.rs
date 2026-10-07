@@ -6,7 +6,7 @@
 //! and shows the settings again.
 
 use core::ffi::{CStr, c_char, c_int};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use ledger_device_sdk::nbgl::NbglGlyph;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
@@ -44,6 +44,25 @@ const PASSKEYS_TOKEN: u8 = FIRST_USER_TOKEN as u8 + 1;
 /// What the settings asked for and the main loop has not done yet; [`NOTHING`] when nothing.
 static ASKED: AtomicU8 = AtomicU8::new(NOTHING);
 const NOTHING: u8 = 0;
+
+/// Set while a status page ends the last ceremony instead of this screen, which comes back when
+/// the page's time is up.
+static STATUS_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// A status page replaced the home screen.
+pub fn status_drawn() {
+    STATUS_SHOWN.store(true, Ordering::Relaxed);
+}
+
+/// The status page is over: its time is up.
+pub fn status_over() {
+    STATUS_SHOWN.store(false, Ordering::Relaxed);
+}
+
+/// Whether a status page is shown, which a redraw of the home screen would cut short.
+pub fn status_shown() -> bool {
+    STATUS_SHOWN.load(Ordering::Relaxed)
+}
 
 /// What the settings asked for since the last call, taken once.
 pub fn take_asked() -> Option<Asked> {
@@ -151,6 +170,8 @@ impl Home {
     // `tuneId` exists on the touch models only.
     #[allow(clippy::needless_update)]
     fn show(&mut self, page: u8) {
+        // This screen replaces any status page.
+        status_over();
         self.infos = nbgl_contentInfoList_t {
             infoTypes: self.info_types.as_ptr(),
             infoContents: self.info_contents.as_ptr(),

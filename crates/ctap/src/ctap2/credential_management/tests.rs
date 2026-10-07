@@ -10,21 +10,19 @@ use super::super::client_pin::tests::{
 use super::super::make_credential::tests::{
     CLIENT_DATA_HASH, Made, OK, RP_ID, descriptors, options, register,
 };
-use super::super::tests::{Asked, Scripted, Shown, TestAuthenticator, settings};
+use super::super::tests::{Asked, Scripted, TestAuthenticator, settings};
 use super::super::{Authenticator, NEXT_ASSERTION_TIMEOUT_MS, Transports};
 use crate::cbor::{Decoder, Key};
 use crate::credential_id::Origin;
 use crate::crypto::KEY_LEN;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, Store};
-use crate::ui::{Answer, USER_ACTION_TIMEOUT_MS};
+use crate::ui::Answer;
 
 const INVALID_PARAMETER: u8 = 0x02;
 const MISSING_PARAMETER: u8 = 0x14;
-const OPERATION_DENIED: u8 = 0x27;
 const KEY_STORE_FULL: u8 = 0x28;
 const NO_CREDENTIALS: u8 = 0x2E;
-const USER_ACTION_TIMEOUT: u8 = 0x2F;
 const NOT_ALLOWED: u8 = 0x30;
 const PIN_AUTH_INVALID: u8 = 0x33;
 const PUAT_REQUIRED: u8 = 0x36;
@@ -326,6 +324,42 @@ fn metadata_needs_an_unbound_cm_token() {
     );
 }
 
+/// getCredsMetadata and enumerateRPsBegin authenticate `subCommand` alone (§6.8.2, §6.8.3): a
+/// request that also carries subCommandParams is accepted with that MAC, and refused with one
+/// that covers the parameters too.
+#[test]
+fn metadata_and_rps_begin_authenticate_the_subcommand_alone() {
+    let mut authenticator = authenticator_with_room(4, 2);
+    register(&mut authenticator, RP_ID, b"user-1", true, None);
+    let params = rp_hash_params(RP_ID);
+    for sub_command in [0x01, 0x02] {
+        let token_cm = token(&mut authenticator, CM, None);
+        let with = |mac: &[u8]| {
+            command(
+                0x0A,
+                &[
+                    (0x01, Value::Uint(sub_command)),
+                    (0x02, Value::Raw(params.clone())),
+                    (0x03, Value::Uint(2)),
+                    (0x04, Value::Bytes(mac.to_vec())),
+                ],
+            )
+        };
+        let spec = with(&hmac(&token_cm, &[&[sub_command as u8]]));
+        assert_eq!(
+            send(&mut authenticator, &spec, Answer::Confirmed, 0).0[0],
+            OK,
+            "subcommand {sub_command}"
+        );
+        let widened = with(&hmac(&token_cm, &[&[sub_command as u8], &params]));
+        assert_eq!(
+            send(&mut authenticator, &widened, Answer::Confirmed, 0).0,
+            [PIN_AUTH_INVALID],
+            "subcommand {sub_command}"
+        );
+    }
+}
+
 /// A subcommand §6.8 does not define is INVALID_SUBCOMMAND, a request without one
 /// MISSING_PARAMETER, and a subcommand without its parameters MISSING_PARAMETER.
 #[test]
@@ -523,30 +557,18 @@ fn credentials_of_an_rp_enumerate_with_their_members() {
     );
 }
 
-/// deleteCredential (§6.8.5) of either origin asks the user on the device, naming the RP and the
-/// account; once confirmed the credential no longer enumerates and no longer signs, also from an
-/// allowList with its ID (§6.1.3). A refusal or no answer deletes nothing; an ID no discoverable
-/// credential has is NO_CREDENTIALS; a token bound to another RP is PIN_AUTH_INVALID.
+/// deleteCredential (§6.8.5) of either origin deletes with no screen: the token is the user's
+/// consent, as §6.8.5 asks for nothing more, so a user who would refuse a screen changes nothing.
+/// The credential then no longer enumerates and no longer signs, also from an allowList with its
+/// ID (§6.1.3). An ID no discoverable credential has is NO_CREDENTIALS; a token bound to another
+/// RP is PIN_AUTH_INVALID.
 #[test]
 fn deleting_a_credential_of_either_origin() {
     for origin in [Origin::SeedRecoverable, Origin::DeviceOnly] {
         let mut authenticator = authenticator_with_room(4, 2);
         let made = register(&mut authenticator, RP_ID, b"user-1", true, Some(origin));
         let kept = register(&mut authenticator, RP_ID, b"user-2", true, Some(origin));
-        let token_cm = token(&mut authenticator, CM, None);
         let params = credential_params(&made.id, None);
-        let delete = request(0x06, Some(&params), &token_cm);
-
-        for (answer, status) in [
-            (Answer::Rejected, OPERATION_DENIED),
-            (Answer::TimedOut, USER_ACTION_TIMEOUT),
-        ] {
-            assert_eq!(
-                send(&mut authenticator, &delete, answer, 0).0,
-                [status],
-                "{origin:?}"
-            );
-        }
         let token_other = token(&mut authenticator, CM, Some("other.example"));
         let foreign = request(0x06, Some(&params), &token_other);
         assert_eq!(
@@ -556,22 +578,9 @@ fn deleting_a_credential_of_either_origin() {
 
         let token_cm = token(&mut authenticator, CM, None);
         let delete = request(0x06, Some(&params), &token_cm);
-        let (response, asked) = send(&mut authenticator, &delete, Answer::Confirmed, 0);
+        let (response, asked) = send(&mut authenticator, &delete, Answer::Rejected, 0);
         assert_eq!(response, [OK], "{origin:?}");
-        assert_eq!(
-            asked,
-            [(
-                Asked::Delete {
-                    rp_id: RP_ID.into(),
-                    account: Shown {
-                        name: Some("alice".into()),
-                        display_name: Some("Alice".into()),
-                        origin: Some(origin),
-                    },
-                },
-                USER_ACTION_TIMEOUT_MS
-            )]
-        );
+        assert_eq!(asked, [], "no screen");
         assert_eq!(
             send(&mut authenticator, &delete, Answer::Confirmed, 0).0,
             [NO_CREDENTIALS]

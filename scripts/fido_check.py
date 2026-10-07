@@ -58,14 +58,13 @@ Credential management (§6.8) and authenticatorConfig (§6.11), in Speculos and 
 tokens from built-in UV: getInfo reports credMgmt and authnrCfg; the metadata counts the
 credentials above, the RPs enumerate with their hashes, the credentials of the RP with their users
 and the public keys their registrations returned; updateUserInformation renames one;
-deleteCredential of the device-only and of the recovery phrase key, each confirmed on its deletion
-screen, leaves IDs that no longer sign; toggleAlwaysUv turns getInfo's alwaysUv on and off again.
-The consent for the credential management token and the deletion screen are compared with their
-snapshots.
+deleteCredential of the device-only and of the recovery phrase key, with no screen (§6.8.5 asks for
+nothing beyond the token), leaves IDs that no longer sign; toggleAlwaysUv turns getInfo's alwaysUv
+on and off again. The consent for the credential management token is compared with its snapshot.
 
 The passkey list of the device's settings, in Speculos: a new passkey is listed first; deleting it
 from the list through its deletion screen leaves an ID that no longer signs, and the list, empty
-then, says so. The list screen is compared with its snapshot.
+then, says so. The list and the deletion screen are compared with their snapshots.
 
 The screens to answer come first and those to leave alone last, so at a device the person
 answers: selection "Don't allow", selection "Allow", token consent "Allow", the credential and
@@ -158,7 +157,6 @@ SIGN_IN = "Sign in"
 OTHER_ACCOUNT = "Other account"
 EXCLUDED_TITLE = "Already registered"
 EXCLUDED_CONFIRM = "OK"
-DELETE_TITLE = f"Delete the passkey for {RP_ID}?"
 DELETE_CONFIRM = "Delete"
 # The longest domain, 253 characters (RFC 1035 §2.3.4), which a screen shows whole.
 LONG_RP_ID = "a." * 121 + "example.com"
@@ -946,13 +944,10 @@ def check_credential_management(
         "credMgmt: updateUserInformation renames a credential",
     )
     client_data_hash = hashlib.sha256(b"client data").digest()
-    for origin, delete_snapshot in (("device", snapshot("delete", DELETE_TITLE)), ("seed", None)):
+    for origin in ("device", "seed"):
         descriptor = {"type": "public-key", "id": registered[origin].credential_id}
-        status, _ = pressed(
-            user,
-            [(DELETE_TITLE, DELETE_CONFIRM, delete_snapshot)],
-            lambda d=descriptor: credman.delete_cred(d),
-        )
+        # §6.8.5 asks for no gesture beyond the token: no screen.
+        status = ctap_status(lambda d=descriptor: credman.delete_cred(d))
         check(status == CtapError.ERR.SUCCESS, f"credMgmt: the {origin} credential is deleted ({status!r})")
         status = ctap_status(
             lambda d=descriptor: ctap.get_assertion(
@@ -1017,7 +1012,8 @@ def open_passkey_list(user: SpeculosUser) -> None:
 def check_settings_list(device: CtapHidDevice, user: SpeculosUser, snapshot) -> None:
     """The passkey list of the device's settings, in Speculos: a new credential is listed first,
     deleting it there through its deletion screen leaves an ID that no longer signs, and the
-    list, empty then, says so. The list screen is compared with its snapshot."""
+    list, empty then, says so. The list and the deletion screen are compared with their
+    snapshots."""
     ctap = Ctap2(device)
     client_data_hash = hashlib.sha256(b"client data").digest()
     status, made = pressed(
@@ -1041,6 +1037,9 @@ def check_settings_list(device: CtapHidDevice, user: SpeculosUser, snapshot) -> 
     user.press(DELETE_CONFIRM)
     # "Delete the passkey for <RP>?", or on a Nano, which shortens it, "Delete this passkey?".
     wait_for_screen("Delete th")
+    delete_snapshot = snapshot("delete", "Delete th")
+    if delete_snapshot is not None:
+        delete_snapshot()
     user.press(DELETE_CONFIRM)
     # The list again, without it: credential management deleted the others, so it is empty.
     wait_for_screen("No passkeys")
