@@ -263,3 +263,17 @@ diff --git a/tests/standard/fido2/user_presence/test_user_presence.py b/tests/st
 +        # presence as usual; CTAP 2.0 refused the key itself.
 +        device.sendMC(*FidoRequest(MCRes, options={"up": True}).toMC())
 
+diff --git a/tests/utils.py b/tests/utils.py
+--- a/tests/utils.py
++++ b/tests/utils.py
+@@ -106,6 +106,10 @@
+     if param == "key_params":
+         return get_key_params()
+     if param == "allow_list":
+-        return []
++        # CTAP 2.2 section 6.2: "A platform MUST NOT send an empty allowList", it omits the
++        # member instead; a present allowList limits the assertion to the credentials it
++        # denotes, so an empty one by default would find no discoverable credential.
++        return None
+     if param == "on_keepalive":
+         return DeviceSelectCredential(1)

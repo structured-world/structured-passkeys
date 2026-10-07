@@ -516,21 +516,22 @@ fn a_command_without_room_still_ends_the_continuation() {
     assert_eq!(run(&mut authenticator, &mut ui, &[0x08]), [NOT_ALLOWED]);
 }
 
-/// An empty allowList is treated as an absent one: §6.2.2 locates credentials from the list only
-/// "If the allowList parameter is present and non-empty", and otherwise from the discoverable
-/// credentials of the RP, which then sign.
+/// An empty allowList denotes no credential: §6.2 lets an authenticator use only the credentials
+/// a present allowList denotes, and the discoverable credentials of §6.2.2 are searched only when
+/// it is absent. A discoverable credential of the RP therefore does not sign, and no screen is
+/// shown for it.
 #[test]
-fn an_empty_allow_list_finds_discoverable_credentials() {
+fn an_empty_allow_list_finds_no_credentials() {
     let mut authenticator = authenticator();
-    let made = register(&mut authenticator, RP_ID, b"user-1", true, None);
-    let (response, _) = assert_with(
+    register(&mut authenticator, RP_ID, b"user-1", true, None);
+    let (response, asked) = assert_with(
         &mut authenticator,
         &assertion(Some(&[]), &[]),
         Answer::Confirmed,
         0,
     );
-    assert_eq!(response[0], OK);
-    assert!(asserted(&response[1..]).signed_by(&made));
+    assert_eq!(response, [NO_CREDENTIALS]);
+    assert_eq!(asked, [], "no screen");
 }
 
 /// Nothing to sign with is CTAP2_ERR_NO_CREDENTIALS: an RP without credentials, an allowList of
