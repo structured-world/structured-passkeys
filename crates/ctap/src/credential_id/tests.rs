@@ -4,7 +4,7 @@
 
 use super::{
     CredProtect, Credential, KeySource, MAX_CREDENTIAL_ID_LEN, MAX_NAME_LEN, MAX_USER_ID_LEN,
-    OpenError, SealError, User, VERSION, seal, truncate_on_char_boundary,
+    OpenError, SealError, StoreId, User, VERSION, seal, truncate_on_char_boundary,
 };
 use crate::attestation::ES256;
 use crate::crypto::{Crypto, KEY_LEN, NONCE_LEN};
@@ -73,6 +73,7 @@ fn seed_credential() -> Credential {
         cred_protect: CredProtect::Optional,
         user: None,
         reset_id: 0,
+        store: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn slot_credential() -> Credential {
             display_name: Some("Alice A".into()),
         }),
         reset_id: 2,
+        store: StoreId::new(7),
     }
 }
 
@@ -119,7 +121,7 @@ fn a_slot_credential_seals_to_the_reference_bytes() {
     assert_eq!(
         id,
         hex(
-            "01f91b337d83bdbe27156e7edd02ea9dc1e297fd9d28359f745420509d161874e9c41969152b6051178844074d763d5f217f7375083da1342dcb7ec4c6ca6c2afe7683d2072253ee07eb6e27f1a6ea257e657060"
+            "01f91b337d83bdbe27156e7edd03ea9dc1e297fd9d28359f745420509d161874e9c41969152b6051178844074d763d5f217f7375083da1342dcb7ec4c6ca6c2afe7683d2b81222198e3d8a69df84e1aa0e7a4fceac30"
         )
     );
     assert_eq!(open(&crypto, &keys, RP, &id), Ok(slot_credential()));
@@ -238,7 +240,8 @@ fn seal_raw(crypto: &mut SoftCrypto, keys: &KeyRing, plaintext: &[u8]) -> Vec<u8
 }
 
 /// An authenticated plaintext that is not this format is refused, never half-read: a missing
-/// epoch, an unknown key, a seed of the wrong length, a device-only origin carrying a seed, a
+/// epoch, a store ID on a non-discoverable credential, a discoverable one without a store ID or
+/// with store ID 0, a seed of the wrong length, a device-only origin carrying a seed, a
 /// discoverable credential without a user ID, trailing bytes.
 #[test]
 fn authenticated_plaintexts_of_another_shape_are_refused() {
@@ -255,10 +258,23 @@ fn authenticated_plaintexts_of_another_shape_are_refused() {
             &[0xA5, 0x01, 0x01, 0x02, 0x26, 0x03],
             &[0x06, 0x01, 0x07, 0xF4],
         ),
-        // An extra key 12 after the epoch.
+        // A store ID (key 12) on a non-discoverable credential.
         around_seed(
             &[0xA7, 0x01, 0x01, 0x02, 0x26, 0x03],
-            &[0x06, 0x01, 0x07, 0xF4, 0x0B, 0x00, 0x0C, 0x00],
+            &[0x06, 0x01, 0x07, 0xF4, 0x0B, 0x00, 0x0C, 0x05],
+        ),
+        // A discoverable credential without its store ID: {1: 1, 2: -7, 3: cs, 6: 1, 7: true,
+        // 8: h'01', 11: 0}.
+        around_seed(
+            &[0xA7, 0x01, 0x01, 0x02, 0x26, 0x03],
+            &[0x06, 0x01, 0x07, 0xF5, 0x08, 0x41, 0x01, 0x0B, 0x00],
+        ),
+        // A discoverable credential with store ID 0, which marks no store ID.
+        around_seed(
+            &[0xA8, 0x01, 0x01, 0x02, 0x26, 0x03],
+            &[
+                0x06, 0x01, 0x07, 0xF5, 0x08, 0x41, 0x01, 0x0B, 0x00, 0x0C, 0x00,
+            ],
         ),
         // A 31-byte seed.
         [
@@ -318,6 +334,38 @@ fn authenticated_plaintexts_of_another_shape_are_refused() {
     );
     let id = seal_raw(&mut crypto, &keys, &valid);
     assert_eq!(open(&crypto, &keys, RP, &id), Ok(seed_credential()));
+    // And a discoverable one with store ID 5 opens with it.
+    let discoverable = around_seed(
+        &[0xA8, 0x01, 0x01, 0x02, 0x26, 0x03],
+        &[
+            0x06, 0x01, 0x07, 0xF5, 0x08, 0x41, 0x01, 0x0B, 0x00, 0x0C, 0x05,
+        ],
+    );
+    let id = seal_raw(&mut crypto, &keys, &discoverable);
+    let opened = open(&crypto, &keys, RP, &id).expect("opens");
+    assert_eq!(opened.store, StoreId::new(5));
+}
+
+/// A store ID goes with a discoverable credential only: sealing a non-discoverable one with it,
+/// or a discoverable one without it, is refused, so no ID is written that `open` would refuse.
+#[test]
+fn a_store_id_comes_exactly_with_a_discoverable_credential() {
+    let (mut crypto, keys) = platform();
+    let non_discoverable = Credential {
+        store: StoreId::new(7),
+        ..seed_credential()
+    };
+    let discoverable = Credential {
+        store: None,
+        ..slot_credential()
+    };
+    for credential in [non_discoverable, discoverable] {
+        assert_eq!(
+            seal(&mut crypto, &keys, RP, &credential),
+            Err(SealError::StoreId),
+            "{credential:?}"
+        );
+    }
 }
 
 /// Names longer than 64 bytes are cut on a character boundary, never inside a UTF-8 sequence.
@@ -406,6 +454,7 @@ fn the_largest_credential_fits_the_reported_maximum() {
             display_name: Some("d".repeat(MAX_NAME_LEN)),
         }),
         reset_id: u32::MAX,
+        store: StoreId::new(u32::MAX),
     };
     let (mut crypto, keys) = platform();
     let id = seal(&mut crypto, &keys, RP, &credential).expect("fits");

@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN};
+use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN, StoreId};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::ctap2::StatusCode;
 
@@ -28,7 +28,7 @@ pub use memory::MemoryStorage;
 
 /// Version of the record layout below, stored in the configuration. NVM that holds another
 /// version (or none: a fresh install reads all zeros) is wiped and formatted on open.
-pub const LAYOUT_VERSION: u8 = 1;
+pub const LAYOUT_VERSION: u8 = 2;
 /// Longest RP ID kept in an index entry, in bytes.
 pub const MAX_RP_ID_LEN: usize = 64;
 /// Length of the stored PIN verifier, `LEFT(SHA-256(PIN), 16)` (CTAP 2.2 §6.5.5.5).
@@ -43,7 +43,7 @@ pub const PIN_RETRIES: u8 = 8;
 const USED: u8 = 1;
 
 // Configuration record: version, generation, reset ID, alwaysUv, PIN retries, PIN set, verifier,
-// creation sequence limit, device key set, device key.
+// creation sequence limit, device key set, device key, store ID (0: none yet).
 const CONFIG_VERSION: usize = 0;
 const CONFIG_GENERATION: usize = 1;
 const CONFIG_RESET_ID: usize = 5;
@@ -54,8 +54,9 @@ const CONFIG_PIN: usize = 12;
 const CONFIG_SEQUENCE_LIMIT: usize = CONFIG_PIN + PIN_VERIFIER_LEN;
 const CONFIG_DEVICE_KEY_SET: usize = CONFIG_SEQUENCE_LIMIT + 4;
 const CONFIG_DEVICE_KEY: usize = CONFIG_DEVICE_KEY_SET + 1;
+const CONFIG_STORE_ID: usize = CONFIG_DEVICE_KEY + KEY_LEN;
 /// Length of the configuration record.
-pub const CONFIG_LEN: usize = CONFIG_DEVICE_KEY + KEY_LEN;
+pub const CONFIG_LEN: usize = CONFIG_STORE_ID + 4;
 
 /// Creation sequences are handed out in blocks: the configuration records the end of the
 /// current block, so one configuration write covers this many creations and a sequence below
@@ -367,8 +368,9 @@ impl<S: Storage> Store<S> {
             // credentials for as long as this NVM lives; the reset ID travels in the encrypted
             // backup, and the reset confirmation screen says both. Device-only credentials are
             // unaffected: their keys are gone with the NVM.
-            // No device key: the record of another layout holds none that this one could read.
-            store.write_record(&Config::after_reset(0), 0, None);
+            // No device key and no store ID: the record of another layout holds none that this
+            // one could read, and the first discoverable credential draws the store ID.
+            store.write_record(&Config::after_reset(0), 0, None, 0);
             return store;
         }
         let mut store = Self {
@@ -411,7 +413,40 @@ impl<S: Storage> Store<S> {
     pub fn write_config(&mut self, config: &Config) {
         let device_key = self.device_key();
         let reset_id = read_u32(self.storage.config(), CONFIG_RESET_ID);
-        self.write_record(config, reset_id, device_key.as_deref());
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(config, reset_id, device_key.as_deref(), store_id);
+    }
+
+    /// The store ID of this NVM, if a discoverable credential was created since it was
+    /// formatted.
+    pub fn store_id(&self) -> Option<StoreId> {
+        StoreId::new(read_u32(self.storage.config(), CONFIG_STORE_ID))
+    }
+
+    /// The store ID of this NVM, first drawn from the TRNG and written into the configuration if
+    /// there is none: a random nonzero value, kept until NVM is formatted again (a reset keeps
+    /// it, as the reset ID already revokes what was created before).
+    pub fn store_id_or_create<C: Crypto>(&mut self, crypto: &mut C) -> StoreId {
+        if let Some(store_id) = self.store_id() {
+            return store_id;
+        }
+        // Drawn until nonzero: a draw is 0 with probability 2^-32.
+        let store_id = loop {
+            let mut bytes = [0u8; 4];
+            crypto.random(&mut bytes);
+            if let Some(store_id) = StoreId::new(u32::from_le_bytes(bytes)) {
+                break store_id;
+            }
+        };
+        let config = self.config();
+        let device_key = self.device_key();
+        self.write_record(
+            &config,
+            config.reset_id,
+            device_key.as_deref(),
+            store_id.get(),
+        );
+        store_id
     }
 
     /// The device key `K_dev` of non-discoverable device-only credentials, if one was created
@@ -421,7 +456,7 @@ impl<S: Storage> Store<S> {
         (record[CONFIG_DEVICE_KEY_SET] == USED).then(|| {
             // Copied straight into the zeroizing buffer: no plain array holds it on the way.
             let mut key = Zeroizing::new([0u8; KEY_LEN]);
-            key.copy_from_slice(&record[CONFIG_DEVICE_KEY..CONFIG_LEN]);
+            key.copy_from_slice(&record[CONFIG_DEVICE_KEY..CONFIG_STORE_ID]);
             key
         })
     }
@@ -435,13 +470,21 @@ impl<S: Storage> Store<S> {
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         crypto.random(&mut key[..]);
         let config = self.config();
-        self.write_record(&config, config.reset_id, Some(&key));
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(&config, config.reset_id, Some(&key), store_id);
         key
     }
 
     /// Writes `config` with `reset_id` in place of its own, so a caller can keep the stored reset
-    /// ID without copying the rest of the configuration (it holds the PIN verifier).
-    fn write_record(&mut self, config: &Config, reset_id: u32, device_key: Option<&[u8; KEY_LEN]>) {
+    /// ID without copying the rest of the configuration (it holds the PIN verifier), and with
+    /// `store_id` (0 for none).
+    fn write_record(
+        &mut self,
+        config: &Config,
+        reset_id: u32,
+        device_key: Option<&[u8; KEY_LEN]>,
+        store_id: u32,
+    ) {
         let mut record = Zeroizing::new([0u8; CONFIG_LEN]);
         record[CONFIG_VERSION] = LAYOUT_VERSION;
         write_u32(&mut record[..], CONFIG_GENERATION, self.generation);
@@ -455,8 +498,9 @@ impl<S: Storage> Store<S> {
         write_u32(&mut record[..], CONFIG_SEQUENCE_LIMIT, self.sequence_limit);
         if let Some(key) = device_key {
             record[CONFIG_DEVICE_KEY_SET] = USED;
-            record[CONFIG_DEVICE_KEY..CONFIG_LEN].copy_from_slice(key);
+            record[CONFIG_DEVICE_KEY..CONFIG_STORE_ID].copy_from_slice(key);
         }
+        write_u32(&mut record[..], CONFIG_STORE_ID, store_id);
         self.storage.write_config(&record);
     }
 
@@ -489,7 +533,9 @@ impl<S: Storage> Store<S> {
             .generation
             .checked_add(1)
             .ok_or(StoreError::Exhausted)?;
-        self.write_record(&Config::after_reset(reset_id), reset_id, None);
+        // The store ID stays: the new reset ID already refuses every ID created before.
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(&Config::after_reset(reset_id), reset_id, None, store_id);
         self.sweep();
         Ok(())
     }

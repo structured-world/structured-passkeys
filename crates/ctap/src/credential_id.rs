@@ -4,7 +4,7 @@
 //! ```text
 //! credential_id = version (1, 0x01) || nonce (12) || ciphertext || tag (16)
 //! AAD           = version || SHA-256(rpId)
-//! plaintext     = canonical CBOR map, keys 1..=11 as listed on [`Credential`]
+//! plaintext     = canonical CBOR map, keys 1..=12 as listed on [`Credential`]
 //! ```
 
 use alloc::string::String;
@@ -31,7 +31,7 @@ pub const SEED_LEN: usize = 32;
 pub const SLOT_TAG_LEN: usize = 16;
 
 /// Largest plaintext: the map header and every field at its maximum size.
-const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
+const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 12 entries
     + 2 // 1: origin
     + 2 + 9 // 2: alg, any i64
     + 1 + 2 + SEED_LEN // 3: cs
@@ -41,7 +41,8 @@ const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
     + 2 // 7: rk
     + 1 + 2 + MAX_USER_ID_LEN // 8: user_id
     + 2 * (1 + 2 + MAX_NAME_LEN) // 9, 10: names
-    + 2 + 5; // 11: epoch, up to u32
+    + 2 + 5 // 11: reset ID, up to u32
+    + 1 + 5; // 12: store ID, up to u32
 
 /// Longest credential ID, reported as `maxCredentialIdLength`.
 pub const MAX_CREDENTIAL_ID_LEN: usize = 1 + NONCE_LEN + MAX_PLAINTEXT_LEN + TAG_LEN;
@@ -142,6 +143,25 @@ impl TryFrom<u64> for CredProtect {
     }
 }
 
+/// The store ID of the NVM that created a discoverable credential: random, nonzero, drawn once
+/// per NVM. A discoverable ID carrying the current store ID opens only while its index entry
+/// exists, so deleting the entry revokes it although the recovery phrase reproduces its key
+/// (CTAP 2.2 §6.1.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreId(u32);
+
+impl StoreId {
+    /// The store ID `value`; `None` for 0, which marks no store ID in the configuration.
+    pub const fn new(value: u32) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    /// The value, never 0.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// The user of a discoverable credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct User {
@@ -155,7 +175,8 @@ pub struct User {
 
 /// Everything a credential ID carries. Plaintext keys: 1 origin (0 device-only, 1
 /// seed-recoverable), 2 alg, 3 cs (seed-recoverable, or device-only under `K_dev`), 4 slot, 5
-/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 reset ID.
+/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 reset ID, 12 store
+/// ID (discoverable only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credential {
     /// Where the private key comes from.
@@ -169,6 +190,9 @@ pub struct Credential {
     /// The device's reset ID at creation: 0 before any reset, otherwise the random value the
     /// last reset drew.
     pub reset_id: u32,
+    /// The store ID of the NVM that created a discoverable credential; `None` exactly when
+    /// `user` is, since a non-discoverable credential has no entry to delete.
+    pub store: Option<StoreId>,
 }
 
 /// Why a credential ID does not open.
@@ -194,6 +218,8 @@ pub enum SealError {
     /// A key source that does not fit the credential: a slot key belongs to a discoverable
     /// credential, which its entry can delete, and a key under `K_dev` to a non-discoverable one.
     KeySource,
+    /// A store ID on a non-discoverable credential, or none on a discoverable one.
+    StoreId,
 }
 
 /// Whether `key` may carry a credential that is discoverable or not, as `discoverable` says.
@@ -231,12 +257,16 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
     let names = user.map_or(0, |user| {
         usize::from(user.name.is_some()) + usize::from(user.display_name.is_some())
     });
-    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, reset ID.
+    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, reset ID, store ID.
     let key_fields = match credential.key {
         KeySource::Seed(_) | KeySource::Device(_) => 1,
         KeySource::Slot { .. } => 2,
     };
-    let entries = 5 + key_fields + usize::from(user.is_some()) + names;
+    let entries = 5
+        + key_fields
+        + usize::from(user.is_some())
+        + names
+        + usize::from(credential.store.is_some());
     let write = |encoder: &mut Encoder<'_>| -> Result<(), cbor::Full> {
         encoder.map(entries)?;
         match &credential.key {
@@ -273,6 +303,9 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
         encoder
             .unsigned(11)?
             .unsigned(u64::from(credential.reset_id))?;
+        if let Some(store) = credential.store {
+            encoder.unsigned(12)?.unsigned(u64::from(store.get()))?;
+        }
         Ok(())
     };
     write(&mut encoder).map_err(|_| SealError::TooLong)?;
@@ -285,7 +318,8 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
 /// # Errors
 ///
 /// [`SealError::TooLong`] for a user ID over 64 bytes, [`SealError::KeySource`] for a
-/// key source that does not fit the credential's discoverability.
+/// key source that does not fit the credential's discoverability, [`SealError::StoreId`] for a
+/// store ID present on a non-discoverable credential or missing on a discoverable one.
 pub fn seal<C: Crypto>(
     crypto: &mut C,
     keys: &KeyRing,
@@ -294,6 +328,9 @@ pub fn seal<C: Crypto>(
 ) -> Result<Vec<u8>, SealError> {
     if !key_fits(&credential.key, credential.user.is_some()) {
         return Err(SealError::KeySource);
+    }
+    if credential.store.is_some() != credential.user.is_some() {
+        return Err(SealError::StoreId);
     }
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
@@ -496,7 +533,17 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             return Err(NOT_A_CREDENTIAL);
         }
         let reset_id = u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
-        if entries.next_key()?.is_some() {
+        // A discoverable credential carries its store ID, a non-discoverable one never does.
+        let store = match (user.is_some(), next_int_key(entries)?) {
+            (true, Some(12)) => {
+                let value =
+                    u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
+                Some(StoreId::new(value).ok_or(NOT_A_CREDENTIAL)?)
+            }
+            (false, None) => None,
+            _ => return Err(NOT_A_CREDENTIAL),
+        };
+        if store.is_some() && entries.next_key()?.is_some() {
             return Err(NOT_A_CREDENTIAL);
         }
         Ok(Credential {
@@ -505,6 +552,7 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             cred_protect,
             user,
             reset_id,
+            store,
         })
     })?;
     decoder.finish()?;

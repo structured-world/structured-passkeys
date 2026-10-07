@@ -338,15 +338,30 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     pub(super) fn locate(&self, keys: &KeyRing, rp_id: &str, id: &[u8]) -> Option<Credential> {
         let reset_id = self.store.config().reset_id;
         let credential = credential_id::open(&self.crypto, keys, rp_id, id, reset_id).ok()?;
-        let live = match &credential.key {
-            KeySource::Slot { index, tag } => self.store.key(*index, tag).is_some(),
-            KeySource::Device(_) => self.store.device_key().is_some(),
-            KeySource::Seed(_) => credential
+        let live = match (&credential.key, credential.store) {
+            (KeySource::Slot { index, tag }, _) => self.store.key(*index, tag).is_some(),
+            (KeySource::Device(_), _) => self.store.device_key().is_some(),
+            // Created by this NVM: it lives exactly as long as its index entry, so deleting or
+            // replacing the entry revokes it (§6.1.3, key model "deletion").
+            (KeySource::Seed(_), Some(store)) if self.store.store_id() == Some(store) => {
+                self.indexed(rp_id, id)
+            }
+            // From another install or device with the same recovery phrase: the phrase restores
+            // it, unless this NVM holds a newer credential for its user.
+            (KeySource::Seed(_), _) => credential
                 .user
                 .as_ref()
                 .is_none_or(|user| !self.overwritten(keys, rp_id, &user.id, id)),
         };
         live.then_some(credential)
+    }
+
+    /// Whether the index holds the discoverable credential `id` for `rp_id`.
+    fn indexed(&self, rp_id: &str, id: &[u8]) -> bool {
+        let rp_id_hash = self.crypto.sha256(&[rp_id.as_bytes()]);
+        self.store
+            .entries()
+            .any(|entry| entry.rp_id_hash == &rp_id_hash && entry.credential_id == id)
     }
 
     /// Whether the index holds another credential for `rp_id` and the same user than the

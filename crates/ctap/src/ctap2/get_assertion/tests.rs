@@ -584,6 +584,69 @@ fn a_replaced_credential_no_longer_signs() {
     }
 }
 
+/// Removes the index entry holding `id`, as deleteCredential does.
+fn remove_entry(authenticator: &mut Authenticator<SoftCrypto, MemoryStorage>, id: &[u8]) {
+    let entry = authenticator
+        .store
+        .entries()
+        .find(|entry| entry.credential_id == id)
+        .map(|entry| entry.id)
+        .expect("the credential is in the index");
+    assert!(authenticator.store.remove(entry));
+}
+
+/// A deleted discoverable credential no longer signs, also from an allowList with its ID (CTAP
+/// 2.2 §6.1.3), whatever its origin; a seed-recoverable ID would otherwise open from the
+/// recovery phrase alone.
+#[test]
+fn a_deleted_credential_no_longer_signs() {
+    for origin in [Origin::SeedRecoverable, Origin::DeviceOnly] {
+        let mut authenticator = authenticator();
+        let made = register(&mut authenticator, RP_ID, b"user-1", true, Some(origin));
+        remove_entry(&mut authenticator, &made.id);
+        let (response, asked) = assert_with(
+            &mut authenticator,
+            &assertion(Some(&[&made.id]), &[]),
+            Answer::Confirmed,
+            0,
+        );
+        assert_eq!(response, [NO_CREDENTIALS], "{origin:?}");
+        assert_eq!(asked, [], "no screen for {origin:?}");
+    }
+}
+
+/// A credential replaced by a newer one for the same user stays revoked once the newer one is
+/// deleted too: neither ID signs (§6.1.3). Without the store binding the older seed-recoverable
+/// ID came back, as no entry of the user was left to tell it was replaced.
+#[test]
+fn a_replaced_credential_stays_revoked_after_its_replacement_is_deleted() {
+    let mut authenticator = authenticator();
+    let old = register(
+        &mut authenticator,
+        RP_ID,
+        b"user-1",
+        true,
+        Some(Origin::SeedRecoverable),
+    );
+    let new = register(
+        &mut authenticator,
+        RP_ID,
+        b"user-1",
+        true,
+        Some(Origin::SeedRecoverable),
+    );
+    remove_entry(&mut authenticator, &new.id);
+    for id in [&old.id, &new.id] {
+        let (response, _) = assert_with(
+            &mut authenticator,
+            &assertion(Some(&[id]), &[]),
+            Answer::Confirmed,
+            0,
+        );
+        assert_eq!(response, [NO_CREDENTIALS]);
+    }
+}
+
 /// On NVM installed fresh with the same recovery phrase, a seed-recoverable credential, also a
 /// discoverable one, signs again from its ID alone; a device-only one does not, its key gone with
 /// the NVM.

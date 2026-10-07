@@ -431,7 +431,7 @@ fn reset_erases_the_device_key() {
     assert_ne!(*store.device_key_or_create(&mut crypto), *before);
 }
 
-/// Formatting NVM of another layout keeps no device key from its bytes.
+/// Formatting NVM of another layout keeps no device key and no store ID from its bytes.
 #[test]
 fn another_layout_leaves_no_device_key() {
     let mut storage = MemoryStorage::new(1, 1);
@@ -440,6 +440,30 @@ fn another_layout_leaves_no_device_key() {
     storage.write_config(&config);
     let store = Store::open(storage);
     assert!(store.device_key().is_none());
+    assert!(store.store_id().is_none());
+}
+
+/// The store ID is drawn at the first discoverable credential of a formatted NVM, nonzero, and
+/// kept across reopens, configuration writes, a device key creation and a reset: the reset ID
+/// revokes what came before a reset, and the store ID tells this NVM's credentials from those of
+/// another install. A device key write or a PIN write never erases it.
+#[test]
+fn the_store_id_is_created_once_and_kept() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(1, 2));
+    assert!(store.store_id().is_none(), "none before the first");
+    let created = store.store_id_or_create(&mut crypto);
+    assert_ne!(created.get(), 0);
+    assert_eq!(store.store_id_or_create(&mut crypto), created);
+    store.write_config(&Config {
+        pin: Some(PinVerifier::new([7; 16])),
+        ..store.config()
+    });
+    store.device_key_or_create(&mut crypto);
+    assert_eq!(store.store_id(), Some(created));
+    store.reset(&mut crypto).expect("a generation left");
+    let store = Store::open(store.into_storage());
+    assert_eq!(store.store_id(), Some(created));
 }
 
 /// A reused slot gets a new tag, so the ID of the credential that held it no longer opens it.
