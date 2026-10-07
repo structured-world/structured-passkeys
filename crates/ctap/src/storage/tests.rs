@@ -5,7 +5,8 @@ use zeroize::Zeroizing;
 
 use super::{
     Config, DeviceKey, EntryId, INDEX_ENTRY_LEN, KEY_SLOT_LEN, KEY_TAG, LAYOUT_VERSION,
-    MAX_RP_ID_LEN, MemoryStorage, PIN_RETRIES, PinVerifier, Storage, Store, StoreError,
+    MAX_RP_ID_LEN, MAX_SEALED_NAMES_LEN, MemoryStorage, NAME_SLOT_LEN, PIN_RETRIES, PinVerifier,
+    Storage, Store, StoreError,
 };
 use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN};
 use crate::crypto::KEY_LEN;
@@ -72,8 +73,17 @@ struct Snapshot {
     pin: Option<[u8; 16]>,
     pin_retries: u8,
     device_key: Option<[u8; KEY_LEN]>,
-    entries: Vec<(Vec<u8>, String, Vec<u8>)>,
+    entries: Vec<Observed>,
     keys: Vec<(u16, [u8; KEY_LEN])>,
+}
+
+/// An entry as a caller sees it, with its sealed name override.
+#[derive(Debug, PartialEq, Eq)]
+struct Observed {
+    rp_id_hash: Vec<u8>,
+    rp_id: String,
+    credential_id: Vec<u8>,
+    names: Option<Vec<u8>>,
 }
 
 fn snapshot(store: &Store<MemoryStorage>) -> Snapshot {
@@ -97,12 +107,11 @@ fn snapshot(store: &Store<MemoryStorage>) -> Snapshot {
         device_key: store.device_key().map(|key| *key),
         entries: entries
             .iter()
-            .map(|entry| {
-                (
-                    entry.rp_id_hash.to_vec(),
-                    entry.rp_id.into(),
-                    entry.credential_id.to_vec(),
-                )
+            .map(|entry| Observed {
+                rp_id_hash: entry.rp_id_hash.to_vec(),
+                rp_id: entry.rp_id.into(),
+                credential_id: entry.credential_id.to_vec(),
+                names: store.names(entry.id).map(<[u8]>::to_vec),
             })
             .collect(),
         keys,
@@ -127,6 +136,13 @@ fn assert_no_residue(store: &Store<MemoryStorage>) {
         assert!(
             live || store.storage.key_slot(slot) == &[0; KEY_SLOT_LEN],
             "key slot {slot} keeps a retired key"
+        );
+    }
+    for slot in 0..store.storage.name_slots() {
+        let live = u16::try_from(slot).is_ok_and(|slot| store.names_owner(slot).is_some());
+        assert!(
+            live || store.storage.name_slot(slot) == &[0; NAME_SLOT_LEN],
+            "name slot {slot} keeps retired names"
         );
     }
 }
@@ -896,8 +912,8 @@ fn power_loss_leaves_old_or_new(
     }
 }
 
-/// After a reset (a nonzero reset ID): two discoverable credentials of RP A (one device-only),
-/// one of RP B, the device key and a PIN.
+/// After a reset (a nonzero reset ID): two discoverable credentials of RP A (one device-only,
+/// with updated names), one of RP B, the device key and a PIN.
 fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
     let mut store = Store::open(MemoryStorage::new(4, 4));
     store.reset(crypto).expect("counters far from wrapping");
@@ -907,7 +923,7 @@ fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
         pin: Some(PinVerifier::new([9; 16])),
         pin_retries: 6,
     });
-    add(
+    let (alice, _) = add(
         &mut store,
         crypto,
         &RP_A,
@@ -916,10 +932,95 @@ fn populated(crypto: &mut SoftCrypto) -> MemoryStorage {
         Some(&device_key(1)),
     )
     .expect("room");
+    store.set_names(alice, b"alice-names").expect("a name slot");
     add(&mut store, crypto, &RP_A, "bob", "1", None).expect("room");
     add(&mut store, crypto, &RP_B, "carol", "1", None).expect("room");
     store.device_key_or_create(crypto);
     store.into_storage()
+}
+
+/// Updating names is one write of the name slot.
+#[test]
+fn power_loss_while_updating_names() {
+    power_loss_leaves_old_or_new(populated, |store, _| {
+        let bob = store
+            .newest_first(&RP_A)
+            .first()
+            .map(|entry| entry.id)
+            .expect("bob's entry");
+        store.set_names(bob, b"bob-names").expect("a name slot");
+    });
+}
+
+/// Updated names belong to their entry: a second update rewrites the same slot, removing or
+/// replacing the entry retires them with it (they are not kept for the replacement), and names
+/// for an entry no longer in the index, or longer than any sealing writes, are refused.
+#[test]
+fn names_follow_their_entry() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::with_name_slots(4, 4, 2));
+    let (alice, _) = add(&mut store, &mut crypto, &RP_A, "alice", "1", None).expect("room");
+    assert_eq!(store.names(alice), None, "none before an update");
+    store.set_names(alice, b"first").expect("a free slot");
+    store.set_names(alice, b"second").expect("its own slot");
+    assert_eq!(store.names(alice), Some(&b"second"[..]));
+    let (bob, _) = add(&mut store, &mut crypto, &RP_A, "bob", "1", None).expect("room");
+    store.set_names(bob, b"bob").expect("the other slot");
+    assert_no_residue(&store);
+
+    let (replaced, _) = add(&mut store, &mut crypto, &RP_A, "alice", "2", None).expect("replaces");
+    assert_eq!(
+        store.names(replaced),
+        None,
+        "a new credential starts with its own names"
+    );
+    assert_eq!(store.names(alice), None);
+    assert_eq!(
+        store.set_names(alice, b"stale"),
+        Err(StoreError::Stale),
+        "the replaced entry takes no names"
+    );
+    assert!(store.remove(bob));
+    assert_eq!(store.names(bob), None);
+    assert_no_residue(&store);
+    assert_eq!(
+        store.set_names(replaced, &[0; MAX_SEALED_NAMES_LEN + 1]),
+        Err(StoreError::TooLong)
+    );
+}
+
+/// With every name slot holding the names of another entry, an update is refused as
+/// CTAP2_ERR_KEY_STORE_FULL (CTAP 2.2 §6.8.6 step 9), and the names already stored stay; a slot
+/// freed by a removal takes the next update.
+#[test]
+fn full_name_slots_are_refused() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::with_name_slots(4, 4, 1));
+    let (alice, _) = add(&mut store, &mut crypto, &RP_A, "alice", "1", None).expect("room");
+    let (bob, _) = add(&mut store, &mut crypto, &RP_A, "bob", "1", None).expect("room");
+    store.set_names(alice, b"alice").expect("the slot");
+    let refused = store.set_names(bob, b"bob");
+    assert_eq!(refused, Err(StoreError::Full));
+    assert_eq!(StatusCode::from(StoreError::Full), StatusCode::KeyStoreFull);
+    assert_eq!(store.names(alice), Some(&b"alice"[..]));
+    assert!(store.remove(alice));
+    store.set_names(bob, b"bob").expect("the freed slot");
+    assert_eq!(store.names(bob), Some(&b"bob"[..]));
+}
+
+/// A reset empties the name slots with every other slot, and a store opened again keeps the
+/// names of a live entry.
+#[test]
+fn names_survive_a_reopen_and_not_a_reset() {
+    let mut crypto = crypto();
+    let mut store = Store::open(MemoryStorage::new(4, 4));
+    let (alice, _) = add(&mut store, &mut crypto, &RP_A, "alice", "1", None).expect("room");
+    store.set_names(alice, b"alice").expect("a slot");
+    let mut store = Store::open(store.into_storage());
+    assert_eq!(store.names(alice), Some(&b"alice"[..]));
+    store.reset(&mut crypto).expect("a generation left");
+    assert_eq!(store.names(alice), None);
+    assert_no_residue(&store);
 }
 
 // Power loss is invisible to the store: each operation below runs to its end and succeeds

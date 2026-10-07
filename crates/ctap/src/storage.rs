@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN, StoreId};
+use crate::credential_id::{
+    KeySource, MAX_CREDENTIAL_ID_LEN, MAX_SEALED_NAMES_LEN, SLOT_TAG_LEN, StoreId,
+};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::ctap2::StatusCode;
 
@@ -90,6 +92,19 @@ const KEY_CRED_RANDOM: usize = KEY_CRED_RANDOM_UV + KEY_LEN;
 /// Length of a device-only key slot record.
 pub const KEY_SLOT_LEN: usize = KEY_CRED_RANDOM + KEY_LEN;
 
+// Name override slot: state, generation, owner (index slot, sequence), sealed length, sealed names.
+const NAMES_STATE: usize = 0;
+const NAMES_GENERATION: usize = 1;
+const NAMES_OWNER_SLOT: usize = 5;
+const NAMES_OWNER_SEQUENCE: usize = 7;
+const NAMES_SEALED_LEN: usize = 11;
+const NAMES_SEALED: usize = NAMES_SEALED_LEN + 2;
+/// Length of a name override slot record.
+pub const NAME_SLOT_LEN: usize = NAMES_SEALED + MAX_SEALED_NAMES_LEN;
+/// Name override slots on every device: renaming is rare, so 16 credentials with updated names
+/// at a time are enough, and a slot costs flash for every install.
+pub const NAME_SLOTS: usize = 16;
+
 /// The NVM regions of the device. Each write replaces one record atomically: after a power loss
 /// the record holds the value before the write or the value written, never a mix. The device
 /// implements it with the SDK's atomic storage; [`MemoryStorage`] is the host double.
@@ -114,6 +129,12 @@ pub trait Storage {
     fn key_slot(&self, slot: usize) -> &[u8; KEY_SLOT_LEN];
     /// Replaces the key slot record of `slot`.
     fn write_key_slot(&mut self, slot: usize, record: &[u8; KEY_SLOT_LEN]);
+    /// Number of name override slots.
+    fn name_slots(&self) -> usize;
+    /// The name override record of `slot`.
+    fn name_slot(&self, slot: usize) -> &[u8; NAME_SLOT_LEN];
+    /// Replaces the name override record of `slot`.
+    fn write_name_slot(&mut self, slot: usize, record: &[u8; NAME_SLOT_LEN]);
 }
 
 /// Why a store operation was refused. Nothing was written when it is returned.
@@ -350,6 +371,11 @@ impl<S: Storage> Store<S> {
             for slot in 0..storage.key_slots() {
                 if !is_zero(storage.key_slot(slot)) {
                     storage.write_key_slot(slot, &[0; KEY_SLOT_LEN]);
+                }
+            }
+            for slot in 0..storage.name_slots() {
+                if !is_zero(storage.name_slot(slot)) {
+                    storage.write_name_slot(slot, &[0; NAME_SLOT_LEN]);
                 }
             }
             let mut store = Self {
@@ -812,6 +838,68 @@ impl<S: Storage> Store<S> {
         })
     }
 
+    /// The sealed names updateUserInformation gave the entry `owner`, if its override slot is
+    /// still live.
+    pub fn names(&self, owner: EntryId) -> Option<&[u8]> {
+        (0..slot_count(self.storage.name_slots()))
+            .find(|&slot| self.names_owner(slot) == Some(owner))
+            .and_then(|slot| {
+                let record = self.storage.name_slot(usize::from(slot));
+                let length = usize::from(read_u16(record, NAMES_SEALED_LEN));
+                record.get(NAMES_SEALED..NAMES_SEALED + length)
+            })
+    }
+
+    /// Stores `sealed` names for the entry `owner`, in place of the names it had: its own slot
+    /// is rewritten, or a free one taken.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Stale`] when the index no longer holds `owner`, [`StoreError::TooLong`] for
+    /// sealed names over [`MAX_SEALED_NAMES_LEN`], [`StoreError::Full`] when every slot holds
+    /// the names of another entry (CTAP2_ERR_KEY_STORE_FULL, CTAP 2.2 §6.8.6 step 9).
+    pub fn set_names(&mut self, owner: EntryId, sealed: &[u8]) -> Result<(), StoreError> {
+        if self.entry(owner.slot).map(|entry| entry.id) != Some(owner) {
+            return Err(StoreError::Stale);
+        }
+        if sealed.len() > MAX_SEALED_NAMES_LEN {
+            return Err(StoreError::TooLong);
+        }
+        let slots = slot_count(self.storage.name_slots());
+        let slot = (0..slots)
+            .find(|&slot| self.names_owner(slot) == Some(owner))
+            .or_else(|| (0..slots).find(|&slot| self.names_owner(slot).is_none()))
+            .ok_or(StoreError::Full)?;
+        let mut record = [0u8; NAME_SLOT_LEN];
+        record[NAMES_STATE] = USED;
+        write_u32(&mut record, NAMES_GENERATION, self.generation);
+        write_u16(&mut record, NAMES_OWNER_SLOT, owner.slot);
+        write_u32(&mut record, NAMES_OWNER_SEQUENCE, owner.sequence);
+        // At most MAX_SEALED_NAMES_LEN, checked above, which fits in 16 bits.
+        let length = u16::try_from(sealed.len()).map_err(|_| StoreError::TooLong)?;
+        write_u16(&mut record, NAMES_SEALED_LEN, length);
+        record[NAMES_SEALED..NAMES_SEALED + sealed.len()].copy_from_slice(sealed);
+        self.storage.write_name_slot(usize::from(slot), &record);
+        Ok(())
+    }
+
+    /// The entry a name override slot belongs to, while it is live: of this generation, within
+    /// its length, and owned by an entry still in the index.
+    fn names_owner(&self, slot: u16) -> Option<EntryId> {
+        let record = self.storage.name_slot(usize::from(slot));
+        if record[NAMES_STATE] != USED
+            || read_u32(record, NAMES_GENERATION) != self.generation
+            || usize::from(read_u16(record, NAMES_SEALED_LEN)) > MAX_SEALED_NAMES_LEN
+        {
+            return None;
+        }
+        let owner = EntryId {
+            slot: read_u16(record, NAMES_OWNER_SLOT),
+            sequence: read_u32(record, NAMES_OWNER_SEQUENCE),
+        };
+        (self.entry(owner.slot).map(|entry| entry.id) == Some(owner)).then_some(owner)
+    }
+
     /// Whether a live key of this generation belongs to the entry `id`.
     fn owns_key(&self, id: EntryId) -> bool {
         (0..slot_count(self.storage.key_slots())).any(|key| {
@@ -843,7 +931,8 @@ impl<S: Storage> Store<S> {
             && self.entry(owner.slot).map(|entry| entry.id) == Some(owner)
     }
 
-    /// Wipes the keys owned by index slot `slot` that its current entry does not own.
+    /// Wipes the keys and name overrides owned by index slot `slot` that its current entry does
+    /// not own.
     fn wipe_orphans(&mut self, slot: u16) {
         for key in 0..slot_count(self.storage.key_slots()) {
             let record = self.storage.key_slot(usize::from(key));
@@ -851,6 +940,15 @@ impl<S: Storage> Store<S> {
             if owned_here && !self.key_is_live(key) {
                 self.storage
                     .write_key_slot(usize::from(key), &[0; KEY_SLOT_LEN]);
+            }
+        }
+        for names in 0..slot_count(self.storage.name_slots()) {
+            let record = self.storage.name_slot(usize::from(names));
+            let owned_here =
+                record[NAMES_STATE] == USED && read_u16(record, NAMES_OWNER_SLOT) == slot;
+            if owned_here && self.names_owner(names).is_none() {
+                self.storage
+                    .write_name_slot(usize::from(names), &[0; NAME_SLOT_LEN]);
             }
         }
     }
@@ -877,6 +975,12 @@ impl<S: Storage> Store<S> {
             let live = u16::try_from(slot).is_ok_and(|slot| self.key_is_live(slot));
             if !live && !is_zero(self.storage.key_slot(slot)) {
                 self.storage.write_key_slot(slot, &[0; KEY_SLOT_LEN]);
+            }
+        }
+        for slot in 0..self.storage.name_slots() {
+            let live = u16::try_from(slot).is_ok_and(|slot| self.names_owner(slot).is_some());
+            if !live && !is_zero(self.storage.name_slot(slot)) {
+                self.storage.write_name_slot(slot, &[0; NAME_SLOT_LEN]);
             }
         }
         // Every sequence below the recorded limit may have been handed out already.

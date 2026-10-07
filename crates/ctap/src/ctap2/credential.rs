@@ -13,7 +13,7 @@ use crate::credential_id::{self, Credential, KeySource, Origin, truncate_on_char
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
 use crate::keys::{DeviceKeys, KeyRing};
 use crate::pin::{Permissions, Protocol};
-use crate::storage::{MAX_RP_ID_LEN, Storage, stored_rp_id};
+use crate::storage::{EntryId, MAX_RP_ID_LEN, Storage, stored_rp_id};
 use crate::ui::{Answer, MAX_SHOWN_LEN, Prompt, RP_ID_FINGERPRINT_LEN, USER_ACTION_TIMEOUT_MS, Ui};
 
 /// Authenticator data flag UP, user present (WebAuthn L3 §6.1).
@@ -231,6 +231,19 @@ pub(super) const fn presence(answer: Answer) -> Result<(), StatusCode> {
     }
 }
 
+/// The answer to a confirmation that a command waits for, as authenticatorReset (§6.6) and
+/// authenticatorSelection (§6.9) answer it: approval goes on, a refusal is
+/// CTAP2_ERR_OPERATION_DENIED, no answer CTAP2_ERR_USER_ACTION_TIMEOUT, a request the platform
+/// cancelled CTAP2_ERR_KEEPALIVE_CANCEL (§11.2.9.1.5).
+pub(super) const fn presence_or_timeout(answer: Answer) -> Result<(), StatusCode> {
+    match answer {
+        Answer::Confirmed => Ok(()),
+        Answer::Rejected => Err(StatusCode::OperationDenied),
+        Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
+        Answer::TimedOut => Err(StatusCode::UserActionTimeout),
+    }
+}
+
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// A zero-length `pinUvAuthParam` (§6.1.2 step 1, §6.2.2 step 1): evidence of user
     /// interaction, then CTAP2_ERR_PIN_NOT_SET or CTAP2_ERR_PIN_INVALID by the PIN state. Over
@@ -337,7 +350,12 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// authenticator").
     pub(super) fn locate(&self, keys: &KeyRing, rp_id: &str, id: &[u8]) -> Option<Credential> {
         let reset_id = self.store.config().reset_id;
-        let credential = credential_id::open(&self.crypto, keys, rp_id, id, reset_id).ok()?;
+        let mut credential = credential_id::open(&self.crypto, keys, rp_id, id, reset_id).ok()?;
+        if credential.user.is_some()
+            && let Some(entry) = self.entry_of(rp_id, id)
+        {
+            self.apply_names(keys, entry, id, &mut credential);
+        }
         let live = match (&credential.key, credential.store) {
             (KeySource::Slot { index, tag }, _) => self.store.key(*index, tag).is_some(),
             (KeySource::Device(_), _) => self.store.device_key().is_some(),
@@ -358,10 +376,39 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
 
     /// Whether the index holds the discoverable credential `id` for `rp_id`.
     fn indexed(&self, rp_id: &str, id: &[u8]) -> bool {
+        self.entry_of(rp_id, id).is_some()
+    }
+
+    /// The index entry holding the discoverable credential `id` for `rp_id`, if any.
+    fn entry_of(&self, rp_id: &str, id: &[u8]) -> Option<EntryId> {
         let rp_id_hash = self.crypto.sha256(&[rp_id.as_bytes()]);
         self.store
             .entries()
-            .any(|entry| entry.rp_id_hash == &rp_id_hash && entry.credential_id == id)
+            .find(|entry| entry.rp_id_hash == &rp_id_hash && entry.credential_id == id)
+            .map(|entry| entry.id)
+    }
+
+    /// Replaces the names of the discoverable `credential` with ID `id`, held by the index entry
+    /// `entry`, by the ones updateUserInformation gave it, if any (CTAP 2.2 §6.8.6): every screen
+    /// and response shows the updated names. Names that no longer open (a corrupted slot) leave
+    /// the credential's own.
+    pub(super) fn apply_names(
+        &self,
+        keys: &KeyRing,
+        entry: EntryId,
+        id: &[u8],
+        credential: &mut Credential,
+    ) {
+        let Some(user) = credential.user.as_mut() else {
+            return;
+        };
+        let Some(sealed) = self.store.names(entry) else {
+            return;
+        };
+        if let Ok(names) = credential_id::open_names(&self.crypto, keys, id, sealed) {
+            user.name = names.name;
+            user.display_name = names.display_name;
+        }
     }
 
     /// Whether the index holds another credential for `rp_id` and the same user than the

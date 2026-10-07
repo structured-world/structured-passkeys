@@ -3,8 +3,9 @@
 //! open.
 
 use super::{
-    CredProtect, Credential, KeySource, MAX_CREDENTIAL_ID_LEN, MAX_NAME_LEN, MAX_USER_ID_LEN,
-    OpenError, SealError, StoreId, User, VERSION, seal, truncate_on_char_boundary,
+    CredProtect, Credential, KeySource, MAX_CREDENTIAL_ID_LEN, MAX_NAME_LEN, MAX_SEALED_NAMES_LEN,
+    MAX_USER_ID_LEN, Names, OpenError, SealError, StoreId, User, VERSION, open_names, seal,
+    seal_names, truncate_on_char_boundary,
 };
 use crate::attestation::ES256;
 use crate::crypto::{Crypto, KEY_LEN, NONCE_LEN};
@@ -344,6 +345,44 @@ fn authenticated_plaintexts_of_another_shape_are_refused() {
     let id = seal_raw(&mut crypto, &keys, &discoverable);
     let opened = open(&crypto, &keys, RP, &id).expect("opens");
     assert_eq!(opened.store, StoreId::new(5));
+}
+
+/// Updated names open back for the credential they were sealed for, with an empty name dropped
+/// (CTAP 2.2 §6.8.6 step 11) and a long one cut on a character boundary; for another credential ID
+/// or altered they do not open, and a credential ID never opens as names nor names as an ID.
+#[test]
+fn sealed_names_open_only_for_their_credential() {
+    let (mut crypto, keys) = platform();
+    let id = seal(&mut crypto, &keys, RP, &slot_credential()).expect("fits");
+    let names = Names {
+        name: Some(format!("{}é", "b".repeat(63))),
+        display_name: Some(String::new()),
+    };
+    let sealed = seal_names(&mut crypto, &keys, &id, &names);
+    assert!(sealed.len() <= MAX_SEALED_NAMES_LEN);
+    assert_eq!(
+        open_names(&crypto, &keys, &id, &sealed),
+        Ok(Names {
+            name: Some("b".repeat(63)),
+            display_name: None,
+        })
+    );
+    let other = seal(&mut crypto, &keys, RP, &slot_credential()).expect("fits");
+    assert_eq!(
+        open_names(&crypto, &keys, &other, &sealed),
+        Err(OpenError::Authentication)
+    );
+    let mut altered = sealed.clone();
+    *altered.last_mut().expect("a tag") ^= 1;
+    assert_eq!(
+        open_names(&crypto, &keys, &id, &altered),
+        Err(OpenError::Authentication)
+    );
+    assert!(open_names(&crypto, &keys, &id, &id).is_err());
+    assert!(open(&crypto, &keys, RP, &sealed).is_err());
+    // No names at all is a valid update: the RP removed both.
+    let none = seal_names(&mut crypto, &keys, &id, &Names::default());
+    assert_eq!(open_names(&crypto, &keys, &id, &none), Ok(Names::default()));
 }
 
 /// A store ID goes with a discoverable credential only: sealing a non-discoverable one with it,

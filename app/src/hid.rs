@@ -413,11 +413,10 @@ pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
     .flatten()
 }
 
-/// Refuses the request the transport handed out while a request from another transport runs: it
-/// is answered at once with CTAP1_ERR_CHANNEL_BUSY (CTAP 2.2 §8.2: "Client SHOULD retry the
-/// request after a short delay"), as the NFC applet answers in the other direction, rather than
-/// run after the other one with its CANCEL unheard meanwhile.
-#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
+/// Refuses the request the transport handed out while a request from another transport runs, or
+/// while the settings' screens wait: it is answered at once with CTAP1_ERR_CHANNEL_BUSY (CTAP 2.2
+/// §8.2: "Client SHOULD retry the request after a short delay"), as the NFC applet answers in the
+/// other direction, rather than run afterwards with its CANCEL unheard meanwhile.
 pub fn refuse_request() {
     with_hid(|hid| {
         if core::mem::take(&mut hid.pending)

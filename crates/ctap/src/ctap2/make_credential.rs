@@ -74,7 +74,9 @@ fn rp_entity<'a>(decoder: &mut Decoder<'a>) -> Result<Option<&'a str>, crate::cb
 
 /// Reads `user` (WebAuthn L3 §5.4.3); `None` without its `id`. The removed `icon` member and any
 /// other are skipped (§6.1, note on `user`).
-fn user_entity(decoder: &mut Decoder<'_>) -> Result<Option<UserEntity>, crate::cbor::Error> {
+pub(super) fn user_entity(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<UserEntity>, crate::cbor::Error> {
     decoder.map(|entries| {
         let mut id = None;
         let mut name = None;

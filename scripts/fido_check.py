@@ -54,9 +54,23 @@ screen; a registration for a 253-character domain, the longest, shows it whole. 
 verified with the key its registration returned. The registration, key type, account picker,
 sign-in and long RP ID screens are compared with their snapshots.
 
+Credential management (§6.8) and authenticatorConfig (§6.11), in Speculos and on a device, with
+tokens from built-in UV: getInfo reports credMgmt and authnrCfg; the metadata counts the
+credentials above, the RPs enumerate with their hashes, the credentials of the RP with their users
+and the public keys their registrations returned; updateUserInformation renames one;
+deleteCredential of the device-only and of the recovery phrase key, each confirmed on its deletion
+screen, leaves IDs that no longer sign; toggleAlwaysUv turns getInfo's alwaysUv on and off again.
+The consent for the credential management token and the deletion screen are compared with their
+snapshots.
+
+The passkey list of the device's settings, in Speculos: a new passkey is listed first; deleting it
+from the list through its deletion screen leaves an ID that no longer signs, and the list, empty
+then, says so. The list screen is compared with its snapshot.
+
 The screens to answer come first and those to leave alone last, so at a device the person
-answers: selection "Don't allow", selection "Allow", token consent "Allow", the credential screens
-as printed, then nothing while a selection is cancelled and the next one times out.
+answers: selection "Don't allow", selection "Allow", token consent "Allow", the credential and
+credential management screens as printed, then nothing while a selection is cancelled and the
+next one times out.
 """
 
 import argparse
@@ -74,7 +88,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fido2.ctap import CtapError
-from fido2.ctap2 import Ctap2
+from fido2.ctap2 import Config, CredentialManagement, Ctap2
 from fido2.ctap2.pin import PinProtocolV1, PinProtocolV2
 from fido2.hid import CAPABILITY, CtapHidDevice, list_descriptors, open_connection
 from fido2.hid.base import CtapHidConnection, HidDescriptor
@@ -123,8 +137,10 @@ KEY_AGREEMENT = 0x01
 PIN_UV_AUTH_TOKEN = 0x02
 PIN_RETRIES = 0x03
 UV_RETRIES = 0x05
-# getAssertion permission (§6.5.5.7).
+# The getAssertion, credential management and authenticatorConfig permissions (§6.5.5.7).
 PERMISSION_GA = 0x02
+PERMISSION_CM = 0x04
+PERMISSION_ACFG = 0x20
 # Authenticator data flags (WebAuthn L3 §6.1): UP, UV, BE, BS, AT.
 FLAG_UP = 0x01
 FLAG_UV = 0x04
@@ -142,6 +158,8 @@ SIGN_IN = "Sign in"
 OTHER_ACCOUNT = "Other account"
 EXCLUDED_TITLE = "Already registered"
 EXCLUDED_CONFIRM = "OK"
+DELETE_TITLE = f"Delete the passkey for {RP_ID}?"
+DELETE_CONFIRM = "Delete"
 # The longest domain, 253 characters (RFC 1035 §2.3.4), which a screen shows whole.
 LONG_RP_ID = "a." * 121 + "example.com"
 # The start of a registration screen: a Nano heads a long one with the short question.
@@ -690,9 +708,10 @@ def pressed(user, steps: list[tuple[str, str, object]], call) -> tuple[int, obje
     return while_answering(1.0, answer, lambda: ctap_result(call))
 
 
-def check_credentials(device: CtapHidDevice, user, snapshot) -> None:
+def check_credentials(device: CtapHidDevice, user, snapshot) -> dict[str, object]:
     """makeCredential, getAssertion and getNextAssertion (CTAP 2.2 §6.1 to §6.3) with built-in user
-    verification (the uv option, the device unlock), for both key origins."""
+    verification (the uv option, the device unlock), for both key origins. Returns the attested
+    credential data of the device-only and the recovery phrase registration for RP_ID."""
     ctap = Ctap2(device)
     info_options = ctap.info.options
     check(
@@ -852,6 +871,189 @@ def check_credentials(device: CtapHidDevice, user, snapshot) -> None:
         status == CtapError.ERR.SUCCESS,
         f"makeCredential: a 253-character RP ID registers ({status!r})",
     )
+    return {
+        "device": device_only.auth_data.credential_data,
+        "seed": seed.auth_data.credential_data,
+    }
+
+
+def uv_token(ctap: Ctap2, user, permissions: int, snapshot=None) -> bytes:
+    """A pinUvAuthToken with `permissions` and no RP ID from built-in user verification, after the
+    consent on the device."""
+    protocol = PinProtocolV2()
+    token: list[bytes] = []
+
+    def get() -> None:
+        session = PinSession(ctap, protocol)
+        response = session.client_pin(GET_TOKEN_USING_UV, permissions=permissions)
+        token.append(protocol.decrypt(session.secret, response[PIN_UV_AUTH_TOKEN]))
+
+    status = answered(user, True, TOKEN_TITLE, get, snapshot)
+    check(
+        status == CtapError.ERR.SUCCESS and len(token) == 1,
+        f"built-in UV: a token with permissions {permissions:#04x} ({status!r})",
+    )
+    return token[0]
+
+
+def check_credential_management(
+    device: CtapHidDevice, user, snapshot, registered: dict[str, object]
+) -> None:
+    """authenticatorCredentialManagement (CTAP 2.2 §6.8) with a cm token from built-in UV, on the
+    credentials check_credentials registered: the metadata counts them, the RPs and the RP's
+    credentials enumerate with their users and public keys, updateUserInformation renames one,
+    and deleteCredential of either key origin, confirmed on the device, leaves an ID that no
+    longer signs."""
+    ctap = Ctap2(device)
+    info_options = ctap.info.options
+    check(
+        info_options.get("credMgmt") is True and info_options.get("authnrCfg") is True,
+        f"getInfo: credMgmt and authnrCfg ({info_options})",
+    )
+    token = uv_token(ctap, user, PERMISSION_CM, snapshot("cm_token", TOKEN_TITLE))
+    credman = CredentialManagement(ctap, PinProtocolV2(), token)
+    result = CredentialManagement.RESULT
+    metadata = credman.get_metadata()
+    check(
+        metadata[result.EXISTING_CRED_COUNT] >= len(registered),
+        f"credMgmt: {metadata[result.EXISTING_CRED_COUNT]} discoverable credentials, "
+        f"{metadata[result.MAX_REMAINING_COUNT]} more fit",
+    )
+    rps = {rp[result.RP]["id"]: rp[result.RP_ID_HASH] for rp in credman.enumerate_rps()}
+    check(
+        rps.get(RP_ID) == hashlib.sha256(RP_ID.encode()).digest(),
+        f"credMgmt: the RPs enumerate with their hashes ({len(rps)} RPs)",
+    )
+    rp_hash = hashlib.sha256(RP_ID.encode()).digest()
+    listed = credman.enumerate_creds(rp_hash)
+    by_id = {entry[result.CREDENTIAL_ID]["id"]: entry for entry in listed}
+    expected = {data.credential_id: data for data in registered.values()}
+    check(
+        set(by_id) >= set(expected)
+        and all(by_id[cid][result.PUBLIC_KEY] == data.public_key for cid, data in expected.items())
+        and by_id[registered["seed"].credential_id][result.USER]["name"] == "seed user",
+        f"credMgmt: the credentials of {RP_ID} enumerate with their users and public keys",
+    )
+    seed_id = {"type": "public-key", "id": registered["seed"].credential_id}
+    credman.update_user_info(
+        seed_id, {"id": b"user-seed", "name": "renamed user", "displayName": "Renamed"}
+    )
+    renamed = {
+        entry[result.CREDENTIAL_ID]["id"]: entry[result.USER] for entry in credman.enumerate_creds(rp_hash)
+    }[registered["seed"].credential_id]
+    check(
+        renamed.get("name") == "renamed user" and renamed.get("displayName") == "Renamed",
+        "credMgmt: updateUserInformation renames a credential",
+    )
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    for origin, delete_snapshot in (("device", snapshot("delete", DELETE_TITLE)), ("seed", None)):
+        descriptor = {"type": "public-key", "id": registered[origin].credential_id}
+        status, _ = pressed(
+            user,
+            [(DELETE_TITLE, DELETE_CONFIRM, delete_snapshot)],
+            lambda d=descriptor: credman.delete_cred(d),
+        )
+        check(status == CtapError.ERR.SUCCESS, f"credMgmt: the {origin} credential is deleted ({status!r})")
+        status = ctap_status(
+            lambda d=descriptor: ctap.get_assertion(
+                RP_ID, client_data_hash, [d], options={"up": False}
+            )
+        )
+        check(
+            status == CtapError.ERR.NO_CREDENTIALS,
+            f"credMgmt: the deleted {origin} credential no longer signs ({status!r})",
+        )
+
+
+def check_config(device: CtapHidDevice, user) -> None:
+    """authenticatorConfig toggleAlwaysUv (CTAP 2.2 §6.11.2) with an acfg token from built-in UV:
+    getInfo reports alwaysUv on, then off again."""
+    ctap = Ctap2(device)
+    token = uv_token(ctap, user, PERMISSION_ACFG)
+    config = Config(ctap, PinProtocolV2(), token)
+    states = []
+    for _ in range(2):
+        config.toggle_always_uv()
+        states.append(ctap.get_info().options.get("alwaysUv"))
+    check(states == [True, False], f"authenticatorConfig: toggleAlwaysUv turns alwaysUv {states}")
+
+
+# The settings button at the top right of a touch model's home screen (NBGL
+# `nbgl_layoutAddTopRightButton`: `BUTTON_WIDTH` by `BUTTON_DIAMETER`, `BORDER_MARGIN` from the
+# corner).
+SETTINGS_BUTTON = {"stax": (336, 64), "flex": (404, 76), "apex_p": (257, 44)}
+SETTINGS_RP_ID = "settings.example"
+PASSKEY_TITLE = f"Passkey for {SETTINGS_RP_ID}"
+
+
+def open_passkey_list(user: SpeculosUser) -> None:
+    """From the home screen to the passkey list of the settings, as the person would."""
+    if user.nano:
+        for _ in range(10):
+            if button("App settings") is not None:
+                break
+            api("/button/right", {"action": "press-and-release"})
+            time.sleep(0.2)
+        api("/button/both", {"action": "press-and-release"})
+        time.sleep(0.5)
+        user.press("Passkeys")
+        return
+    # The home screen, after the status page of the last ceremony, which a touch would only end.
+    wait_for_screen("Quit app")
+    x, y = SETTINGS_BUTTON[user.model]
+    api("/finger", {"action": "press-and-release", "x": x, "y": y})
+    # The first settings page holds the passkey list entry; the header, the application's name,
+    # reads "Passkeys" too, so the entry is the one below it.
+    for _ in range(100):
+        entries = [e for e in screen_texts() if e["text"].strip() == "Passkeys"]
+        if len(entries) > 1:
+            entry = max(entries, key=lambda e: e["y"])
+            api("/finger", {"action": "press-and-release", "x": entry["x"], "y": entry["y"]})
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"FAILED: no passkey list entry in the settings: {screen_texts()}")
+
+
+def check_settings_list(device: CtapHidDevice, user: SpeculosUser, snapshot) -> None:
+    """The passkey list of the device's settings, in Speculos: a new credential is listed first,
+    deleting it there through its deletion screen leaves an ID that no longer signs, and the
+    list, empty then, says so. The list screen is compared with its snapshot."""
+    ctap = Ctap2(device)
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    status, made = pressed(
+        user,
+        # A Nano heads this registration with the short question.
+        [(REGISTER_START, REGISTER_CONFIRM, None)],
+        lambda: ctap.make_credential(
+            client_data_hash,
+            {"id": SETTINGS_RP_ID, "name": "Settings"},
+            {"id": b"user-settings", "name": "settings user"},
+            [{"type": "public-key", "alg": -7}],
+            options={"rk": True, "uv": True},
+        ),
+    )
+    check(status == CtapError.ERR.SUCCESS, f"settings: a passkey to list ({status!r})")
+    open_passkey_list(user)
+    wait_for_screen(PASSKEY_TITLE)
+    list_snapshot = snapshot("passkey_list", PASSKEY_TITLE)
+    if list_snapshot is not None:
+        list_snapshot()
+    user.press(DELETE_CONFIRM)
+    # "Delete the passkey for <RP>?", or on a Nano, which shortens it, "Delete this passkey?".
+    wait_for_screen("Delete th")
+    user.press(DELETE_CONFIRM)
+    # The list again, without it: credential management deleted the others, so it is empty.
+    wait_for_screen("No passkeys")
+    check(not screen_shows(SETTINGS_RP_ID), "settings: the deleted passkey left the list")
+    user.press("OK")
+    descriptor = {"type": "public-key", "id": made.auth_data.credential_data.credential_id}
+    status = ctap_status(
+        lambda: ctap.get_assertion(SETTINGS_RP_ID, client_data_hash, [descriptor], options={"up": False})
+    )
+    check(
+        status == CtapError.ERR.NO_CREDENTIALS,
+        f"settings: the passkey deleted in the list no longer signs ({status!r})",
+    )
 
 
 def snapshot_check(model: str, directory: Path, golden: bool, name: str, title: str):
@@ -930,8 +1132,11 @@ def main() -> None:
     # left unanswered (cancel, timeout) last, so no answer is given to the wrong screen.
     check_selection_answers(device, user, snapshot("selection", SELECTION_TITLE))
     check_built_in_uv(device, user, snapshot("uv_token", TOKEN_TITLE))
-    check_credentials(device, user, snapshot)
+    registered = check_credentials(device, user, snapshot)
+    check_credential_management(device, user, snapshot, registered)
+    check_config(device, user)
     if args.speculos:
+        check_settings_list(device, user, snapshot)
         # The reset left the PIN unset, so it can be set; a device keeps its PIN.
         check_client_pin(device, user, snapshot("token", TOKEN_TITLE))
     check_selection_unanswered(device, keepalives)

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::Zeroize;
 
-use super::{CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LEN, Storage};
+use super::{CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LEN, NAME_SLOT_LEN, NAME_SLOTS, Storage};
 
 /// NVM regions held in RAM. Writes are atomic per record, as on the device; after
 /// [`MemoryStorage::lose_power_after`] the given number of writes land and every later one is
@@ -16,17 +16,25 @@ pub struct MemoryStorage {
     config: [u8; CONFIG_LEN],
     index: Vec<[u8; INDEX_ENTRY_LEN]>,
     keys: Vec<[u8; KEY_SLOT_LEN]>,
+    names: Vec<[u8; NAME_SLOT_LEN]>,
     writes: usize,
     power_until: Option<usize>,
 }
 
 impl MemoryStorage {
-    /// Fresh NVM, all zeros, with `index_slots` discoverable slots and `key_slots` key slots.
+    /// Fresh NVM, all zeros, with `index_slots` discoverable slots, `key_slots` key slots and the
+    /// device's [`NAME_SLOTS`] name override slots.
     pub fn new(index_slots: usize, key_slots: usize) -> Self {
+        Self::with_name_slots(index_slots, key_slots, NAME_SLOTS)
+    }
+
+    /// Fresh NVM as [`MemoryStorage::new`], with `name_slots` name override slots.
+    pub fn with_name_slots(index_slots: usize, key_slots: usize, name_slots: usize) -> Self {
         Self {
             config: [0; CONFIG_LEN],
             index: vec![[0; INDEX_ENTRY_LEN]; index_slots],
             keys: vec![[0; KEY_SLOT_LEN]; key_slots],
+            names: vec![[0; NAME_SLOT_LEN]; name_slots],
             writes: 0,
             power_until: None,
         }
@@ -118,6 +126,20 @@ impl Storage for MemoryStorage {
     fn write_key_slot(&mut self, slot: usize, record: &[u8; KEY_SLOT_LEN]) {
         if self.powered() {
             self.keys[slot] = *record;
+        }
+    }
+
+    fn name_slots(&self) -> usize {
+        self.names.len()
+    }
+
+    fn name_slot(&self, slot: usize) -> &[u8; NAME_SLOT_LEN] {
+        &self.names[slot]
+    }
+
+    fn write_name_slot(&mut self, slot: usize, record: &[u8; NAME_SLOT_LEN]) {
+        if self.powered() {
+            self.names[slot] = *record;
         }
     }
 }

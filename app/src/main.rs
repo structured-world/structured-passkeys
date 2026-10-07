@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod crypto;
 mod hid;
+mod home;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
 mod nfc;
 mod storage;
@@ -17,7 +18,7 @@ use ledger_device_sdk::include_gif;
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
 use ledger_device_sdk::io::ApduTransport;
 use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
-use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
+use ledger_device_sdk::nbgl::NbglGlyph;
 use structured_passkeys_ctap::ctap2::{
     Authenticator, Link, MIN_MESSAGE_SIZE, MaxMsgSize, Settings, Transports,
 };
@@ -51,15 +52,6 @@ const SETTINGS: Settings = Settings {
     #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
     transports: Transports::Usb,
 };
-
-/// Name on the home screen; the same as `package.metadata.ledger.name`.
-const APP_NAME: &str = "Structured Passkeys";
-
-/// What the home screen of the touch devices says under the name; without it the SDK shows its
-/// default line about signing transactions on a network. The Nano home screen shows the name
-/// alone, and a tagline would take its place there.
-#[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-const TAGLINE: &str = "Passkeys and FIDO2 security key for signing in to websites and apps";
 
 /// Class byte of the Ledger management channel; the SDK rejects other classes.
 const CLA: u8 = 0xE0;
@@ -95,15 +87,8 @@ extern "C" fn sample_main(_arg0: u32) {
     let store = Store::open(unsafe { storage::NvmStorage::take() });
     let mut authenticator = Authenticator::new(SETTINGS, crypto::DeviceCrypto, store);
 
-    // The home screen carries the version page and the quit action.
-    let home = NbglHomeAndSettings::new().glyph(&HOME_GLYPH);
-    #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-    let home = home.tagline(TAGLINE);
-    let mut home = home.infos(
-        APP_NAME,
-        env!("CARGO_PKG_VERSION"),
-        env!("CARGO_PKG_AUTHORS"),
-    );
+    // The home screen carries the settings, the version page and the quit action.
+    let mut home = home::Home::new(&HOME_GLYPH, authenticator.always_uv());
     home.show_and_return();
 
     // FIDO HID reports reach the transport through the USB class callbacks during each event, NFC
@@ -121,6 +106,20 @@ extern "C" fn sample_main(_arg0: u32) {
         }
         if ui::home_due() {
             home.show_and_return();
+        }
+        // What the settings asked for during the event, done here where the store is at hand.
+        match home::take_asked() {
+            Some(home::Asked::ToggleAlwaysUv) => {
+                authenticator.toggle_always_uv();
+                // The settings are drawn again with the state the store now holds.
+                home.set_always_uv(authenticator.always_uv());
+                home.show_settings(home::SettingsPage::AlwaysUv);
+            }
+            Some(home::Asked::Passkeys) => {
+                let mut ui = ui::DeviceUi::settings(comm, &mut home, &HOME_GLYPH, &mut interfaces);
+                authenticator.manage_passkeys(&mut ui);
+            }
+            None => {}
         }
         // Parsed while the transport holds the request; run once it is released, so the screen
         // of a waiting command can take events.
@@ -144,6 +143,12 @@ extern "C" fn sample_main(_arg0: u32) {
             let length = authenticator.execute(command, Link::Nfc, &mut ui, &mut response[..]);
             interfaces.nfc.respond(comm, &response[..length]);
             response[..length].zeroize();
+        }
+        // authenticatorConfig and authenticatorReset change alwaysUv without a screen of their
+        // own: the switch is drawn again with the new state.
+        if home.always_uv() != authenticator.always_uv() {
+            home.set_always_uv(authenticator.always_uv());
+            home.show_and_return();
         }
     }
 }

@@ -421,8 +421,13 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Reads a whole item and returns its encoded bytes.
-    fn encoded_item(&mut self) -> Result<&'a [u8], Error> {
+    /// Reads a whole item, checking it as [`Decoder::skip`] does, and returns its encoded bytes:
+    /// for a member a MAC covers as received (CTAP 2.2 §6.8, `subCommandParams`).
+    ///
+    /// # Errors
+    ///
+    /// The encoding errors of the item or of anything nested in it.
+    pub fn encoded_item(&mut self) -> Result<&'a [u8], Error> {
         let start = self.input;
         self.skip()?;
         let read = start

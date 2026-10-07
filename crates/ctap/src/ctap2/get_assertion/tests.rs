@@ -22,7 +22,9 @@ use crate::crypto::KEY_LEN;
 use crate::pin::MAX_USAGE_TIME_PERIOD_MS;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, Store};
-use crate::ui::{Accounts, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{
+    Accounts, Answer, Choice, Passkeys, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui,
+};
 
 const OPERATION_DENIED: u8 = 0x27;
 const UNSUPPORTED_OPTION: u8 = 0x2B;
@@ -816,6 +818,15 @@ impl Ui for Reader {
             assert_eq!(name, Some(true));
         }
         Choice::Chose(0)
+    }
+
+    fn browse<P: Passkeys>(
+        &mut self,
+        _passkeys: &mut P,
+        _start: usize,
+        _timeout_ms: u32,
+    ) -> Choice<usize> {
+        Choice::Rejected
     }
 
     fn device_unlocked(&mut self) -> bool {

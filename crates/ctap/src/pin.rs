@@ -566,6 +566,12 @@ impl ClientPin {
             .is_none_or(|bound| constant_time_eq(&bound, rp_id_hash))
     }
 
+    /// Whether the token has a permissions RP ID: credential management subcommands that cover
+    /// every RP require a token without one (CTAP 2.2 §6.8.2, §6.8.3).
+    pub const fn has_rp_id(&self) -> bool {
+        self.token.rp_id_hash.is_some()
+    }
+
     /// Binds the token to `rp_id_hash` unless it has a permissions RP ID; `false` when it is
     /// bound to another RP.
     pub fn bind_rp_id(&mut self, rp_id_hash: &[u8; KEY_LEN]) -> bool {

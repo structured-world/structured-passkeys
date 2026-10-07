@@ -7,7 +7,9 @@
 
 use ledger_device_sdk::NVMData;
 use ledger_device_sdk::nvm::{AtomicStorage, SingleStorage};
-use structured_passkeys_ctap::storage::{CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LEN, Storage};
+use structured_passkeys_ctap::storage::{
+    CONFIG_LEN, INDEX_ENTRY_LEN, KEY_SLOT_LEN, NAME_SLOT_LEN, NAME_SLOTS, Storage,
+};
 
 /// Discoverable index slots: at least 64 on every device.
 pub const INDEX_SLOTS: usize = 64;
@@ -26,12 +28,16 @@ static mut INDEX: NVMData<[Record<INDEX_ENTRY_LEN>; INDEX_SLOTS]> =
 #[unsafe(link_section = ".nvm_data")]
 static mut KEYS: NVMData<[Record<KEY_SLOT_LEN>; KEY_SLOTS]> =
     NVMData::new([const { AtomicStorage::new(&[0; KEY_SLOT_LEN]) }; KEY_SLOTS]);
+#[unsafe(link_section = ".nvm_data")]
+static mut NAMES: NVMData<[Record<NAME_SLOT_LEN>; NAME_SLOTS]> =
+    NVMData::new([const { AtomicStorage::new(&[0; NAME_SLOT_LEN]) }; NAME_SLOTS]);
 
 /// The application's NVM regions.
 pub struct NvmStorage {
     config: &'static mut Record<CONFIG_LEN>,
     index: &'static mut [Record<INDEX_ENTRY_LEN>; INDEX_SLOTS],
     keys: &'static mut [Record<KEY_SLOT_LEN>; KEY_SLOTS],
+    names: &'static mut [Record<NAME_SLOT_LEN>; NAME_SLOTS],
 }
 
 impl NvmStorage {
@@ -47,12 +53,14 @@ impl NvmStorage {
         let config = &raw mut CONFIG;
         let index = &raw mut INDEX;
         let keys = &raw mut KEYS;
+        let names = &raw mut NAMES;
         // SAFETY: the caller takes the statics once, so these are their only references.
         let storage = unsafe {
             Self {
                 config: (*config).get_mut(),
                 index: (*index).get_mut(),
                 keys: (*keys).get_mut(),
+                names: (*names).get_mut(),
             }
         };
         storage.config.get_or_init(&[0; CONFIG_LEN]);
@@ -63,6 +71,10 @@ impl NvmStorage {
         }
         for record in storage.keys.iter_mut() {
             record.get_or_init(&[0; KEY_SLOT_LEN]);
+            record.settle();
+        }
+        for record in storage.names.iter_mut() {
+            record.get_or_init(&[0; NAME_SLOT_LEN]);
             record.settle();
         }
         storage
@@ -107,5 +119,19 @@ impl Storage for NvmStorage {
         // Private key and CredRandom: settling overwrites the copy the update retired.
         self.keys[slot].update(record);
         self.keys[slot].settle();
+    }
+
+    fn name_slots(&self) -> usize {
+        NAME_SLOTS
+    }
+
+    fn name_slot(&self, slot: usize) -> &[u8; NAME_SLOT_LEN] {
+        self.names[slot].get_ref()
+    }
+
+    fn write_name_slot(&mut self, slot: usize, record: &[u8; NAME_SLOT_LEN]) {
+        // Sealed names of a removed entry: settling overwrites the copy the update retired.
+        self.names[slot].update(record);
+        self.names[slot].settle();
     }
 }
