@@ -18,7 +18,7 @@ permissions:
 jobs:
   build:
     name: Build for every device
-    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@db5fd3d8e4fe724ccc4617709c9e245976ee8280 # v1
+    uses: LedgerHQ/ledger-app-workflows/.github/workflows/reusable_build.yml@8250648d7eed5f825c8e7441f6d064931e30efec # v1
     with:
       upload_app_binaries_artifact: structured_passkeys_binaries
       builder: ledger-app-builder
