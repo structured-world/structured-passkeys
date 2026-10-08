@@ -68,6 +68,11 @@ impl KeyRing {
 
     /// The `which` CredRandom of a seed-recoverable credential with credential seed `cs`, for
     /// hmac-secret: `HKDF-SHA-256(K_hmac, salt = cs, info = "uv" | "no-uv")`.
+    ///
+    /// CTAP 2.2 §12.7 has the authenticator generate CredRandom randomly; here it derives from
+    /// the recovery phrase like the credential's key, so a credential the phrase restores on
+    /// another device or install also gives the same PRF outputs. Random values would restore the
+    /// key but not what the relying party encrypted with the PRF, which would then be lost.
     pub fn cred_random<C: Crypto>(
         &self,
         crypto: &C,

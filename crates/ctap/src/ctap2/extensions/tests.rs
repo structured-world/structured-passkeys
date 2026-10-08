@@ -12,9 +12,10 @@ use super::super::tests::{Scripted, TestAuthenticator, authenticator, authentica
 use super::super::{Link, NfcTap, Transports};
 use crate::cbor::{Decoder, Key, validate};
 use crate::credential_id::{self, KeySource, Origin};
-use crate::keys::{DeviceKeys, KeyRing};
+use crate::keys::KeyRing;
 use crate::pin::Protocol;
 use crate::ui::Answer;
+use sha2::Sha256;
 
 const INVALID_PARAMETER: u8 = 0x02;
 const CBOR_UNEXPECTED_TYPE: u8 = 0x11;
@@ -200,30 +201,48 @@ fn secret(
     session.decrypt(&output.secret.expect("an hmac-secret output"))
 }
 
-/// The CredRandom of `made` with or without UV, read the way its origin keeps it: the slot of a
-/// discoverable device-only credential, the derivation under K_dev or under the recovery phrase.
+/// HKDF-SHA-256 (RFC 5869) with a 32-byte output, from the RustCrypto crate.
+fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hkdf::Hkdf::<Sha256>::new(Some(salt), ikm)
+        .expand(info, &mut out)
+        .expect("32 bytes");
+    out
+}
+
+/// The CredRandom of `made` with or without UV, computed here from what its origin keeps, apart
+/// from the derivation under test: the slot of a discoverable device-only credential, or the key
+/// model's HKDF chain below the device key or below the root key of the application node 11..11
+/// (`HKDF(K, info = "cred-random")`, then `salt = cs`, `info = "uv" | "no-uv"`).
 fn cred_random(authenticator: &mut TestAuthenticator, made: &Made, uv: bool) -> [u8; 32] {
+    // Opening the ID only recovers the credential seed the derivation starts from.
     let keys = KeyRing::new(&mut authenticator.crypto);
     let reset_id = authenticator.store.config().reset_id;
     let credential = credential_id::open(&authenticator.crypto, &keys, RP_ID, &made.id, reset_id)
         .expect("the credential opens");
-    let which = crate::keys::CredRandom::for_uv(uv);
-    let value = match credential.key {
-        KeySource::Seed(cs) => keys.cred_random(&authenticator.crypto, &cs, which),
-        KeySource::Device(cs) => DeviceKeys::new(
-            authenticator.store.device_key().expect("a device key"),
-        )
-        .cred_random(&authenticator.crypto, &cs, which),
+    let info: &[u8] = if uv { b"uv" } else { b"no-uv" };
+    let derive = |root: &[u8], cs: &[u8; 32]| {
+        let k_hmac = hkdf_sha256(&[0; 32], root, b"cred-random");
+        hkdf_sha256(cs, &k_hmac, info)
+    };
+    match credential.key {
+        KeySource::Seed(cs) => {
+            let k_root = hkdf_sha256(b"structured-passkeys/v1", &[0x11; 32], b"root");
+            derive(&k_root, &cs)
+        }
+        KeySource::Device(cs) => {
+            let k_dev = authenticator.store.device_key().expect("a device key");
+            derive(&k_dev[..], &cs)
+        }
         KeySource::Slot { index, tag } => {
             let secrets = authenticator.store.key(index, &tag).expect("a live slot");
             if uv {
-                secrets.cred_random_uv
+                *secrets.cred_random_uv
             } else {
-                secrets.cred_random
+                *secrets.cred_random
             }
         }
-    };
-    *value
+    }
 }
 
 /// The outputs of an encoded map follow canonical order, `credProtect` and `hmac-secret` of equal

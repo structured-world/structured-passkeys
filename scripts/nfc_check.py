@@ -17,13 +17,16 @@ the transports nfc and usb; a request longer than 1024 bytes is CTAP2_ERR_REQUES
 
 Ceremonies, the screens answered through the Speculos API: authenticatorReset in its window with
 the confirmation on the device; authenticatorSelection answers at once, the tap being the user
-presence; getPinToken waits for the consent on the device while the platform polls with
+presence; two discoverable registrations on taps and a sign-in with hmac-secret, which answers
+the count and the first account, getNextAssertion the second, each with its own PRF output and
+the same ones on a second sign-in; getPinToken waits for the consent on the device while the platform polls with
 NFCCTAP_GETRESPONSE and gets status updates with "user presence needed", or, from a client
 without them, answers its NFCCTAP_MSG directly; a poll with P1 0x11 cancels a waiting request
 (CTAP2_ERR_KEEPALIVE_CANCEL).
 """
 
 import argparse
+import hashlib
 import socket
 import struct
 import sys
@@ -190,6 +193,61 @@ def check_selection(link: SpeculosApdu) -> None:
     )
 
 
+def check_hmac_secret(link: SpeculosApdu) -> None:
+    """hmac-secret over the tap (CTAP 2.2 §12.7): with no account list over NFC, a sign-in of two
+    discoverable accounts answers the count and the first, and getNextAssertion the second, each
+    with its own PRF output for the same salt; a second sign-in gives the same outputs."""
+    ctap = Ctap2(NfcCtap(link))
+    protocol = PinProtocolV2()
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    rp = {"id": "prf.example.com", "name": "PRF"}
+    params = [{"type": "public-key", "alg": -7}]
+    for user_id in (b"prf-1", b"prf-2"):
+        # Each registration takes a tap of its own: the selection of the applet.
+        select(link)
+        status = ctap_status(
+            lambda user_id=user_id: ctap.make_credential(
+                client_data_hash,
+                rp,
+                {"id": user_id, "name": user_id.decode()},
+                params,
+                extensions={"hmac-secret": True},
+                options={"rk": True, "uv": True},
+            )
+        )
+        check(status == CtapError.ERR.SUCCESS, f"registration {user_id!r} over the tap ({status!r})")
+    salt = hashlib.sha256(b"prf salt").digest()
+
+    def sign_in() -> dict[bytes, bytes]:
+        select(link)
+        session = PinSession(ctap, protocol)
+        salt_enc = protocol.encrypt(session.secret, salt)
+        extensions = {
+            "hmac-secret": {
+                1: session.key_agreement,
+                2: salt_enc,
+                3: protocol.authenticate(session.secret, salt_enc),
+                4: protocol.VERSION,
+            }
+        }
+        first = ctap.get_assertion(rp["id"], client_data_hash, extensions=extensions)
+        check(first.number_of_credentials == 2, f"sign-in over the tap counts {first.number_of_credentials}")
+        second = ctap.get_next_assertion()
+        outputs = {}
+        for assertion in (first, second):
+            output = assertion.auth_data.extensions.get("hmac-secret") if assertion.auth_data.extensions else None
+            check(output is not None, "getAssertion and getNextAssertion each answer hmac-secret")
+            outputs[bytes(assertion.credential["id"])] = protocol.decrypt(session.secret, output)
+        return outputs
+
+    once = sign_in()
+    check(
+        len(once) == 2 and all(len(v) == 32 for v in once.values()) and len(set(once.values())) == 2,
+        "hmac-secret: one 32-byte output per account, different accounts differ",
+    )
+    check(sign_in() == once, "hmac-secret: a second sign-in gives the same outputs")
+
+
 def check_token(link: SpeculosApdu, user: SpeculosUser) -> None:
     check(
         ctap_status(lambda: set_pin(Ctap2(NfcCtap(link)), PinProtocolV2(), "1234")) == CtapError.ERR.SUCCESS,
@@ -261,6 +319,7 @@ def main() -> None:
     check_reset(link, user)
     check_get_info(link)
     check_selection(link)
+    check_hmac_secret(link)
     check_token(link, user)
     check_cancel(link)
     check_deselect(link)

@@ -58,7 +58,8 @@ NEEDS_NVRAM = {
     "test_user_info_returned_when_using_allowlist[123456-True]": "a credential kept across a power cycle",
 }
 # Tests whose premise CTAP 2.2 rules out for this authenticator, with the rule. The application's
-# own unit tests cover the behaviour CTAP 2.2 gives instead.
+# own tests cover the behaviour CTAP 2.2 gives instead; hmac-secret over getNextAssertion is
+# checked on the device in scripts/nfc_check.py, over the NFC tap, where no account list is shown.
 CTAP_2_2 = {
     "test_get_next_assertion_has_extension": "an authenticator with a display lists the accounts "
     "of a request with presence and returns the one picked, without numberOfCredentials (CTAP 2.2 "

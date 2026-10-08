@@ -7,8 +7,9 @@
 //! (CTAP 2.2 §6.5.5.7), the NFC tap included, built-in UV only on an unlocked device, a PIN try
 //! spent only by a PIN check that fails, one at a time (§6.5.5.6, §6.5.5.7), and a selection only
 //! with user presence (§6.9). For the credential commands, authenticator data reports user
-//! presence only when the user answered on the device or the tap counted, and a new credential
-//! always comes with both UP and UV (§6.1.2 steps 11 and 18).
+//! presence only when the user answered on the device or the tap counted, a new credential
+//! always comes with both UP and UV (§6.1.2 steps 11 and 18), and a getAssertion asking for
+//! hmac-secret without user presence never succeeds (§12.7).
 
 use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
 use structured_passkeys_ctap::credential_id::Origin;
@@ -126,6 +127,51 @@ fn client_pin_sub_command(request: &[u8]) -> Option<u64> {
         .flatten()
 }
 
+/// Whether a request is an authenticatorGetAssertion with the hmac-secret extension and the `up`
+/// option false, which CTAP 2.2 §12.7 refuses with CTAP2_ERR_UNSUPPORTED_OPTION.
+fn hmac_secret_without_presence(request: &[u8]) -> bool {
+    let Some((&0x02, parameters)) = request.split_first() else {
+        return false;
+    };
+    Decoder::new(parameters)
+        .map(|entries| {
+            let mut hmac_secret = false;
+            let mut up_false = false;
+            while let Some(key) = entries.next_key()? {
+                let value = entries.value();
+                match key {
+                    Key::Int(0x04) => {
+                        hmac_secret = value.map(|extensions| {
+                            let mut found = false;
+                            while let Some(name) = extensions.next_key()? {
+                                found |= name == Key::Text("hmac-secret");
+                                extensions.value().skip()?;
+                            }
+                            Ok(found)
+                        })?;
+                    }
+                    Key::Int(0x05) => {
+                        up_false = value.map(|options| {
+                            let mut found = false;
+                            while let Some(name) = options.next_key()? {
+                                let option = options.value();
+                                if name == Key::Text("up") {
+                                    found = !option.bool()?;
+                                } else {
+                                    option.skip()?;
+                                }
+                            }
+                            Ok(found)
+                        })?;
+                    }
+                    _ => value.skip()?,
+                }
+            }
+            Ok(hmac_secret && up_false)
+        })
+        .unwrap_or(false)
+}
+
 /// The flags byte of the authenticator data in a makeCredential or getAssertion response body.
 fn auth_data_flags(body: &[u8]) -> Option<u8> {
     Decoder::new(body)
@@ -207,6 +253,11 @@ pub fn run(data: &[u8]) {
             assert_eq!(flags & (UP | UV), UP | UV, "a credential with UP and UV");
             assert_eq!(answers & 0x20, 0, "a credential only on an unlocked device");
         }
+    }
+    // hmac-secret needs user presence: a getAssertion that asks for it with `up` false never
+    // succeeds (§12.7), whatever other check refuses it first.
+    if hmac_secret_without_presence(request) {
+        assert!(!succeeded, "hmac-secret never without user presence");
     }
     // authenticatorSelection answers OK only with user presence: a confirmation on the device, or
     // over NFC the tap (§6.9).
