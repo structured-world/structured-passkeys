@@ -202,6 +202,8 @@ enum Ending {
         success: bool,
         message: &'static CStr,
     },
+    /// Answered, and the next screen of the same flow replaces this one at once.
+    Continued,
 }
 
 /// Room for a composed screen text: the longest sentence around an RP ID shown at its longest,
@@ -846,6 +848,8 @@ impl<'a> DeviceUi<'a> {
                 unsafe { nbgl_useCaseStatus(message.as_ptr(), success, Some(status_ended)) };
                 crate::home::status_drawn();
             }
+            // The flow's next screen draws itself.
+            Ending::Continued => {}
         }
         if !matches!(ending, Ending::Unanswered) {
             self.waiting_for_user(false);
@@ -1208,14 +1212,9 @@ impl Ui for DeviceUi<'_> {
                 success: false,
                 message: c"Reset cancelled",
             },
-            (Answer::Confirmed, Prompt::Delete { .. }) => Ending::Reported {
-                success: true,
-                message: c"Deletion confirmed",
-            },
-            (Answer::Rejected, Prompt::Delete { .. }) => Ending::Reported {
-                success: false,
-                message: c"Passkey kept",
-            },
+            // The passkey list comes back at once and shows the answer: a status page here would
+            // only flash before it.
+            (_, Prompt::Delete { .. }) => Ending::Continued,
             // A selection or a token is followed by the request it prepares, and an excluded
             // registration has said all there is.
             _ => Ending::Answered,

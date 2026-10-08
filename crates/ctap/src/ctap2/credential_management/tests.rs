@@ -662,6 +662,18 @@ fn updating_user_names() {
         .0,
         [KEY_STORE_FULL]
     );
+    // §6.8.6 checks for room (step 9) before the user ID (step 10).
+    assert_eq!(
+        send(
+            &mut authenticator,
+            &update(&other.id, b"user-9", Some("carol"), None),
+            Answer::Confirmed,
+            0
+        )
+        .0,
+        [KEY_STORE_FULL],
+        "no room comes before a wrong user ID"
+    );
 
     let listed = request(0x04, Some(&rp_hash_params(RP_ID)), &token_cm);
     let (response, _) = send(&mut authenticator, &listed, Answer::Confirmed, 0);

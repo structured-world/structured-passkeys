@@ -851,6 +851,20 @@ impl<S: Storage> Store<S> {
             })
     }
 
+    /// Whether names for the entry `owner` have room: it owns a name slot already or one is
+    /// free. [`Store::set_names`] answers [`StoreError::Full`] exactly when this is false.
+    pub fn names_fit(&self, owner: EntryId) -> bool {
+        self.names_slot_for(owner).is_some()
+    }
+
+    /// The name slot names for `owner` go to: the one it owns, else the first free one.
+    fn names_slot_for(&self, owner: EntryId) -> Option<u16> {
+        let slots = slot_count(self.storage.name_slots());
+        (0..slots)
+            .find(|&slot| self.names_owner(slot) == Some(owner))
+            .or_else(|| (0..slots).find(|&slot| self.names_owner(slot).is_none()))
+    }
+
     /// Stores `sealed` names for the entry `owner`, in place of the names it had: its own slot
     /// is rewritten, or a free one taken.
     ///
@@ -866,11 +880,7 @@ impl<S: Storage> Store<S> {
         if sealed.len() > MAX_SEALED_NAMES_LEN {
             return Err(StoreError::TooLong);
         }
-        let slots = slot_count(self.storage.name_slots());
-        let slot = (0..slots)
-            .find(|&slot| self.names_owner(slot) == Some(owner))
-            .or_else(|| (0..slots).find(|&slot| self.names_owner(slot).is_none()))
-            .ok_or(StoreError::Full)?;
+        let slot = self.names_slot_for(owner).ok_or(StoreError::Full)?;
         let mut record = [0u8; NAME_SLOT_LEN];
         record[NAMES_STATE] = USED;
         write_u32(&mut record, NAMES_GENERATION, self.generation);

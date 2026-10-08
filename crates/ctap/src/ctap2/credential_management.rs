@@ -631,6 +631,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let (id, credential) = self
             .indexed_credential(keys, &rp_id_hash, entry)
             .ok_or(StatusCode::NoCredentials)?;
+        // Room first (step 9), then the user ID (step 10).
+        if !self.store.names_fit(entry) {
+            return Err(StatusCode::KeyStoreFull);
+        }
         if credential.user.as_ref().map(|stored| &stored.id) != Some(&user.id) {
             return Err(StatusCode::InvalidParameter);
         }
