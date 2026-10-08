@@ -569,7 +569,8 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             return Err(NOT_A_CREDENTIAL);
         }
         let reset_id = u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
-        // A discoverable credential carries its store ID, a non-discoverable one never does.
+        // A discoverable credential carries its store ID, a non-discoverable one never does. No
+        // released format had discoverable IDs without one, so there is no older form to accept.
         let store = match (user.is_some(), next_int_key(entries)?) {
             (true, Some(12)) => {
                 let value =
