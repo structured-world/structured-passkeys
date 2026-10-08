@@ -46,7 +46,7 @@
 //! let store = Store::open(MemoryStorage::new(4, 4));
 //! let settings = Settings { max_msg_size, transports: Transports::Usb };
 //! let mut authenticator = Authenticator::new(settings, crypto, store);
-//! let mut response = [0u8; 128];
+//! let mut response = [0u8; 256];
 //! let length = authenticator.process(&[0x04], Link::Usb, &mut Present, &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
 //! assert!(length > 1);
