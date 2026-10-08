@@ -273,7 +273,7 @@ const fn new_pin_length_error(protocol: Protocol, len: usize) -> StatusCode {
 /// and y, and nothing else: such a key "MUST contain the optional alg parameter and MUST NOT
 /// contain any other optional parameters" (§6.5.5, keyAgreement). A key with a further label
 /// cannot be decapsulated.
-fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
+pub(super) fn peer_key(decoder: &mut Decoder<'_>) -> Result<PeerKey, cbor::Error> {
     decoder.map(|entries| {
         let mut kty = None;
         let mut alg = None;
@@ -355,7 +355,7 @@ fn protocol(number: u64) -> Result<Protocol, StatusCode> {
 
 /// The shared secret with the platform key, or CTAP1_ERR_INVALID_PARAMETER when `decapsulate`
 /// fails (§6.5.5.5 step 5.4).
-fn decapsulate<C: Crypto>(
+pub(super) fn decapsulate<C: Crypto>(
     client_pin: &ClientPin,
     crypto: &C,
     protocol: Protocol,

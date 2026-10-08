@@ -383,16 +383,24 @@ pub(super) const OPTIONS_WITHOUT_PIN: [u8; 80] = [
     0xF5, // "pinUvAuthToken": true
 ];
 
-/// getInfo answers CTAP2_OK and the map {1: ["FIDO_2_0"], 3: AAGUID, 4: options, 5: 1024, 6:
-/// [2, 1], 9: ["usb"], 13: 4} in canonical order: the required versions, FIDO_2_0 for the CTAP 2.0
-/// command set the conformance suite covers, and aaguid, the options, maxMsgSize, the PIN/UV auth
+/// getInfo answers CTAP2_OK and the map {1: ["FIDO_2_0"], 2: ["credProtect", "hmac-secret",
+/// "hmac-secret-mc"], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9: ["usb"], 13: 4} in canonical
+/// order: the required versions, FIDO_2_0 for the CTAP 2.0 command set the conformance suite
+/// covers, the implemented extensions, among them hmac-secret-mc, which platforms take as the
+/// offer of the PRF at registration, and aaguid, the options, maxMsgSize, the PIN/UV auth
 /// protocols, two first, the transports, and minPINLength, which "MUST be present if the
 /// authenticator supports authenticatorClientPIN" (§6.4), at the 4 code points of §6.5.1.
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA7, 0x01, 0x81, 0x68];
+    let mut expected = vec![0x00, 0xA8, 0x01, 0x81, 0x68];
     expected.extend_from_slice(b"FIDO_2_0");
+    expected.extend_from_slice(&[0x02, 0x83, 0x6B]);
+    expected.extend_from_slice(b"credProtect");
+    expected.push(0x6B);
+    expected.extend_from_slice(b"hmac-secret");
+    expected.push(0x6E);
+    expected.extend_from_slice(b"hmac-secret-mc");
     expected.extend_from_slice(&[0x03, 0x50]);
     expected.extend_from_slice(&AAGUID);
     expected.extend_from_slice(&OPTIONS_WITHOUT_PIN);
@@ -415,7 +423,7 @@ fn get_info_lists_nfc_on_a_device_that_has_it() {
         let tail = [
             0x09, 0x82, 0x63, b'n', b'f', b'c', 0x63, b'u', b's', b'b', 0x0D, 0x04,
         ];
-        assert_eq!(response[1], 0xA7, "{link:?}");
+        assert_eq!(response[1], 0xA8, "{link:?}");
         assert!(response[..length].ends_with(&tail), "{link:?}");
         assert_eq!(validate(&response[1..length]), Ok(()), "{link:?}");
     }

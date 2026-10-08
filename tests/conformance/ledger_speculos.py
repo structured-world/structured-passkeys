@@ -57,6 +57,16 @@ NEEDS_NVRAM = {
     "test_user_info_returned_when_using_allowlist[-True]": "a credential kept across a power cycle",
     "test_user_info_returned_when_using_allowlist[123456-True]": "a credential kept across a power cycle",
 }
+# Tests whose premise CTAP 2.2 rules out for this authenticator, with the rule. The application's
+# own unit tests cover the behaviour CTAP 2.2 gives instead.
+CTAP_2_2 = {
+    "test_get_next_assertion_has_extension": "an authenticator with a display lists the accounts "
+    "of a request with presence and returns the one picked, without numberOfCredentials (CTAP 2.2 "
+    "section 6.2.2 step 15.2.3), and hmac-secret needs presence (section 12.7)",
+    "test_credprotect_required_not_excluded_with_no_uv": "every registration verifies the user, as "
+    "getInfo reports uv without makeCredUvNotRqd (CTAP 2.2 section 6.1.2 step 8), so a "
+    "userVerificationRequired credential in the excludeList is found (step 16)",
+}
 # The channels the suite's transport tests name themselves.
 SUITE_CHANNELS = (b"\x11\x22\x33\x44", b"\x01\x22\x33\x44", b"\x05\x04\x03\x02")
 # Tests that leave a screen unanswered, with the number of confirmations they want first.
@@ -365,18 +375,12 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     hid = SpeculosHid()
     device = CtapHidDevice({"path": "speculos"}, fido2._pyu2f.hidtransport.UsbHidTransport(hid))
-    info = fido2.ctap2.CTAP2(device).get_info()
     hid.sock.close()
-    extensions = info.extensions or []
     for item in items:
         path = item.nodeid
-        if "extensions/test_hmac_secret.py" in path and "hmac-secret" not in extensions:
-            item.add_marker(
-                pytest.mark.skip(
-                    reason="getInfo does not list the hmac-secret extension, which CTAP 2.2 "
-                    "leaves optional"
-                )
-            )
+        reason = CTAP_2_2.get(item.originalname)
+        if reason:
+            item.add_marker(pytest.mark.skip(reason=reason))
         if item.originalname == "test_wink" and not device.capabilities & CAPABILITY.WINK:
             item.add_marker(
                 pytest.mark.skip(

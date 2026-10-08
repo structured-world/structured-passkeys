@@ -17,7 +17,8 @@
 # commit, patched where CTAP 2.2 differs from the CTAP 2.0 it was written for
 # (tests/conformance/fido2-tests.patch, each change with its section), in its own environment
 # with the python-fido2 it needs (tests/conformance/requirements.txt), driven by the pytest
-# plugin tests/conformance/ledger_speculos.py, which answers the screens.
+# plugin tests/conformance/ledger_speculos.py, which answers the screens. Its CTAP 2.0 tests run
+# with the credProtect tests of its CTAP 2.1 part, an extension getInfo lists.
 # The FIDO applet over NFC on Stax, Flex and Nano Gen5, with Speculos on its NFC
 # transport: scripts/nfc_check.py (selection and deselection of the applet,
 # short and extended APDUs, reset, selection by the tap, the consent screen with
@@ -147,7 +148,7 @@ docker run --rm ${name[@]+"${name[@]}"} \
             if ! (cd "$suite" && SPECULOS_MODEL="$model" SPECULOS_ELF="/app/$elf" \
                 PYTHONPATH="/app/tests/conformance:$suite" /tmp/conformance/bin/python -m pytest \
                 -p ledger_speculos --vendor ledger --timeout 120 -q -rfEs \
-                tests/standard/fido2 tests/standard/transport); then
+                tests/standard/fido2 tests/standard/fido2v1/extensions tests/standard/transport); then
                 tail -50 /tmp/speculos-conformance.log
                 status=1
             fi

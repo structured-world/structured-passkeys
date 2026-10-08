@@ -9,11 +9,14 @@ use super::credential::{
     Options, PUBLIC_KEY, authenticator_data, descriptors, flags, options, presence, shown,
     shown_rp_id,
 };
+use super::extensions::{
+    HmacSecretInput, HmacSecretOutput, Outputs, Salts, get_assertion_extensions,
+};
 use super::{Authenticator, Link, StatusCode};
 use crate::cbor::{Decoder, Encoder, Full, Key};
 use crate::credential_id::{self, CredProtect, Credential, MAX_NAME_LEN};
 use crate::crypto::{Crypto, KEY_LEN};
-use crate::keys::KeyRing;
+use crate::keys::{CredRandom, KeyRing};
 use crate::pin::Permissions;
 use crate::storage::{EntryId, Storage};
 use crate::ui::{Account, Accounts, Choice, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
@@ -29,6 +32,8 @@ pub struct GetAssertionRequest {
     rp_id: String,
     client_data_hash: [u8; KEY_LEN],
     allow_list: Option<Vec<Vec<u8>>>,
+    /// The hmac-secret extension input; any other extension is ignored (§6.2.2 step 12.1).
+    hmac_secret: Option<HmacSecretInput>,
     options: Options,
     pin_uv_auth_param: Option<Bytes<KEY_LEN>>,
     pin_uv_auth_protocol: Option<u64>,
@@ -43,6 +48,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
         let mut rp_id = None;
         let mut client_data_hash = None;
         let mut allow_list = None;
+        let mut hmac_secret = None;
         let mut request_options = Options::default();
         let mut pin_uv_auth_param = None;
         let mut pin_uv_auth_protocol = None;
@@ -52,9 +58,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
                 Key::Int(0x01) => rp_id = Some(value.text()?),
                 Key::Int(0x02) => client_data_hash = Some(value.bytes()?),
                 Key::Int(0x03) => allow_list = Some(descriptors(value, &mut missing)?),
-                // An extension this authenticator does not support is ignored (§6.2.2 step
-                // 12.1); the member must still be a map.
-                Key::Int(0x04) => value.map(|_| Ok(()))?,
+                Key::Int(0x04) => hmac_secret = get_assertion_extensions(value, &mut missing)?,
                 Key::Int(0x05) => request_options = options(value)?,
                 Key::Int(0x06) => pin_uv_auth_param = Some(Bytes::new(value.bytes()?)),
                 Key::Int(0x07) => pin_uv_auth_protocol = Some(value.unsigned()?),
@@ -65,6 +69,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
             rp_id,
             client_data_hash,
             allow_list,
+            hmac_secret,
             request_options,
             pin_uv_auth_param,
             pin_uv_auth_protocol,
@@ -74,6 +79,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
         rp_id,
         client_data_hash,
         allow_list,
+        hmac_secret,
         request_options,
         pin_uv_auth_param,
         pin_uv_auth_protocol,
@@ -96,6 +102,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<GetAssertionRequest, StatusCode
         // discoverable credentials of §6.2.2 are searched only when it is absent; an empty one
         // denotes none, which a platform never sends (§6.2 has it omitted instead).
         allow_list,
+        hmac_secret,
         options: request_options,
         pin_uv_auth_param,
         pin_uv_auth_protocol,
@@ -119,6 +126,8 @@ pub(super) struct NextAssertions {
     uv: bool,
     /// Whether a pinUvAuthToken authenticated the assertion, whose expiry ends the state.
     token: bool,
+    /// The hmac-secret salts, which every credential returned answers as the first did.
+    salts: Option<Salts>,
 }
 
 /// A credential that may answer the assertion, by where it is found. It is decoded again each
@@ -178,10 +187,12 @@ fn account_names(credential: &Credential) -> (Option<String>, Option<String>) {
     })
 }
 
-/// The members of an assertion response besides the signed parts.
-struct Extras {
+/// The members of an assertion response besides the signed parts, and the hmac-secret salts its
+/// authenticator data answers.
+struct Extras<'a> {
     number_of_credentials: Option<usize>,
     user_selected: bool,
+    salts: Option<&'a Salts>,
 }
 
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
@@ -214,6 +225,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             return Err(StatusCode::UnsupportedOption);
         }
         let up = request.options.up.unwrap_or(true);
+        // §12.7: hmac-secret needs user presence.
+        if request.hmac_secret.is_some() && !up {
+            return Err(StatusCode::UnsupportedOption);
+        }
         // Step 6: under alwaysUv a ceremony with user presence gets built-in user verification
         // when the request brings no other.
         if self.store.config().always_uv && up && protocol.is_none() {
@@ -257,10 +272,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // would interrupt every pre-flight and give the user nothing to decide.
         let pick = several && !tapped && (up || uv);
         let mut selected = 0;
-        let mut extras = Extras {
-            number_of_credentials: None,
-            user_selected: false,
-        };
+        let mut number_of_credentials = None;
+        let mut user_selected = false;
         if pick {
             let mut offered = Offered {
                 authenticator: self,
@@ -276,7 +289,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 Choice::Rejected | Choice::TimedOut => return Err(StatusCode::OperationDenied),
                 Choice::Cancelled => return Err(StatusCode::KeepaliveCancel),
             };
-            extras.user_selected = true;
+            user_selected = true;
         } else if up && !on_tap {
             // Step 11: user presence on the device, for the credential that will sign.
             let mut offered = Offered {
@@ -306,6 +319,12 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if on_tap {
             self.use_nfc_tap();
         }
+        // §12.7: the salts are read after consent and user verification.
+        let salts = request
+            .hmac_secret
+            .as_ref()
+            .map(|input| self.salts(input))
+            .transpose()?;
         // Step 15.2.2: the platform gets the count and the rest with getNextAssertion, which
         // continues only once this response has been written (§6.3 follows a received assertion).
         let continuation = (several && !pick).then(|| NextAssertions {
@@ -324,9 +343,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             up,
             uv,
             token: protocol.is_some(),
+            salts: None,
         });
         if continuation.is_some() {
-            extras.number_of_credentials = Some(applicable.len());
+            number_of_credentials = Some(applicable.len());
         }
         let chosen = self
             .read_candidate(&keys, request, applicable[selected])
@@ -336,6 +356,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             })
             .ok_or(StatusCode::NoCredentials)?;
         drop(applicable);
+        let extras = Extras {
+            number_of_credentials,
+            user_selected,
+            salts: salts.as_ref(),
+        };
         self.assert(
             &keys,
             &chosen,
@@ -345,7 +370,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             &extras,
             encoder,
         )?;
-        self.next_assertions = continuation;
+        self.next_assertions = continuation.map(|state| NextAssertions { salts, ..state });
         Ok(())
     }
 
@@ -425,7 +450,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
 
     /// Signs the assertion with `chosen` and writes the response (§6.2.2 steps 15.3 and 16): the
     /// user member for a discoverable credential, its names only when the ceremony verified the
-    /// user.
+    /// user, and the hmac-secret output under the CredRandom of the response's UV flag (§12.7).
     #[expect(
         clippy::too_many_arguments,
         reason = "the signed parts of one assertion, borrowed from the command that runs it"
@@ -437,11 +462,25 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         rp_id_hash: &[u8; KEY_LEN],
         client_data_hash: &[u8; KEY_LEN],
         (up, uv): (bool, bool),
-        extras: &Extras,
+        extras: &Extras<'_>,
         encoder: &mut Encoder<'_>,
     ) -> Result<(), StatusCode> {
         let origin = chosen.credential.key.origin();
-        let auth_data = authenticator_data(rp_id_hash, flags(up, uv, origin), None)?;
+        // §12.7: a credential without its CredRandom gets no output; one located with its key
+        // always has it.
+        let hmac_secret = match extras.salts {
+            Some(salts) => self
+                .cred_random(keys, &chosen.credential.key, CredRandom::for_uv(uv))
+                .map(|cred_random| self.hmac_secret_output(salts, &cred_random))
+                .transpose()?
+                .map(HmacSecretOutput::Secret),
+            None => None,
+        };
+        let outputs = Outputs {
+            hmac_secret,
+            ..Outputs::default()
+        };
+        let auth_data = authenticator_data(rp_id_hash, flags(up, uv, origin), None, &outputs)?;
         let private_key = self
             .private_key(keys, &chosen.credential.key)
             .ok_or(StatusCode::NoCredentials)?;
@@ -542,6 +581,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let extras = Extras {
             number_of_credentials: None,
             user_selected: false,
+            salts: state.salts.as_ref(),
         };
         self.assert(
             &keys,
@@ -590,4 +630,4 @@ fn write_response(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

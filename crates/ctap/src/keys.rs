@@ -1,6 +1,6 @@
-//! Key hierarchy below the application's BIP32 node (the root key, the credential wrapping key
-//! and seed-recoverable credential keys), and the keys of non-discoverable device-only
-//! credentials below the device key `K_dev`.
+//! Key hierarchy below the application's BIP32 node (the root key, the credential wrapping key,
+//! seed-recoverable credential keys and their hmac-secret values), and the same keys of
+//! non-discoverable device-only credentials below the device key `K_dev`.
 //!
 //! Every key lives in a [`Zeroizing`] buffer for the duration of one command.
 
@@ -65,6 +65,45 @@ impl KeyRing {
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
         credential_key(crypto, &self.root, cs)
     }
+
+    /// The `which` CredRandom of a seed-recoverable credential with credential seed `cs`, for
+    /// hmac-secret: `HKDF-SHA-256(K_hmac, salt = cs, info = "uv" | "no-uv")`.
+    pub fn cred_random<C: Crypto>(
+        &self,
+        crypto: &C,
+        cs: &[u8; KEY_LEN],
+        which: CredRandom,
+    ) -> Zeroizing<[u8; KEY_LEN]> {
+        cred_random(crypto, &self.root, cs, which)
+    }
+}
+
+/// Which of a credential's two hmac-secret values (CTAP 2.2 §12.7): the one for ceremonies that
+/// verified the user, or the one for ceremonies that did not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredRandom {
+    /// CredRandomWithUV.
+    WithUv,
+    /// CredRandomWithoutUV.
+    WithoutUv,
+}
+
+impl CredRandom {
+    /// The value for a response whose UV flag is `uv`.
+    pub const fn for_uv(uv: bool) -> Self {
+        if uv {
+            CredRandom::WithUv
+        } else {
+            CredRandom::WithoutUv
+        }
+    }
+
+    const fn info(self) -> &'static [u8] {
+        match self {
+            CredRandom::WithUv => b"uv",
+            CredRandom::WithoutUv => b"no-uv",
+        }
+    }
 }
 
 /// The device key `K_dev`: random, kept only in NVM and erased by reset, so the keys of
@@ -100,6 +139,28 @@ impl DeviceKeys {
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
         credential_key(crypto, &self.root, cs)
     }
+
+    /// The `which` CredRandom of a non-discoverable device-only credential with credential seed
+    /// `cs`: the seed-recoverable derivation with `K_dev` in place of `K_root`.
+    pub fn cred_random<C: Crypto>(
+        &self,
+        crypto: &C,
+        cs: &[u8; KEY_LEN],
+        which: CredRandom,
+    ) -> Zeroizing<[u8; KEY_LEN]> {
+        cred_random(crypto, &self.root, cs, which)
+    }
+}
+
+/// `HKDF-SHA-256(HKDF-SHA-256(root, info = "cred-random"), salt = cs, info = "uv" | "no-uv")`.
+fn cred_random<C: Crypto>(
+    crypto: &C,
+    root: &[u8; KEY_LEN],
+    cs: &[u8; KEY_LEN],
+    which: CredRandom,
+) -> Zeroizing<[u8; KEY_LEN]> {
+    let hmac = hkdf_sha256(crypto, &[], &root[..], b"cred-random", &[]);
+    hkdf_sha256(crypto, cs, &hmac[..], which.info(), &[])
 }
 
 /// `HKDF-SHA-256(HKDF-SHA-256(root, info = "credential-key"), salt = cs, info = "es256" || ctr)`

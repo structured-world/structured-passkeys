@@ -94,6 +94,26 @@ diff --git a/tests/standard/fido2/test_get_assertion.py b/tests/standard/fido2/t
 -        l2 = 6
 +        l2 = 3
          for i in range(0, l2):
+diff --git a/tests/standard/fido2/extensions/test_hmac_secret.py b/tests/standard/fido2/extensions/test_hmac_secret.py
+--- a/tests/standard/fido2/extensions/test_hmac_secret.py
++++ b/tests/standard/fido2/extensions/test_hmac_secret.py
+@@ -188,5 +188,6 @@ class TestHmacSecret(object):
+         with pytest.raises(CtapError) as e:
+             device.sendGA(*req.toGA())
+-        assert e.value.code == CtapError.ERR.EXTENSION_FIRST
++        # CTAP 2.2 section 12.7: a saltAuth that does not verify is CTAP2_ERR_PIN_AUTH_INVALID.
++        assert e.value.code == CtapError.ERR.PIN_AUTH_INVALID
+
+     @pytest.mark.parametrize("salts", [(salt4,), (salt4, salt5)])
+@@ -201,5 +202,7 @@ class TestHmacSecret(object):
+         with pytest.raises(CtapError) as e:
+             device.sendGA(*req.toGA())
+-        assert e.value.code in [ CtapError.ERR.INVALID_LENGTH, CtapError.ERR.INVALID_CBOR ]
++        # CTAP 2.2 section 12.7: salts that decrypt to other than 32 or 64 bytes are
++        # CTAP1_ERR_INVALID_PARAMETER.
++        assert e.value.code == CtapError.ERR.INVALID_PARAMETER
+
+     @pytest.mark.parametrize("salts", [(salt1,), (salt1, salt2)])
 diff --git a/tests/standard/fido2/pin/test_pin.py b/tests/standard/fido2/pin/test_pin.py
 --- a/tests/standard/fido2/pin/test_pin.py
 +++ b/tests/standard/fido2/pin/test_pin.py

@@ -37,6 +37,7 @@ pub(in crate::ctap2) const UV: u8 = 0x04;
 pub(in crate::ctap2) const BE: u8 = 0x08;
 pub(in crate::ctap2) const BS: u8 = 0x10;
 const AT: u8 = 0x40;
+pub(in crate::ctap2) const ED: u8 = 0x80;
 
 pub(in crate::ctap2) const RP_ID: &str = "example.com";
 pub(in crate::ctap2) const CLIENT_DATA_HASH: [u8; 32] = [0xCD; 32];
@@ -113,7 +114,11 @@ pub(in crate::ctap2) fn options(pairs: &[(&str, bool)]) -> Value {
 }
 
 /// A registration of `user_id` ("alice" / "Alice") at `rp_id` with ES256 and `opts`.
-fn registration(rp_id: &str, user_id: &[u8], opts: &[(&str, bool)]) -> Vec<(u64, Value)> {
+pub(in crate::ctap2) fn registration(
+    rp_id: &str,
+    user_id: &[u8],
+    opts: &[(&str, bool)],
+) -> Vec<(u64, Value)> {
     vec![
         (0x01, Value::Bytes(CLIENT_DATA_HASH.to_vec())),
         (0x02, rp(rp_id)),
@@ -134,6 +139,8 @@ pub(in crate::ctap2) struct Made {
     pub(in crate::ctap2) public_key: Vec<u8>,
     /// attStmt `alg` and `sig`, if any.
     pub(in crate::ctap2) statement: Option<(i64, Vec<u8>)>,
+    /// The encoded extension outputs after the credential key, present exactly with ED.
+    pub(in crate::ctap2) extensions: Vec<u8>,
 }
 
 /// Reads the response body of a makeCredential, and the attested credential data of its
@@ -187,7 +194,12 @@ pub(in crate::ctap2) fn made(body: &[u8]) -> Made {
     public_key.extend_from_slice(&key[10..42]);
     assert_eq!(key[42..45], [0x22, 0x58, 0x20], "COSE_Key y head");
     public_key.extend_from_slice(&key[45..77]);
-    assert_eq!(key.len(), 77, "nothing after the key");
+    let extensions = key[77..].to_vec();
+    assert_eq!(
+        extensions.is_empty(),
+        auth_data[32] & ED == 0,
+        "extension outputs exactly with ED"
+    );
     Made {
         fmt,
         flags: auth_data[32],
@@ -195,6 +207,7 @@ pub(in crate::ctap2) fn made(body: &[u8]) -> Made {
         id,
         public_key,
         statement,
+        extensions,
     }
 }
 

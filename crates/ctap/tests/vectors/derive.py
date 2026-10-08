@@ -82,6 +82,15 @@ def main() -> None:
     print("device_credential_key_counter", counter)
     print("device_credential_key", device.hex())
 
+    # CredRandom for hmac-secret: K_hmac below K_root (seed-recoverable) or K_dev
+    # (non-discoverable device-only), then one value with UV and one without per cs.
+    k_hmac = hkdf(b"", k_root, b"cred-random")
+    print("cred_random_uv", hkdf(CS, k_hmac, b"uv").hex())
+    print("cred_random_no_uv", hkdf(CS, k_hmac, b"no-uv").hex())
+    k_dev_hmac = hkdf(b"", K_DEV, b"cred-random")
+    print("device_cred_random_uv", hkdf(CS, k_dev_hmac, b"uv").hex())
+    print("device_cred_random_no_uv", hkdf(CS, k_dev_hmac, b"no-uv").hex())
+
     # Seed-recoverable, non-discoverable: {1: 1, 2: -7, 3: cs, 6: 1, 7: false, 11: 0}.
     seed_plaintext = (
         bytes([0xA6, 0x01, 0x01, 0x02, 0x26, 0x03, 0x58, 0x20])
