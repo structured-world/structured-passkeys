@@ -126,8 +126,10 @@ pub(super) struct NextAssertions {
     uv: bool,
     /// Whether a pinUvAuthToken authenticated the assertion, whose expiry ends the state.
     token: bool,
-    /// The hmac-secret salts, which every credential returned answers as the first did.
-    salts: Option<Salts>,
+    /// The hmac-secret input, which every credential returned answers as the first did. Only the
+    /// public input is kept: each command decrypts the salts again for its own run, so the
+    /// shared secret and the salts leave RAM with the command, however long the state waits.
+    hmac_secret: Option<HmacSecretInput>,
 }
 
 /// A credential that may answer the assertion, by where it is found. It is decoded again each
@@ -343,7 +345,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             up,
             uv,
             token: protocol.is_some(),
-            salts: None,
+            // Copied out of the request, which ends with this command: under 100 bytes, once.
+            hmac_secret: request.hmac_secret.clone(),
         });
         if continuation.is_some() {
             number_of_credentials = Some(applicable.len());
@@ -370,7 +373,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             &extras,
             encoder,
         )?;
-        self.next_assertions = continuation.map(|state| NextAssertions { salts, ..state });
+        self.next_assertions = continuation;
         Ok(())
     }
 
@@ -578,10 +581,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 credential,
             })
             .ok_or(StatusCode::NoCredentials)?;
+        // The salts are decrypted again for this command, and wiped with it.
+        let salts = state
+            .hmac_secret
+            .as_ref()
+            .map(|input| self.salts(input))
+            .transpose()?;
         let extras = Extras {
             number_of_credentials: None,
             user_selected: false,
-            salts: state.salts.as_ref(),
+            salts: salts.as_ref(),
         };
         self.assert(
             &keys,

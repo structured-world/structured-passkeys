@@ -31,7 +31,7 @@ const MAX_OUTPUTS_LEN: usize = 256;
 /// The hmac-secret input of getAssertion, also the hmac-secret-mc input of makeCredential
 /// (§12.7, §12.8): the platform key agreement key, the encrypted salts, their MAC and the
 /// protocol. The salts are encrypted and the MAC is public, so neither is secret.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HmacSecretInput {
     key_agreement: PeerKey,
     salt_enc: Vec<u8>,
