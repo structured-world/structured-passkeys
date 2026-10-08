@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 use core::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::credential_id::{KeySource, MAX_CREDENTIAL_ID_LEN, SLOT_TAG_LEN};
+use crate::credential_id::{
+    KeySource, MAX_CREDENTIAL_ID_LEN, MAX_SEALED_NAMES_LEN, SLOT_TAG_LEN, StoreId,
+};
 use crate::crypto::{Crypto, KEY_LEN};
 use crate::ctap2::StatusCode;
 
@@ -28,7 +30,7 @@ pub use memory::MemoryStorage;
 
 /// Version of the record layout below, stored in the configuration. NVM that holds another
 /// version (or none: a fresh install reads all zeros) is wiped and formatted on open.
-pub const LAYOUT_VERSION: u8 = 1;
+pub const LAYOUT_VERSION: u8 = 2;
 /// Longest RP ID kept in an index entry, in bytes.
 pub const MAX_RP_ID_LEN: usize = 64;
 /// Length of the stored PIN verifier, `LEFT(SHA-256(PIN), 16)` (CTAP 2.2 §6.5.5.5).
@@ -43,7 +45,7 @@ pub const PIN_RETRIES: u8 = 8;
 const USED: u8 = 1;
 
 // Configuration record: version, generation, reset ID, alwaysUv, PIN retries, PIN set, verifier,
-// creation sequence limit, device key set, device key.
+// creation sequence limit, device key set, device key, store ID (0: none yet).
 const CONFIG_VERSION: usize = 0;
 const CONFIG_GENERATION: usize = 1;
 const CONFIG_RESET_ID: usize = 5;
@@ -54,8 +56,9 @@ const CONFIG_PIN: usize = 12;
 const CONFIG_SEQUENCE_LIMIT: usize = CONFIG_PIN + PIN_VERIFIER_LEN;
 const CONFIG_DEVICE_KEY_SET: usize = CONFIG_SEQUENCE_LIMIT + 4;
 const CONFIG_DEVICE_KEY: usize = CONFIG_DEVICE_KEY_SET + 1;
+const CONFIG_STORE_ID: usize = CONFIG_DEVICE_KEY + KEY_LEN;
 /// Length of the configuration record.
-pub const CONFIG_LEN: usize = CONFIG_DEVICE_KEY + KEY_LEN;
+pub const CONFIG_LEN: usize = CONFIG_STORE_ID + 4;
 
 /// Creation sequences are handed out in blocks: the configuration records the end of the
 /// current block, so one configuration write covers this many creations and a sequence below
@@ -89,9 +92,23 @@ const KEY_CRED_RANDOM: usize = KEY_CRED_RANDOM_UV + KEY_LEN;
 /// Length of a device-only key slot record.
 pub const KEY_SLOT_LEN: usize = KEY_CRED_RANDOM + KEY_LEN;
 
+// Name override slot: state, generation, owner (index slot, sequence), sealed length, sealed names.
+const NAMES_STATE: usize = 0;
+const NAMES_GENERATION: usize = 1;
+const NAMES_OWNER_SLOT: usize = 5;
+const NAMES_OWNER_SEQUENCE: usize = 7;
+const NAMES_SEALED_LEN: usize = 11;
+const NAMES_SEALED: usize = NAMES_SEALED_LEN + 2;
+/// Length of a name override slot record.
+pub const NAME_SLOT_LEN: usize = NAMES_SEALED + MAX_SEALED_NAMES_LEN;
+/// Name override slots on every device: renaming is rare, so 16 credentials with updated names
+/// at a time are enough, and a slot costs flash for every install.
+pub const NAME_SLOTS: usize = 16;
+
 /// The NVM regions of the device. Each write replaces one record atomically: after a power loss
 /// the record holds the value before the write or the value written, never a mix. The device
-/// implements it with the SDK's atomic storage; [`MemoryStorage`] is the host double.
+/// implements it with the SDK's atomic storage; `MemoryStorage` (feature `soft`) is the host
+/// double.
 ///
 /// A record never written reads as all zeros. Slot numbers passed in are below the slot count.
 /// A write leaves no earlier value of the record anywhere in NVM: key slots hold private keys
@@ -113,6 +130,12 @@ pub trait Storage {
     fn key_slot(&self, slot: usize) -> &[u8; KEY_SLOT_LEN];
     /// Replaces the key slot record of `slot`.
     fn write_key_slot(&mut self, slot: usize, record: &[u8; KEY_SLOT_LEN]);
+    /// Number of name override slots.
+    fn name_slots(&self) -> usize;
+    /// The name override record of `slot`.
+    fn name_slot(&self, slot: usize) -> &[u8; NAME_SLOT_LEN];
+    /// Replaces the name override record of `slot`.
+    fn write_name_slot(&mut self, slot: usize, record: &[u8; NAME_SLOT_LEN]);
 }
 
 /// Why a store operation was refused. Nothing was written when it is returned.
@@ -351,6 +374,11 @@ impl<S: Storage> Store<S> {
                     storage.write_key_slot(slot, &[0; KEY_SLOT_LEN]);
                 }
             }
+            for slot in 0..storage.name_slots() {
+                if !is_zero(storage.name_slot(slot)) {
+                    storage.write_name_slot(slot, &[0; NAME_SLOT_LEN]);
+                }
+            }
             let mut store = Self {
                 storage,
                 generation: 0,
@@ -367,8 +395,9 @@ impl<S: Storage> Store<S> {
             // credentials for as long as this NVM lives; the reset ID travels in the encrypted
             // backup, and the reset confirmation screen says both. Device-only credentials are
             // unaffected: their keys are gone with the NVM.
-            // No device key: the record of another layout holds none that this one could read.
-            store.write_record(&Config::after_reset(0), 0, None);
+            // No device key and no store ID: the record of another layout holds none that this
+            // one could read, and the first discoverable credential draws the store ID.
+            store.write_record(&Config::after_reset(0), 0, None, 0);
             return store;
         }
         let mut store = Self {
@@ -411,7 +440,40 @@ impl<S: Storage> Store<S> {
     pub fn write_config(&mut self, config: &Config) {
         let device_key = self.device_key();
         let reset_id = read_u32(self.storage.config(), CONFIG_RESET_ID);
-        self.write_record(config, reset_id, device_key.as_deref());
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(config, reset_id, device_key.as_deref(), store_id);
+    }
+
+    /// The store ID of this NVM, if a discoverable credential was created since it was
+    /// formatted.
+    pub fn store_id(&self) -> Option<StoreId> {
+        StoreId::new(read_u32(self.storage.config(), CONFIG_STORE_ID))
+    }
+
+    /// The store ID of this NVM, first drawn from the TRNG and written into the configuration if
+    /// there is none: a random nonzero value, kept until NVM is formatted again (a reset keeps
+    /// it, as the reset ID already revokes what was created before).
+    pub fn store_id_or_create<C: Crypto>(&mut self, crypto: &mut C) -> StoreId {
+        if let Some(store_id) = self.store_id() {
+            return store_id;
+        }
+        // Drawn until nonzero: a draw is 0 with probability 2^-32.
+        let store_id = loop {
+            let mut bytes = [0u8; 4];
+            crypto.random(&mut bytes);
+            if let Some(store_id) = StoreId::new(u32::from_le_bytes(bytes)) {
+                break store_id;
+            }
+        };
+        let config = self.config();
+        let device_key = self.device_key();
+        self.write_record(
+            &config,
+            config.reset_id,
+            device_key.as_deref(),
+            store_id.get(),
+        );
+        store_id
     }
 
     /// The device key `K_dev` of non-discoverable device-only credentials, if one was created
@@ -421,7 +483,7 @@ impl<S: Storage> Store<S> {
         (record[CONFIG_DEVICE_KEY_SET] == USED).then(|| {
             // Copied straight into the zeroizing buffer: no plain array holds it on the way.
             let mut key = Zeroizing::new([0u8; KEY_LEN]);
-            key.copy_from_slice(&record[CONFIG_DEVICE_KEY..CONFIG_LEN]);
+            key.copy_from_slice(&record[CONFIG_DEVICE_KEY..CONFIG_STORE_ID]);
             key
         })
     }
@@ -435,13 +497,21 @@ impl<S: Storage> Store<S> {
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         crypto.random(&mut key[..]);
         let config = self.config();
-        self.write_record(&config, config.reset_id, Some(&key));
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(&config, config.reset_id, Some(&key), store_id);
         key
     }
 
     /// Writes `config` with `reset_id` in place of its own, so a caller can keep the stored reset
-    /// ID without copying the rest of the configuration (it holds the PIN verifier).
-    fn write_record(&mut self, config: &Config, reset_id: u32, device_key: Option<&[u8; KEY_LEN]>) {
+    /// ID without copying the rest of the configuration (it holds the PIN verifier), and with
+    /// `store_id` (0 for none).
+    fn write_record(
+        &mut self,
+        config: &Config,
+        reset_id: u32,
+        device_key: Option<&[u8; KEY_LEN]>,
+        store_id: u32,
+    ) {
         let mut record = Zeroizing::new([0u8; CONFIG_LEN]);
         record[CONFIG_VERSION] = LAYOUT_VERSION;
         write_u32(&mut record[..], CONFIG_GENERATION, self.generation);
@@ -455,8 +525,9 @@ impl<S: Storage> Store<S> {
         write_u32(&mut record[..], CONFIG_SEQUENCE_LIMIT, self.sequence_limit);
         if let Some(key) = device_key {
             record[CONFIG_DEVICE_KEY_SET] = USED;
-            record[CONFIG_DEVICE_KEY..CONFIG_LEN].copy_from_slice(key);
+            record[CONFIG_DEVICE_KEY..CONFIG_STORE_ID].copy_from_slice(key);
         }
+        write_u32(&mut record[..], CONFIG_STORE_ID, store_id);
         self.storage.write_config(&record);
     }
 
@@ -489,7 +560,9 @@ impl<S: Storage> Store<S> {
             .generation
             .checked_add(1)
             .ok_or(StoreError::Exhausted)?;
-        self.write_record(&Config::after_reset(reset_id), reset_id, None);
+        // The store ID stays: the new reset ID already refuses every ID created before.
+        let store_id = read_u32(self.storage.config(), CONFIG_STORE_ID);
+        self.write_record(&Config::after_reset(reset_id), reset_id, None, store_id);
         self.sweep();
         Ok(())
     }
@@ -766,6 +839,78 @@ impl<S: Storage> Store<S> {
         })
     }
 
+    /// The sealed names updateUserInformation gave the entry `owner`, if its override slot is
+    /// still live.
+    pub fn names(&self, owner: EntryId) -> Option<&[u8]> {
+        (0..slot_count(self.storage.name_slots()))
+            .find(|&slot| self.names_owner(slot) == Some(owner))
+            .and_then(|slot| {
+                let record = self.storage.name_slot(usize::from(slot));
+                let length = usize::from(read_u16(record, NAMES_SEALED_LEN));
+                record.get(NAMES_SEALED..NAMES_SEALED + length)
+            })
+    }
+
+    /// Whether names for the entry `owner` have room: it owns a name slot already or one is
+    /// free. [`Store::set_names`] answers [`StoreError::Full`] exactly when this is false.
+    pub fn names_fit(&self, owner: EntryId) -> bool {
+        self.names_slot_for(owner).is_some()
+    }
+
+    /// The name slot names for `owner` go to: the one it owns, else the first free one.
+    fn names_slot_for(&self, owner: EntryId) -> Option<u16> {
+        let slots = slot_count(self.storage.name_slots());
+        (0..slots)
+            .find(|&slot| self.names_owner(slot) == Some(owner))
+            .or_else(|| (0..slots).find(|&slot| self.names_owner(slot).is_none()))
+    }
+
+    /// Stores `sealed` names for the entry `owner`, in place of the names it had: its own slot
+    /// is rewritten, or a free one taken.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Stale`] when the index no longer holds `owner`, [`StoreError::TooLong`] for
+    /// sealed names over [`MAX_SEALED_NAMES_LEN`], [`StoreError::Full`] when every slot holds
+    /// the names of another entry (CTAP2_ERR_KEY_STORE_FULL, CTAP 2.2 §6.8.6 step 9).
+    pub fn set_names(&mut self, owner: EntryId, sealed: &[u8]) -> Result<(), StoreError> {
+        if self.entry(owner.slot).map(|entry| entry.id) != Some(owner) {
+            return Err(StoreError::Stale);
+        }
+        if sealed.len() > MAX_SEALED_NAMES_LEN {
+            return Err(StoreError::TooLong);
+        }
+        let slot = self.names_slot_for(owner).ok_or(StoreError::Full)?;
+        let mut record = [0u8; NAME_SLOT_LEN];
+        record[NAMES_STATE] = USED;
+        write_u32(&mut record, NAMES_GENERATION, self.generation);
+        write_u16(&mut record, NAMES_OWNER_SLOT, owner.slot);
+        write_u32(&mut record, NAMES_OWNER_SEQUENCE, owner.sequence);
+        // At most MAX_SEALED_NAMES_LEN, checked above, which fits in 16 bits.
+        let length = u16::try_from(sealed.len()).map_err(|_| StoreError::TooLong)?;
+        write_u16(&mut record, NAMES_SEALED_LEN, length);
+        record[NAMES_SEALED..NAMES_SEALED + sealed.len()].copy_from_slice(sealed);
+        self.storage.write_name_slot(usize::from(slot), &record);
+        Ok(())
+    }
+
+    /// The entry a name override slot belongs to, while it is live: of this generation, within
+    /// its length, and owned by an entry still in the index.
+    fn names_owner(&self, slot: u16) -> Option<EntryId> {
+        let record = self.storage.name_slot(usize::from(slot));
+        if record[NAMES_STATE] != USED
+            || read_u32(record, NAMES_GENERATION) != self.generation
+            || usize::from(read_u16(record, NAMES_SEALED_LEN)) > MAX_SEALED_NAMES_LEN
+        {
+            return None;
+        }
+        let owner = EntryId {
+            slot: read_u16(record, NAMES_OWNER_SLOT),
+            sequence: read_u32(record, NAMES_OWNER_SEQUENCE),
+        };
+        (self.entry(owner.slot).map(|entry| entry.id) == Some(owner)).then_some(owner)
+    }
+
     /// Whether a live key of this generation belongs to the entry `id`.
     fn owns_key(&self, id: EntryId) -> bool {
         (0..slot_count(self.storage.key_slots())).any(|key| {
@@ -797,7 +942,8 @@ impl<S: Storage> Store<S> {
             && self.entry(owner.slot).map(|entry| entry.id) == Some(owner)
     }
 
-    /// Wipes the keys owned by index slot `slot` that its current entry does not own.
+    /// Wipes the keys and name overrides owned by index slot `slot` that its current entry does
+    /// not own.
     fn wipe_orphans(&mut self, slot: u16) {
         for key in 0..slot_count(self.storage.key_slots()) {
             let record = self.storage.key_slot(usize::from(key));
@@ -805,6 +951,15 @@ impl<S: Storage> Store<S> {
             if owned_here && !self.key_is_live(key) {
                 self.storage
                     .write_key_slot(usize::from(key), &[0; KEY_SLOT_LEN]);
+            }
+        }
+        for names in 0..slot_count(self.storage.name_slots()) {
+            let record = self.storage.name_slot(usize::from(names));
+            let owned_here =
+                record[NAMES_STATE] == USED && read_u16(record, NAMES_OWNER_SLOT) == slot;
+            if owned_here && self.names_owner(names).is_none() {
+                self.storage
+                    .write_name_slot(usize::from(names), &[0; NAME_SLOT_LEN]);
             }
         }
     }
@@ -831,6 +986,12 @@ impl<S: Storage> Store<S> {
             let live = u16::try_from(slot).is_ok_and(|slot| self.key_is_live(slot));
             if !live && !is_zero(self.storage.key_slot(slot)) {
                 self.storage.write_key_slot(slot, &[0; KEY_SLOT_LEN]);
+            }
+        }
+        for slot in 0..self.storage.name_slots() {
+            let live = u16::try_from(slot).is_ok_and(|slot| self.names_owner(slot).is_some());
+            if !live && !is_zero(self.storage.name_slot(slot)) {
+                self.storage.write_name_slot(slot, &[0; NAME_SLOT_LEN]);
             }
         }
         // Every sequence below the recorded limit may have been handed out already.

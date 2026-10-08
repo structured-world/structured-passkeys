@@ -15,13 +15,15 @@ use crate::pin::{
 use crate::storage::{PIN_RETRIES, PIN_VERIFIER_LEN, PinVerifier, Storage};
 use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
 
-/// The getInfo option IDs that decide token permissions. Credential management and
-/// authenticatorConfig are not implemented yet, so `credMgmt` and `authnrCfg` are absent and
-/// their permissions are refused.
+/// The getInfo option IDs that decide token permissions: credential management and
+/// authenticatorConfig are offered, the latter also to a token from built-in user verification
+/// (uvAcfg); large blobs and the persistent credential management token are not, so their
+/// permissions are refused. A token may carry several of the offered permissions at once; the
+/// consent screen names each one it grants (§6.5.5.7.2 step 7).
 pub const FEATURES: Features = Features {
-    cred_mgmt: false,
-    authnr_cfg: false,
-    uv_acfg: false,
+    cred_mgmt: true,
+    authnr_cfg: true,
+    uv_acfg: true,
     large_blobs: false,
     per_cred_mgmt_ro: false,
 };

@@ -15,7 +15,7 @@
 //! use structured_passkeys_ctap::soft::SoftCrypto;
 //! use structured_passkeys_ctap::storage::{MemoryStorage, Store};
 //! use structured_passkeys_ctap::credential_id::Origin;
-//! use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Prompt, Registration, Ui};
+//! use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Passkeys, Prompt, Registration, Ui};
 //!
 //! /// A user who confirms everything on an unlocked device.
 //! struct Present;
@@ -29,6 +29,9 @@
 //!     }
 //!     fn pick<A: Accounts>(&mut self, _rp_id: &str, _accounts: &mut A, _timeout_ms: u32) -> Choice<usize> {
 //!         Choice::Chose(0)
+//!     }
+//!     fn browse<P: Passkeys>(&mut self, _passkeys: &mut P, _start: usize, _timeout_ms: u32) -> Choice<usize> {
+//!         Choice::Rejected
 //!     }
 //!     fn device_unlocked(&mut self) -> bool {
 //!         true
@@ -50,12 +53,17 @@
 //! ```
 
 mod client_pin;
+mod config;
 mod credential;
+mod credential_management;
 mod get_assertion;
 mod make_credential;
+mod settings;
 
 pub use client_pin::{ClientPinRequest, FEATURES, SubCommand};
+pub use config::ConfigRequest;
 pub use credential::Options;
+pub use credential_management::{CredentialManagementRequest, SubCommand as CredentialSubCommand};
 pub use get_assertion::{GetAssertionRequest, NEXT_ASSERTION_TIMEOUT_MS};
 pub use make_credential::{MakeCredentialRequest, UserEntity};
 
@@ -63,7 +71,8 @@ use crate::cbor::{self, Encoder, Full};
 use crate::crypto::Crypto;
 use crate::pin::{ClientPin, MIN_PIN_CODE_POINTS, Protocol};
 use crate::storage::{Storage, Store};
-use crate::ui::{Answer, Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use crate::ui::{Prompt, USER_ACTION_TIMEOUT_MS, Ui};
+use credential::presence_or_timeout;
 
 /// The AAGUID of this application, the same on every device (WebAuthn L3 §6.5.1).
 pub const AAGUID: [u8; 16] = [
@@ -373,8 +382,12 @@ pub enum Command {
     ClientPin(ClientPinRequest),
     /// authenticatorReset (§6.6).
     Reset,
+    /// authenticatorCredentialManagement (§6.8).
+    CredentialManagement(CredentialManagementRequest),
     /// authenticatorSelection (§6.9).
     Selection,
+    /// authenticatorConfig (§6.11).
+    Config(ConfigRequest),
 }
 
 /// How long after the application opens authenticatorReset is accepted. §6.6 requires it of an
@@ -400,6 +413,9 @@ pub struct Authenticator<C, S> {
     /// What authenticatorGetNextAssertion continues from; any other command discards it (§6.3:
     /// a stateful command continues only the command right before it).
     next_assertions: Option<get_assertion::NextAssertions>,
+    /// What the credential management continuations go on from; any other command discards it
+    /// (§6.8.3, §6.8.4, stateful commands).
+    enumeration: Option<credential_management::Enumeration>,
 }
 
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
@@ -416,6 +432,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             nfc_tap: None,
             nfc_tap_used: None,
             next_assertions: None,
+            enumeration: None,
         }
     }
 
@@ -494,15 +511,15 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             Ok(CommandCode::GetAssertion) => {
                 get_assertion::parse(parameters).map(Command::GetAssertion)
             }
+            Ok(CommandCode::CredentialManagement) => {
+                credential_management::parse(parameters).map(Command::CredentialManagement)
+            }
+            Ok(CommandCode::Config) => config::parse(parameters).map(Command::Config),
             // §8.1: a command code the authenticator does not implement is
             // CTAP1_ERR_INVALID_COMMAND.
-            Ok(
-                CommandCode::BioEnrollment
-                | CommandCode::CredentialManagement
-                | CommandCode::LargeBlobs
-                | CommandCode::Config,
-            )
-            | Err(UnknownCommand(_)) => Err(StatusCode::InvalidCommand),
+            Ok(CommandCode::BioEnrollment | CommandCode::LargeBlobs) | Err(UnknownCommand(_)) => {
+                Err(StatusCode::InvalidCommand)
+            }
         }
     }
 
@@ -522,6 +539,10 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         // would continue.
         if !matches!(command, Ok(Command::GetNextAssertion)) {
             self.next_assertions = None;
+        }
+        // The same for the credential management continuations (§6.8.3, §6.8.4).
+        if !matches!(&command, Ok(Command::CredentialManagement(request)) if request.continues()) {
+            self.enumeration = None;
         }
         let Some((status, body)) = response.split_first_mut() else {
             return 0;
@@ -557,7 +578,11 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             Command::GetInfo => self.get_info(encoder).map_err(|Full| StatusCode::Other),
             Command::ClientPin(request) => self.client_pin(&request, ui, encoder),
             Command::Reset => self.reset(ui),
+            Command::CredentialManagement(request) => {
+                self.credential_management(&request, ui, encoder)
+            }
             Command::Selection => self.selection(link, ui),
+            Command::Config(request) => self.config(&request, ui),
         }
     }
 
@@ -571,12 +596,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if link == Link::Nfc && self.nfc_present(ui.now_ms()) {
             return Ok(());
         }
-        match ui.confirm(Prompt::Selection, USER_ACTION_TIMEOUT_MS) {
-            Answer::Confirmed => Ok(()),
-            Answer::Rejected => Err(StatusCode::OperationDenied),
-            Answer::Cancelled => Err(StatusCode::KeepaliveCancel),
-            Answer::TimedOut => Err(StatusCode::UserActionTimeout),
-        }
+        presence_or_timeout(ui.confirm(Prompt::Selection, USER_ACTION_TIMEOUT_MS))
     }
 
     /// authenticatorReset (§6.6): within [`RESET_WINDOW_MS`] of the application opening, else
@@ -590,12 +610,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         if ui.now_ms() > RESET_WINDOW_MS {
             return Err(StatusCode::NotAllowed);
         }
-        match ui.confirm(Prompt::Reset, USER_ACTION_TIMEOUT_MS) {
-            Answer::Confirmed => {}
-            Answer::Rejected => return Err(StatusCode::OperationDenied),
-            Answer::Cancelled => return Err(StatusCode::KeepaliveCancel),
-            Answer::TimedOut => return Err(StatusCode::UserActionTimeout),
-        }
+        presence_or_timeout(ui.confirm(Prompt::Reset, USER_ACTION_TIMEOUT_MS))?;
         self.store.reset(&mut self.crypto)?;
         self.client_pin.reset(&mut self.crypto);
         // §6.6 also renews the device identifier, which exists only for getInfo's encIdentifier;
@@ -609,12 +624,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// getNextAssertion, getInfo, clientPIN, reset).
     ///
     /// Options: `rk` and `up`; `uv`, since built-in user verification is the device unlock and
-    /// always present; `clientPin`, true once a client PIN is set (§6.4 option IDs); and
-    /// `pinUvAuthToken`, the token commands being implemented. With clientPin comes minPINLength,
-    /// which "MUST be present if the authenticator supports authenticatorClientPIN".
+    /// always present; `credMgmt` and `authnrCfg` with their commands, and `uvAcfg`, so a token
+    /// from built-in UV may carry `acfg` (§6.4: only with authnrCfg); `alwaysUv` as configured;
+    /// `clientPin`, true once a client PIN is set (§6.4 option IDs); and `pinUvAuthToken`.
+    /// `makeCredUvNotRqd` stays absent, which is false, as alwaysUv requires. With clientPin comes
+    /// minPINLength, which "MUST be present if the authenticator supports authenticatorClientPIN".
     fn get_info(&self, encoder: &mut Encoder<'_>) -> Result<(), Full> {
         let transports = self.settings.transports.names();
-        let pin_set = self.store.config().pin.is_some();
+        let config = self.store.config();
+        let pin_set = config.pin.is_some();
+        let always_uv = config.always_uv;
         encoder
             .map(7)?
             // versions (0x01), required. Requests are processed by the CTAP 2.2 rules whatever
@@ -630,13 +649,21 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             .bytes(&AAGUID)?
             // options (0x04), keys in canonical order: shorter first, then bytewise.
             .unsigned(0x04)?
-            .map(5)?
+            .map(9)?
             .text("rk")?
             .bool(true)?
             .text("up")?
             .bool(true)?
             .text("uv")?
             .bool(true)?
+            .text("uvAcfg")?
+            .bool(FEATURES.uv_acfg)?
+            .text("alwaysUv")?
+            .bool(always_uv)?
+            .text("credMgmt")?
+            .bool(FEATURES.cred_mgmt)?
+            .text("authnrCfg")?
+            .bool(FEATURES.authnr_cfg)?
             .text("clientPin")?
             .bool(pin_set)?
             .text("pinUvAuthToken")?

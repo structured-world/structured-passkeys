@@ -895,8 +895,8 @@ fn get_pin_token_takes_no_permissions() {
 }
 
 /// getPinUvAuthTokenUsingPinWithPermissions (§6.5.5.7.2): permissions 0 is INVALID_PARAMETER;
-/// cm, be, lbw, acfg and pcmr are UNAUTHORIZED_PERMISSION while their features are absent; mc
-/// and ga for an RP ID give a token bound to that RP, after consent naming it.
+/// be, lbw and pcmr are UNAUTHORIZED_PERMISSION while their features are absent; mc and ga for
+/// an RP ID give a token bound to that RP, after consent naming it.
 #[test]
 fn a_pin_token_with_permissions_is_bound_to_its_rp() {
     let mut authenticator = authenticator();
@@ -911,7 +911,7 @@ fn a_pin_token_with_permissions_is_bound_to_its_rp() {
         None,
     );
     assert_eq!(response, [INVALID_PARAMETER]);
-    for permission in [0x04, 0x08, 0x10, 0x20, 0x40] {
+    for permission in [0x08, 0x10, 0x40] {
         let (response, _) = pin_token(
             &mut authenticator,
             &mut ui,
@@ -1232,8 +1232,9 @@ fn rp_scoped_permissions_need_an_rp_id() {
     assert_eq!(retries(&mut authenticator), (8, false));
 }
 
-/// Built-in UV requires permissions (MISSING_PARAMETER), refuses 0 (INVALID_PARAMETER) and acfg
-/// without uvAcfg (UNAUTHORIZED_PERMISSION), all before any screen.
+/// Built-in UV requires permissions (MISSING_PARAMETER), refuses 0 (INVALID_PARAMETER) and be,
+/// lbw and pcmr (UNAUTHORIZED_PERMISSION), all before any screen; cm and acfg, which uvAcfg
+/// allows from built-in UV, give a token.
 #[test]
 fn built_in_uv_permission_checks() {
     let mut authenticator = authenticator();
@@ -1241,13 +1242,24 @@ fn built_in_uv_permission_checks() {
     for (permissions, status) in [
         (None, MISSING_PARAMETER),
         (Some(0), INVALID_PARAMETER),
-        (Some(0x20), UNAUTHORIZED_PERMISSION),
-        (Some(0x04), UNAUTHORIZED_PERMISSION),
+        (Some(0x08), UNAUTHORIZED_PERMISSION),
+        (Some(0x10), UNAUTHORIZED_PERMISSION),
+        (Some(0x40), UNAUTHORIZED_PERMISSION),
     ] {
         let (response, _) = uv_token(&mut authenticator, &mut ui, permissions, None);
         assert_eq!(response, [status], "{permissions:?}");
     }
     assert_eq!(ui.asked, []);
+    for permissions in [0x04, 0x20, 0x24] {
+        let (response, _) = uv_token(&mut authenticator, &mut ui, Some(permissions), None);
+        assert_eq!(response[0], OK, "{permissions:#x}");
+        assert!(
+            authenticator
+                .client_pin
+                .has_permission(Permissions::from_request(permissions)),
+            "{permissions:#x}"
+        );
+    }
 }
 
 /// getUVRetries answers {5: 1} while the operating system holds the device PIN validated, and

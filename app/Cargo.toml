@@ -16,7 +16,7 @@ publish = false
 # they come from this fork of the Ledger Rust SDK until the published crate has them.
 # `sys` exposes the C SDK calls the application makes directly: the NBGL use cases its screens
 # start without the SDK's blocking wait, and whether the device is unlocked.
-ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "60b746f6541f12d25d3bda2322ff0e535f3e0959", features = ["io_new", "nano_nbgl", "app_io_stack", "nfc", "sys"] }
+ledger_device_sdk = { git = "https://github.com/structured-world/ledger-device-rust-sdk", rev = "3d8a39f27375d7e73b19d3df13fa96b0ac9ba3f1", features = ["io_new", "nano_nbgl", "app_io_stack", "nfc", "sys"] }
 structured-passkeys-ctap = { path = "../crates/ctap", default-features = false }
 zeroize = { version = "1.9.0", default-features = false }
 

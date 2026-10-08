@@ -74,7 +74,9 @@ fn rp_entity<'a>(decoder: &mut Decoder<'a>) -> Result<Option<&'a str>, crate::cb
 
 /// Reads `user` (WebAuthn L3 §5.4.3); `None` without its `id`. The removed `icon` member and any
 /// other are skipped (§6.1, note on `user`).
-fn user_entity(decoder: &mut Decoder<'_>) -> Result<Option<UserEntity>, crate::cbor::Error> {
+pub(super) fn user_entity(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<UserEntity>, crate::cbor::Error> {
     decoder.map(|entries| {
         let mut id = None;
         let mut name = None;
@@ -565,18 +567,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             name: request.user.name.clone(),
             display_name: request.user.display_name.clone(),
         });
+        // A discoverable ID carries the store ID, so deleting its entry revokes it (§6.1.3).
+        let store = user
+            .is_some()
+            .then(|| self.store.store_id_or_create(&mut self.crypto));
         let credential = Credential {
             key,
             alg,
             cred_protect: CredProtect::Optional,
             user,
             reset_id: self.store.config().reset_id,
+            store,
         };
         let id = credential_id::seal(&mut self.crypto, keys, &request.rp_id, &credential).map_err(
             |error| match error {
-                // The user handle was checked before; a key source that does not fit is a bug.
+                // The user handle was checked before; a key source or store ID that does not fit
+                // is a bug.
                 SealError::TooLong => StatusCode::InvalidParameter,
-                SealError::KeySource => StatusCode::Other,
+                SealError::KeySource | SealError::StoreId => StatusCode::Other,
             },
         )?;
         Ok(Created {

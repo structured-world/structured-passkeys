@@ -18,7 +18,7 @@ use structured_passkeys_ctap::ctap2::{
 };
 use structured_passkeys_ctap::soft::SoftCrypto;
 use structured_passkeys_ctap::storage::{MemoryStorage, PinVerifier, Store};
-use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Prompt, Registration, Ui};
+use structured_passkeys_ctap::ui::{Accounts, Answer, Choice, Passkeys, Prompt, Registration, Ui};
 
 /// Authenticator data flags UP and UV (WebAuthn L3 §6.1).
 const UP: u8 = 0x01;
@@ -83,6 +83,16 @@ impl Ui for Fuzzed {
         }
         let wanted = usize::from((self.0 >> 3) & 0x03);
         self.choice(wanted % accounts.count().max(1))
+    }
+
+    fn browse<P: Passkeys>(
+        &mut self,
+        _passkeys: &mut P,
+        _start: usize,
+        _timeout_ms: u32,
+    ) -> Choice<usize> {
+        // The settings list belongs to the device, never to a request.
+        unreachable!("no request opens the settings list")
     }
 
     fn device_unlocked(&mut self) -> bool {

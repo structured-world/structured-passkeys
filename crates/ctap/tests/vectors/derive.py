@@ -92,9 +92,9 @@ def main() -> None:
     print("seed_credential_id", credential_id(seed_plaintext, k_wrap).hex())
 
     # Device-only, discoverable: {1: 0, 2: -7, 4: 5, 5: tag, 6: 3, 7: true, 8: "user-1" bytes,
-    # 9: "alice", 10: "Alice A", 11: 2}.
+    # 9: "alice", 10: "Alice A", 11: 2, 12: 7}.
     slot_plaintext = (
-        bytes([0xAA, 0x01, 0x00, 0x02, 0x26, 0x04, 0x05, 0x05, 0x50])
+        bytes([0xAB, 0x01, 0x00, 0x02, 0x26, 0x04, 0x05, 0x05, 0x50])
         + SLOT_TAG
         + bytes([0x06, 0x03, 0x07, 0xF5, 0x08, 0x46])
         + b"user-1"
@@ -102,7 +102,7 @@ def main() -> None:
         + b"alice"
         + bytes([0x0A, 0x67])
         + b"Alice A"
-        + bytes([0x0B, 0x02])
+        + bytes([0x0B, 0x02, 0x0C, 0x07])
     )
     print("slot_plaintext", slot_plaintext.hex())
     print("slot_credential_id", credential_id(slot_plaintext, k_wrap).hex())

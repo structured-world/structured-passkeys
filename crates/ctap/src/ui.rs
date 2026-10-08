@@ -59,6 +59,27 @@ pub trait Accounts {
     fn read<R>(&mut self, index: usize, show: impl FnOnce(Account<'_>) -> R) -> Option<R>;
 }
 
+/// A discoverable credential as the settings list shows it: the RP ID the index keeps, shown as
+/// [`MAX_SHOWN_RP_ID_LEN`] describes, and its account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Passkey<'a> {
+    /// The RP ID.
+    pub rp_id: &'a str,
+    /// The account and the origin of its key.
+    pub account: Account<'a>,
+}
+
+/// The passkeys the settings list offers, read one at a time like [`Accounts`].
+pub trait Passkeys {
+    /// How many passkeys there are.
+    fn count(&self) -> usize;
+
+    /// Calls `show` with the passkey at `index`, below [`count`](Passkeys::count), and returns
+    /// what it returned; `None` when that passkey can no longer be read, after which the list
+    /// ends without a choice.
+    fn read<R>(&mut self, index: usize, show: impl FnOnce(Passkey<'_>) -> R) -> Option<R>;
+}
+
 /// What the user is asked to confirm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt<'a> {
@@ -90,6 +111,15 @@ pub enum Prompt<'a> {
     Excluded {
         /// The RP ID of the request.
         rp_id: &'a str,
+    },
+    /// Delete the discoverable credential of `account` for `rp_id`, chosen in the settings list.
+    /// A device-only one cannot come back, a seed-recoverable one only through the recovery
+    /// phrase on another device or after a reinstall.
+    Delete {
+        /// The RP ID the index keeps, shown as [`MAX_SHOWN_RP_ID_LEN`] describes.
+        rp_id: &'a str,
+        /// The account and the origin of its key.
+        account: Account<'a>,
     },
 }
 
@@ -149,6 +179,18 @@ pub trait Ui {
         &mut self,
         rp_id: &str,
         accounts: &mut A,
+        timeout_ms: u32,
+    ) -> Choice<usize>;
+
+    /// Shows the settings list of `passkeys`, most recently created first, from the one at
+    /// `start` (the first when beyond the last), and lets the user choose one to delete within
+    /// `timeout_ms`; the choice is the passkey's index. Leaving the list, or a list with no
+    /// passkey once the user has seen that it is empty, is [`Choice::Rejected`]; a passkey that
+    /// cannot be read ends the list the same way. No request waits behind this list.
+    fn browse<P: Passkeys>(
+        &mut self,
+        passkeys: &mut P,
+        start: usize,
         timeout_ms: u32,
     ) -> Choice<usize>;
 

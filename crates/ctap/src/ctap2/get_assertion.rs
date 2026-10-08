@@ -417,8 +417,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             .entry(entry_id.slot)
             .filter(|entry| entry.id == entry_id)?;
         let reset_id = self.store.config().reset_id;
-        let credential =
+        let mut credential =
             credential_id::open(&self.crypto, keys, rp_id, entry.credential_id, reset_id).ok()?;
+        self.apply_names(keys, entry_id, entry.credential_id, &mut credential);
         Some((entry.credential_id, credential))
     }
 

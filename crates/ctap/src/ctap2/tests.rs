@@ -12,7 +12,7 @@ use crate::pin::Protocol;
 use crate::soft::SoftCrypto;
 use crate::storage::{MemoryStorage, PIN_RETRIES, PinVerifier, Store};
 use crate::ui::{
-    Account, Accounts, Answer, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui,
+    Account, Accounts, Answer, Choice, Passkeys, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui,
 };
 
 pub(super) type TestAuthenticator = Authenticator<SoftCrypto, MemoryStorage>;
@@ -84,6 +84,8 @@ pub(super) enum Asked {
     Assertion { rp_id: String, account: Shown },
     /// A registration found in the excludeList.
     Excluded { rp_id: String },
+    /// The deletion of this account's credential.
+    Delete { rp_id: String, account: Shown },
     /// A registration for this account, the origin selector starting on `default_origin`.
     Registration {
         rp_id: String,
@@ -92,6 +94,11 @@ pub(super) enum Asked {
     },
     /// The account picker with these accounts.
     Pick { rp_id: String, accounts: Vec<Shown> },
+    /// The settings list with these passkeys as (RP ID, account), from the one at `start`.
+    Browse {
+        passkeys: Vec<(String, Shown)>,
+        start: usize,
+    },
 }
 
 impl Asked {
@@ -110,6 +117,10 @@ impl Asked {
             Prompt::Excluded { rp_id } => Asked::Excluded {
                 rp_id: String::from(rp_id),
             },
+            Prompt::Delete { rp_id, account } => Asked::Delete {
+                rp_id: String::from(rp_id),
+                account: Shown::from_account(&account),
+            },
         }
     }
 }
@@ -117,13 +128,15 @@ impl Asked {
 /// A user who gives `answer` to every confirmation, recording what was shown with its timeout,
 /// on a device whose PIN the operating system holds validated while `unlocked`; the clock is
 /// `now_ms`. A confirmed registration takes `origin`, or the default when it is `None`; a
-/// confirmed account picker takes the account at `pick`.
+/// confirmed account picker takes the account at `pick`. The settings list answers with the
+/// choices of `browsed` in turn, then leaves.
 pub(super) struct Scripted {
     pub(super) answer: Answer,
     pub(super) unlocked: bool,
     pub(super) now_ms: u64,
     pub(super) origin: Option<Origin>,
     pub(super) pick: usize,
+    pub(super) browsed: Vec<Choice<usize>>,
     pub(super) asked: Vec<(Asked, u32)>,
 }
 
@@ -135,6 +148,7 @@ impl Scripted {
             now_ms: 0,
             origin: None,
             pick: 0,
+            browsed: Vec::new(),
             asked: Vec::new(),
         }
     }
@@ -188,6 +202,38 @@ impl Ui for Scripted {
             timeout_ms,
         ));
         self.choice(self.pick)
+    }
+
+    fn browse<P: Passkeys>(
+        &mut self,
+        passkeys: &mut P,
+        start: usize,
+        timeout_ms: u32,
+    ) -> Choice<usize> {
+        let shown = (0..passkeys.count())
+            .map(|index| {
+                passkeys
+                    .read(index, |passkey| {
+                        (
+                            String::from(passkey.rp_id),
+                            Shown::from_account(&passkey.account),
+                        )
+                    })
+                    .expect("every listed passkey reads")
+            })
+            .collect();
+        self.asked.push((
+            Asked::Browse {
+                passkeys: shown,
+                start,
+            },
+            timeout_ms,
+        ));
+        if self.browsed.is_empty() {
+            Choice::Rejected
+        } else {
+            self.browsed.remove(0)
+        }
     }
 
     fn device_unlocked(&mut self) -> bool {
@@ -320,13 +366,18 @@ fn parsing_names_the_command() {
     );
 }
 
-/// The options map of getInfo (§6.4) in canonical order: `rk`, `up`, `uv` true, `clientPin`
-/// false while no client PIN is set, `pinUvAuthToken` true.
-const OPTIONS_WITHOUT_PIN: [u8; 41] = [
-    0x04, 0xA5, // key 4, a map of five
+/// The options map of getInfo (§6.4) in canonical order: `rk`, `up`, `uv`, `uvAcfg` true,
+/// `alwaysUv` false until toggled, `credMgmt` and `authnrCfg` true, `clientPin` false while no
+/// client PIN is set, `pinUvAuthToken` true.
+pub(super) const OPTIONS_WITHOUT_PIN: [u8; 80] = [
+    0x04, 0xA9, // key 4, a map of nine
     0x62, b'r', b'k', 0xF5, // "rk": true
     0x62, b'u', b'p', 0xF5, // "up": true
     0x62, b'u', b'v', 0xF5, // "uv": true
+    0x66, b'u', b'v', b'A', b'c', b'f', b'g', 0xF5, // "uvAcfg": true
+    0x68, b'a', b'l', b'w', b'a', b'y', b's', b'U', b'v', 0xF4, // "alwaysUv": false
+    0x68, b'c', b'r', b'e', b'd', b'M', b'g', b'm', b't', 0xF5, // "credMgmt": true
+    0x69, b'a', b'u', b't', b'h', b'n', b'r', b'C', b'f', b'g', 0xF5, // "authnrCfg": true
     0x69, b'c', b'l', b'i', b'e', b'n', b't', b'P', b'i', b'n', 0xF4, // "clientPin": false
     0x6E, b'p', b'i', b'n', b'U', b'v', b'A', b'u', b't', b'h', b'T', b'o', b'k', b'e', b'n',
     0xF5, // "pinUvAuthToken": true
@@ -398,7 +449,7 @@ fn an_empty_request_is_invalid_length() {
 /// CTAP1_ERR_INVALID_COMMAND with no body.
 #[test]
 fn unimplemented_commands_are_invalid_command() {
-    for code in [0x03, 0x05, 0x09, 0x0A, 0x0C, 0x0D, 0x40, 0x41, 0xFF] {
+    for code in [0x03, 0x05, 0x09, 0x0C, 0x40, 0x41, 0xFF] {
         assert_eq!(process(&[code, 0xA0]), [0x01], "command {code:#04x}");
     }
 }

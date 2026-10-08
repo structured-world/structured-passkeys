@@ -4,7 +4,7 @@
 //! ```text
 //! credential_id = version (1, 0x01) || nonce (12) || ciphertext || tag (16)
 //! AAD           = version || SHA-256(rpId)
-//! plaintext     = canonical CBOR map, keys 1..=11 as listed on [`Credential`]
+//! plaintext     = canonical CBOR map, keys 1..=12 as listed on [`Credential`]
 //! ```
 
 use alloc::string::String;
@@ -31,7 +31,7 @@ pub const SEED_LEN: usize = 32;
 pub const SLOT_TAG_LEN: usize = 16;
 
 /// Largest plaintext: the map header and every field at its maximum size.
-const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
+const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 12 entries
     + 2 // 1: origin
     + 2 + 9 // 2: alg, any i64
     + 1 + 2 + SEED_LEN // 3: cs
@@ -41,10 +41,21 @@ const MAX_PLAINTEXT_LEN: usize = 1 // map of up to 11 entries
     + 2 // 7: rk
     + 1 + 2 + MAX_USER_ID_LEN // 8: user_id
     + 2 * (1 + 2 + MAX_NAME_LEN) // 9, 10: names
-    + 2 + 5; // 11: epoch, up to u32
+    + 2 + 5 // 11: reset ID, up to u32
+    + 1 + 5; // 12: store ID, up to u32
 
 /// Longest credential ID, reported as `maxCredentialIdLength`.
 pub const MAX_CREDENTIAL_ID_LEN: usize = 1 + NONCE_LEN + MAX_PLAINTEXT_LEN + TAG_LEN;
+
+/// Largest plaintext of updated names: a map of up to 2 entries, each name at its maximum.
+const MAX_NAMES_PLAINTEXT_LEN: usize = 1 + 2 * (1 + 2 + MAX_NAME_LEN);
+
+/// Longest sealed names: nonce, ciphertext, tag.
+pub const MAX_SEALED_NAMES_LEN: usize = NONCE_LEN + MAX_NAMES_PLAINTEXT_LEN + TAG_LEN;
+
+/// Leads the associated data of sealed names, so they never open as a credential ID, whose
+/// associated data leads with [`VERSION`].
+const NAMES_DOMAIN: u8 = 0x02;
 
 /// The origin of a credential's key, which the user chooses at registration: what the recovery
 /// phrase can reproduce, and so what the backup flags report.
@@ -142,6 +153,25 @@ impl TryFrom<u64> for CredProtect {
     }
 }
 
+/// The store ID of the NVM that created a discoverable credential: random, nonzero, drawn once
+/// per NVM. A discoverable ID carrying the current store ID opens only while its index entry
+/// exists, so deleting the entry revokes it although the recovery phrase reproduces its key
+/// (CTAP 2.2 §6.1.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreId(u32);
+
+impl StoreId {
+    /// The store ID `value`; `None` for 0, which marks no store ID in the configuration.
+    pub const fn new(value: u32) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    /// The value, never 0.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// The user of a discoverable credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct User {
@@ -155,7 +185,8 @@ pub struct User {
 
 /// Everything a credential ID carries. Plaintext keys: 1 origin (0 device-only, 1
 /// seed-recoverable), 2 alg, 3 cs (seed-recoverable, or device-only under `K_dev`), 4 slot, 5
-/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 reset ID.
+/// slot_tag, 6 cred_protect, 7 rk, 8 user_id, 9 user name, 10 display name, 11 reset ID, 12 store
+/// ID (discoverable only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credential {
     /// Where the private key comes from.
@@ -169,6 +200,9 @@ pub struct Credential {
     /// The device's reset ID at creation: 0 before any reset, otherwise the random value the
     /// last reset drew.
     pub reset_id: u32,
+    /// The store ID of the NVM that created a discoverable credential; `None` exactly when
+    /// `user` is, since a non-discoverable credential has no entry to delete.
+    pub store: Option<StoreId>,
 }
 
 /// Why a credential ID does not open.
@@ -194,6 +228,8 @@ pub enum SealError {
     /// A key source that does not fit the credential: a slot key belongs to a discoverable
     /// credential, which its entry can delete, and a key under `K_dev` to a non-discoverable one.
     KeySource,
+    /// A store ID on a non-discoverable credential, or none on a discoverable one.
+    StoreId,
 }
 
 /// Whether `key` may carry a credential that is discoverable or not, as `discoverable` says.
@@ -219,9 +255,13 @@ pub fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
 }
 
 fn aad<C: Crypto>(crypto: &C, rp_id: &str) -> [u8; 1 + KEY_LEN] {
+    aad_for_hash(&crypto.sha256(&[rp_id.as_bytes()]))
+}
+
+fn aad_for_hash(rp_id_hash: &[u8; KEY_LEN]) -> [u8; 1 + KEY_LEN] {
     let mut aad = [0u8; 1 + KEY_LEN];
     aad[0] = VERSION;
-    aad[1..].copy_from_slice(&crypto.sha256(&[rp_id.as_bytes()]));
+    aad[1..].copy_from_slice(rp_id_hash);
     aad
 }
 
@@ -231,12 +271,16 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
     let names = user.map_or(0, |user| {
         usize::from(user.name.is_some()) + usize::from(user.display_name.is_some())
     });
-    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, reset ID.
+    // origin, alg, key fields (1 or 2), cred_protect, rk, user_id, names, reset ID, store ID.
     let key_fields = match credential.key {
         KeySource::Seed(_) | KeySource::Device(_) => 1,
         KeySource::Slot { .. } => 2,
     };
-    let entries = 5 + key_fields + usize::from(user.is_some()) + names;
+    let entries = 5
+        + key_fields
+        + usize::from(user.is_some())
+        + names
+        + usize::from(credential.store.is_some());
     let write = |encoder: &mut Encoder<'_>| -> Result<(), cbor::Full> {
         encoder.map(entries)?;
         match &credential.key {
@@ -273,6 +317,9 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
         encoder
             .unsigned(11)?
             .unsigned(u64::from(credential.reset_id))?;
+        if let Some(store) = credential.store {
+            encoder.unsigned(12)?.unsigned(u64::from(store.get()))?;
+        }
         Ok(())
     };
     write(&mut encoder).map_err(|_| SealError::TooLong)?;
@@ -285,7 +332,8 @@ fn encode(credential: &Credential, output: &mut [u8]) -> Result<usize, SealError
 /// # Errors
 ///
 /// [`SealError::TooLong`] for a user ID over 64 bytes, [`SealError::KeySource`] for a
-/// key source that does not fit the credential's discoverability.
+/// key source that does not fit the credential's discoverability, [`SealError::StoreId`] for a
+/// store ID present on a non-discoverable credential or missing on a discoverable one.
 pub fn seal<C: Crypto>(
     crypto: &mut C,
     keys: &KeyRing,
@@ -294,6 +342,9 @@ pub fn seal<C: Crypto>(
 ) -> Result<Vec<u8>, SealError> {
     if !key_fits(&credential.key, credential.user.is_some()) {
         return Err(SealError::KeySource);
+    }
+    if credential.store.is_some() != credential.user.is_some() {
+        return Err(SealError::StoreId);
     }
     let mut credential = credential.clone();
     if let Some(user) = &mut credential.user {
@@ -342,7 +393,29 @@ pub fn open<C: Crypto>(
     id: &[u8],
     reset_id: u32,
 ) -> Result<Credential, OpenError> {
-    let credential = open_any_reset(crypto, keys, rp_id, id)?;
+    open_for_hash(
+        crypto,
+        keys,
+        &crypto.sha256(&[rp_id.as_bytes()]),
+        id,
+        reset_id,
+    )
+}
+
+/// [`open`] for the RP whose RP ID hashes to `rp_id_hash`: for an index entry, whose stored RP ID
+/// may be the truncated form while its hash is the full RP ID's.
+///
+/// # Errors
+///
+/// As [`open`].
+pub fn open_for_hash<C: Crypto>(
+    crypto: &C,
+    keys: &KeyRing,
+    rp_id_hash: &[u8; KEY_LEN],
+    id: &[u8],
+    reset_id: u32,
+) -> Result<Credential, OpenError> {
+    let credential = open_any_reset(crypto, keys, rp_id_hash, id)?;
     if reset_id != 0 && credential.reset_id != reset_id {
         return Err(OpenError::Revoked);
     }
@@ -353,7 +426,7 @@ pub fn open<C: Crypto>(
 fn open_any_reset<C: Crypto>(
     crypto: &C,
     keys: &KeyRing,
-    rp_id: &str,
+    rp_id_hash: &[u8; KEY_LEN],
     id: &[u8],
 ) -> Result<Credential, OpenError> {
     if id.len() < 1 + NONCE_LEN + TAG_LEN || id.len() > MAX_CREDENTIAL_ID_LEN {
@@ -375,7 +448,7 @@ fn open_any_reset<C: Crypto>(
     data.copy_from_slice(ciphertext);
     let key = keys.wrap_key(crypto);
     crypto
-        .aes256_gcm_open(&key, nonce, &aad(crypto, rp_id), data, tag)
+        .aes256_gcm_open(&key, nonce, &aad_for_hash(rp_id_hash), data, tag)
         .map_err(|_| OpenError::Authentication)?;
     decode(data).map_err(|_| OpenError::Plaintext)
 }
@@ -496,7 +569,18 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             return Err(NOT_A_CREDENTIAL);
         }
         let reset_id = u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
-        if entries.next_key()?.is_some() {
+        // A discoverable credential carries its store ID, a non-discoverable one never does. No
+        // released format had discoverable IDs without one, so there is no older form to accept.
+        let store = match (user.is_some(), next_int_key(entries)?) {
+            (true, Some(12)) => {
+                let value =
+                    u32::try_from(entries.value().unsigned()?).map_err(|_| NOT_A_CREDENTIAL)?;
+                Some(StoreId::new(value).ok_or(NOT_A_CREDENTIAL)?)
+            }
+            (false, None) => None,
+            _ => return Err(NOT_A_CREDENTIAL),
+        };
+        if store.is_some() && entries.next_key()?.is_some() {
             return Err(NOT_A_CREDENTIAL);
         }
         Ok(Credential {
@@ -505,10 +589,120 @@ fn decode(plaintext: &[u8]) -> Result<Credential, cbor::Error> {
             cred_protect,
             user,
             reset_id,
+            store,
         })
     })?;
     decoder.finish()?;
     Ok(credential)
+}
+
+/// The names updateUserInformation gave a discoverable credential (CTAP 2.2 §6.8.6 step 11): each
+/// absent when the update brought none or an empty one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    /// The user name.
+    pub name: Option<String>,
+    /// The display name.
+    pub display_name: Option<String>,
+}
+
+/// The part of `name` that is kept: cut to [`MAX_NAME_LEN`] bytes on a character boundary, and
+/// none for an empty name, which §6.8.6 step 11 removes.
+fn kept_name(name: &Option<String>) -> Option<&str> {
+    name.as_deref()
+        .map(|name| truncate_on_char_boundary(name, MAX_NAME_LEN))
+        .filter(|name| !name.is_empty())
+}
+
+fn names_aad<C: Crypto>(crypto: &C, credential_id: &[u8]) -> [u8; 1 + KEY_LEN] {
+    let mut aad = [0u8; 1 + KEY_LEN];
+    aad[0] = NAMES_DOMAIN;
+    aad[1..].copy_from_slice(&crypto.sha256(&[credential_id]));
+    aad
+}
+
+/// Seals `names` for the credential `credential_id` under `K_wrap`, bound to that ID, so they open
+/// for no other credential. Names longer than [`MAX_NAME_LEN`] are cut on a character boundary.
+pub fn seal_names<C: Crypto>(
+    crypto: &mut C,
+    keys: &KeyRing,
+    credential_id: &[u8],
+    names: &Names,
+) -> Vec<u8> {
+    let (name, display_name) = (kept_name(&names.name), kept_name(&names.display_name));
+    let mut plaintext = [0u8; MAX_NAMES_PLAINTEXT_LEN];
+    let mut encoder = Encoder::new(&mut plaintext);
+    let written: Result<(), cbor::Full> = (|| {
+        encoder.map(usize::from(name.is_some()) + usize::from(display_name.is_some()))?;
+        if let Some(name) = name {
+            encoder.unsigned(1)?.text(name)?;
+        }
+        if let Some(display_name) = display_name {
+            encoder.unsigned(2)?.text(display_name)?;
+        }
+        Ok(())
+    })();
+    written.expect("two names of at most MAX_NAME_LEN bytes fit MAX_NAMES_PLAINTEXT_LEN");
+    let length = encoder.len();
+    let mut nonce = [0u8; NONCE_LEN];
+    crypto.random(&mut nonce);
+    let key = keys.wrap_key(crypto);
+    let aad = names_aad(crypto, credential_id);
+    let data = &mut plaintext[..length];
+    let tag = crypto.aes256_gcm_seal(&key, &nonce, &aad, data);
+    let mut sealed = Vec::with_capacity(NONCE_LEN + length + TAG_LEN);
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(data);
+    sealed.extend_from_slice(&tag);
+    sealed
+}
+
+/// Opens names sealed for `credential_id`.
+///
+/// # Errors
+///
+/// [`OpenError::Length`] for a length no sealing writes, [`OpenError::Authentication`] for names
+/// sealed for another credential or altered, [`OpenError::Plaintext`] for a plaintext of another
+/// shape.
+pub fn open_names<C: Crypto>(
+    crypto: &C,
+    keys: &KeyRing,
+    credential_id: &[u8],
+    sealed: &[u8],
+) -> Result<Names, OpenError> {
+    if sealed.len() < NONCE_LEN + TAG_LEN || sealed.len() > MAX_SEALED_NAMES_LEN {
+        return Err(OpenError::Length);
+    }
+    let (nonce, rest) = sealed
+        .split_first_chunk::<NONCE_LEN>()
+        .ok_or(OpenError::Length)?;
+    let (ciphertext, tag) = rest
+        .split_last_chunk::<TAG_LEN>()
+        .ok_or(OpenError::Length)?;
+    let mut plaintext = [0u8; MAX_NAMES_PLAINTEXT_LEN];
+    let data = &mut plaintext[..ciphertext.len()];
+    data.copy_from_slice(ciphertext);
+    let key = keys.wrap_key(crypto);
+    crypto
+        .aes256_gcm_open(&key, nonce, &names_aad(crypto, credential_id), data, tag)
+        .map_err(|_| OpenError::Authentication)?;
+    decode_names(data).map_err(|_| OpenError::Plaintext)
+}
+
+/// Reads the names map: key 1 the name, key 2 the display name, each optional, nothing else.
+fn decode_names(plaintext: &[u8]) -> Result<Names, cbor::Error> {
+    let mut decoder = Decoder::new(plaintext);
+    let names = decoder.map(|entries| {
+        let mut next = next_int_key(entries)?;
+        let name = optional_name(entries, 1, &mut next)?;
+        let display_name = optional_name(entries, 2, &mut next)?;
+        if next.is_some() {
+            return Err(NOT_A_CREDENTIAL);
+        }
+        Ok(Names { name, display_name })
+    })?;
+    decoder.finish()?;
+    Ok(names)
 }
 
 #[cfg(test)]

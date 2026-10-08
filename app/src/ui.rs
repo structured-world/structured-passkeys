@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
 use ledger_device_sdk::io::ApduTransport;
 use ledger_device_sdk::io::{CommandOrEvent, DecodedEventType};
-use ledger_device_sdk::nbgl::{NbglGlyph, NbglHomeAndSettings};
+use ledger_device_sdk::nbgl::NbglGlyph;
 #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
 use ledger_device_sdk::sys::{BAGL_FONT_OPEN_SANS_EXTRABOLD_11px_1bpp, nbgl_getTextNbLinesInWidth};
 use ledger_device_sdk::sys::{
@@ -43,9 +43,11 @@ use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::ctap2::Link;
 use structured_passkeys_ctap::pin::Permissions;
 use structured_passkeys_ctap::ui::{
-    Account, Accounts, Answer, Choice, MAX_SHOWN_LEN, MAX_SHOWN_RP_ID_LEN, Prompt, Registration, Ui,
+    Account, Accounts, Answer, Choice, MAX_SHOWN_LEN, MAX_SHOWN_RP_ID_LEN, Passkeys, Prompt,
+    Registration, Ui,
 };
 
+use crate::home::{Home, SettingsPage};
 use crate::{Comm, hid};
 
 /// The FIDO interfaces besides HID, owned by the main loop and lent to the screen of a waiting
@@ -88,6 +90,7 @@ pub fn home_due() -> bool {
 }
 
 unsafe extern "C" fn status_ended() {
+    crate::home::status_over();
     HOME_DUE.store(true, Ordering::Relaxed);
 }
 
@@ -199,6 +202,8 @@ enum Ending {
         success: bool,
         message: &'static CStr,
     },
+    /// Answered, and the next screen of the same flow replaces this one at once.
+    Continued,
 }
 
 /// Room for a composed screen text: the longest sentence around an RP ID shown at its longest,
@@ -213,43 +218,50 @@ const LABEL_CLOSE: &str = ")";
 /// The longest account label: both names at their longest, with the brackets.
 const ACCOUNT_LABEL_LEN: usize = 2 * MAX_SHOWN_LEN + LABEL_OPEN.len() + LABEL_CLOSE.len();
 
-/// What a token may do, as the consent screen says it ([`purposes`]).
-const PURPOSES: [&str; 6] = [
-    "sign in with a passkey",
-    "create a passkey",
-    "sign in and create passkeys",
-    "list and delete your passkeys",
-    "change the security key's settings",
-    "sign in, manage passkeys and change settings",
-];
+/// What a token may do, as the consent screen says it ([`purposes`]): a single permission or
+/// the pair a platform asks for to register and sign in has its own sentence, any other set lists
+/// each permission it holds.
+const SIGN_IN_ONLY: &str = "sign in with a passkey";
+const CREATE_ONLY: &str = "create a passkey";
+const SIGN_IN_AND_CREATE: &str = "sign in and create passkeys";
+/// One part per permission, in the order a list names them.
+const SIGN_IN: &str = "sign in";
+const CREATE: &str = "create passkeys";
+const MANAGE: &str = "list and delete your passkeys";
+const CONFIGURE: &str = "change the security key's settings";
+const LIST_COMMA: &str = ", ";
+const LIST_AND: &str = " and ";
+/// Room for the longest purpose: every permission listed.
+const PURPOSES_LEN: usize = SIGN_IN.len()
+    + CREATE.len()
+    + MANAGE.len()
+    + CONFIGURE.len()
+    + 2 * LIST_COMMA.len()
+    + LIST_AND.len();
 /// The words around the shown RP ID and names, shared by the screens and the check below.
 const TOKEN_ASKS: &str = "Your browser or system asks to ";
 const TOKEN_ON: &str = " on ";
 const EXCLUDED_HAS: &str = "This security key already has a passkey for ";
 const REGISTER_FOR: &str = "For ";
 const SIGN_IN_AS: &str = "As ";
+const DELETE_FOR: &str = "Delete the passkey for ";
+const DELETE_OF: &str = "Of ";
+const PASSKEY_FOR: &str = "Passkey for ";
+const PASSKEY: &str = "\nPasskey ";
 const ACCOUNT: &str = "\nAccount ";
 const ACCOUNT_OF: &str = " of ";
 /// Digits of an account position or count ([`number`]).
 const NUMBER_LEN: usize = 5;
 
 const _: () = {
-    let mut longest_purpose = 0;
-    let mut index = 0;
-    while index < PURPOSES.len() {
-        if PURPOSES[index].len() > longest_purpose {
-            longest_purpose = PURPOSES[index].len();
-        }
-        index += 1;
-    }
-    // The token consent: what it allows, on which RP.
-    assert!(
-        TOKEN_ASKS.len() + longest_purpose + TOKEN_ON.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN
-    );
+    // The token consent: what it allows, on which RP; the single sentences are shorter than a
+    // list of every permission.
+    assert!(SIGN_IN_AND_CREATE.len() < PURPOSES_LEN);
+    assert!(TOKEN_ASKS.len() + PURPOSES_LEN + TOKEN_ON.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     // An excluded registration.
     assert!(EXCLUDED_HAS.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
-    // The titles: "Create a passkey for <RP>?" is the longest.
-    assert!("Create a passkey for ".len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
+    // The titles: "Delete the passkey for <RP>?" is the longest.
+    assert!(DELETE_FOR.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     let origins = [Origin::DeviceOnly, Origin::SeedRecoverable];
     let mut index = 0;
     while index < origins.len() {
@@ -274,6 +286,28 @@ const _: () = {
                 + NUMBER_LEN
                 + ACCOUNT_OF.len()
                 + NUMBER_LEN
+                < TEXT_LEN
+        );
+        // A passkey of the settings list.
+        assert!(PASSKEY_FOR.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
+        assert!(
+            ACCOUNT_LABEL_LEN
+                + 2
+                + name
+                + PASSKEY.len()
+                + NUMBER_LEN
+                + ACCOUNT_OF.len()
+                + NUMBER_LEN
+                < TEXT_LEN
+        );
+        // A deletion.
+        assert!(
+            DELETE_OF.len()
+                + ACCOUNT_LABEL_LEN
+                + 2
+                + name
+                + 2
+                + deletion_meaning(origins[index]).len()
                 < TEXT_LEN
         );
         index += 1;
@@ -326,21 +360,48 @@ impl Text {
     }
 }
 
-/// What a token with `permissions` lets the platform do, for the consent screen: exactly the
-/// requested permissions, since the consent is to them (CTAP 2.2 §6.5.5.7.2 step 7).
-fn purposes(permissions: Permissions) -> &'static str {
-    let bits = permissions.bits();
-    let create = bits & Permissions::MAKE_CREDENTIAL.bits() != 0;
-    let sign_in = bits & Permissions::GET_ASSERTION.bits() != 0;
-    let others = bits & !(Permissions::MAKE_CREDENTIAL.bits() | Permissions::GET_ASSERTION.bits());
-    match (create, sign_in, others) {
-        (false, true, 0) => PURPOSES[0],
-        (true, false, 0) => PURPOSES[1],
-        (true, true, 0) => PURPOSES[2],
-        (false, false, bits) if bits == Permissions::CREDENTIAL_MANAGEMENT.bits() => PURPOSES[3],
-        (false, false, bits) if bits == Permissions::AUTHENTICATOR_CONFIG.bits() => PURPOSES[4],
-        _ => PURPOSES[5],
+/// What a token with `permissions` lets the platform do, for the consent screen, as parts to
+/// compose: exactly the requested permissions, since the consent is to them (CTAP 2.2 §6.5.5.7.2
+/// step 7). The permissions a token may carry here are mc, ga, cm and acfg; the others are
+/// refused before consent.
+fn purposes(permissions: Permissions) -> [&'static str; 7] {
+    let mut parts = [""; 7];
+    if permissions == Permissions::GET_ASSERTION {
+        parts[0] = SIGN_IN_ONLY;
+    } else if permissions == Permissions::MAKE_CREDENTIAL {
+        parts[0] = CREATE_ONLY;
+    } else if permissions == Permissions::DEFAULT {
+        parts[0] = SIGN_IN_AND_CREATE;
+    } else {
+        let named = [
+            (Permissions::GET_ASSERTION, SIGN_IN),
+            (Permissions::MAKE_CREDENTIAL, CREATE),
+            (Permissions::CREDENTIAL_MANAGEMENT, MANAGE),
+            (Permissions::AUTHENTICATOR_CONFIG, CONFIGURE),
+        ];
+        let total = named
+            .iter()
+            .filter(|(permission, _)| permissions.contains(*permission))
+            .count();
+        let mut at = 0;
+        for (index, (_, text)) in named
+            .iter()
+            .filter(|(permission, _)| permissions.contains(*permission))
+            .enumerate()
+        {
+            if index > 0 {
+                parts[at] = if index + 1 == total {
+                    LIST_AND
+                } else {
+                    LIST_COMMA
+                };
+                at += 1;
+            }
+            parts[at] = text;
+            at += 1;
+        }
     }
+    parts
 }
 
 /// The account as a screen names it, in parts to compose: the display name and, when it differs,
@@ -373,6 +434,16 @@ const fn origin_meaning(origin: Origin) -> &'static str {
         Origin::DeviceOnly => {
             "An app update or uninstall deletes it, so keep a second sign-in method."
         }
+    }
+}
+
+/// What deleting a key of `origin` means for the user: whether anything brings it back.
+const fn deletion_meaning(origin: Origin) -> &'static str {
+    match origin {
+        Origin::SeedRecoverable => {
+            "Your recovery phrase brings it back on another Ledger or after a reinstall."
+        }
+        Origin::DeviceOnly => "Its key is erased and nothing can restore it.",
     }
 }
 
@@ -678,10 +749,11 @@ fn footer_text(reject: &CStr) -> Vec<u8> {
 /// the ceremony ends.
 pub struct DeviceUi<'a> {
     comm: &'a mut Comm,
-    home: &'a mut NbglHomeAndSettings,
+    home: &'a mut Home,
     glyph: &'a NbglGlyph<'a>,
-    /// The transport of the request the screens are for.
-    link: Link,
+    /// The transport of the request the screens are for; `None` for the settings, which no
+    /// request waits behind.
+    link: Option<Link>,
     #[cfg_attr(
         any(target_os = "nanosplus", target_os = "nanox"),
         expect(dead_code, reason = "the Nano models have no interface besides HID")
@@ -693,7 +765,7 @@ impl<'a> DeviceUi<'a> {
     /// The screens of a request that came on `link`, drawn with `glyph` and returning to `home`.
     pub fn new(
         comm: &'a mut Comm,
-        home: &'a mut NbglHomeAndSettings,
+        home: &'a mut Home,
         glyph: &'a NbglGlyph<'a>,
         link: Link,
         interfaces: &'a mut Interfaces,
@@ -702,7 +774,24 @@ impl<'a> DeviceUi<'a> {
             comm,
             home,
             glyph,
-            link,
+            link: Some(link),
+            interfaces,
+        }
+    }
+
+    /// The screens the settings open, drawn with `glyph` and returning to the settings of
+    /// `home`. A request that arrives meanwhile is refused as busy.
+    pub fn settings(
+        comm: &'a mut Comm,
+        home: &'a mut Home,
+        glyph: &'a NbglGlyph<'a>,
+        interfaces: &'a mut Interfaces,
+    ) -> Self {
+        Self {
+            comm,
+            home,
+            glyph,
+            link: None,
             interfaces,
         }
     }
@@ -710,23 +799,26 @@ impl<'a> DeviceUi<'a> {
     /// Tells the request's transport that it waits for the user (`true`) or processes again.
     fn waiting_for_user(&mut self, waiting: bool) {
         match self.link {
-            Link::Usb => hid::waiting_for_user(waiting),
+            Some(Link::Usb) => hid::waiting_for_user(waiting),
             #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-            Link::Nfc => self.interfaces.nfc.waiting_for_user(self.comm, waiting),
+            Some(Link::Nfc) => self.interfaces.nfc.waiting_for_user(self.comm, waiting),
             // Requests come over NFC only on the devices that have it.
             #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
-            Link::Nfc => {}
+            Some(Link::Nfc) => {}
+            None => {}
         }
     }
 
-    /// Whether the request is gone: cancelled by the platform or aborted with its transport.
+    /// Whether the request is gone: cancelled by the platform or aborted with its transport. The
+    /// settings have no request, which never ends them.
     fn request_ended(&self) -> bool {
         match self.link {
-            Link::Usb => hid::request_ended(),
+            Some(Link::Usb) => hid::request_ended(),
             #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-            Link::Nfc => self.interfaces.nfc.request_ended(),
+            Some(Link::Nfc) => self.interfaces.nfc.request_ended(),
             #[cfg(any(target_os = "nanosplus", target_os = "nanox"))]
-            Link::Nfc => true,
+            Some(Link::Nfc) => true,
+            None => false,
         }
     }
 
@@ -743,6 +835,9 @@ impl<'a> DeviceUi<'a> {
     /// nothing. The status change follows the drawing, as in [`Self::choose`].
     fn end(&mut self, ending: Ending) {
         match ending {
+            Ending::Unanswered | Ending::Answered if self.link.is_none() => {
+                self.home.show_settings(SettingsPage::Passkeys);
+            }
             Ending::Unanswered | Ending::Answered => self.home.show_and_return(),
             Ending::Reported { success, message } => {
                 // A status page replaced before its time never calls back; a flag left by one
@@ -751,7 +846,10 @@ impl<'a> DeviceUi<'a> {
                 // SAFETY: the message is a static NUL-terminated string; the page starts its own
                 // timer and returns at once.
                 unsafe { nbgl_useCaseStatus(message.as_ptr(), success, Some(status_ended)) };
+                crate::home::status_drawn();
             }
+            // The flow's next screen draws itself.
+            Ending::Continued => {}
         }
         if !matches!(ending, Ending::Unanswered) {
             self.waiting_for_user(false);
@@ -910,9 +1008,9 @@ impl<'a> DeviceUi<'a> {
             CommandOrEvent::Event(_) => {}
         }
         // A HID request that arrived during this event, while the screen is for a request over
-        // NFC, is refused as busy; the HID transport refuses the other direction itself.
-        #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
-        if matches!(self.link, Link::Nfc) {
+        // NFC or for the settings, is refused as busy; the HID transport refuses the other
+        // direction itself.
+        if self.link != Some(Link::Usb) {
             hid::refuse_request();
         }
     }
@@ -1011,9 +1109,16 @@ impl Ui for DeviceUi<'_> {
             // the screen says what the token will allow and where (CTAP 2.2 §6.5.5.7.2 step 7,
             // §6.5.5.7.3 step 9).
             Prompt::Token { permissions, rp_id } => {
+                let purpose = purposes(permissions);
                 sub_message = Text::new(&[
                     TOKEN_ASKS,
-                    purposes(permissions),
+                    purpose[0],
+                    purpose[1],
+                    purpose[2],
+                    purpose[3],
+                    purpose[4],
+                    purpose[5],
+                    purpose[6],
                     match rp_id {
                         Some(_) => TOKEN_ON,
                         None => " on any website",
@@ -1066,6 +1171,33 @@ impl Ui for DeviceUi<'_> {
                     reject: c"Close",
                 }
             }
+            // A deletion names the RP, the account and what becomes of its key.
+            Prompt::Delete { rp_id, account } => {
+                message = Text::new(&[DELETE_FOR, rp_id, "?"]);
+                let label = account_label(&account);
+                let (origin, meaning) = account
+                    .origin
+                    .map_or(("", ""), |origin| (origin_name(origin), deletion_meaning(origin)));
+                sub_message = Text::new(&[
+                    DELETE_OF,
+                    label[0],
+                    label[1],
+                    label[2],
+                    label[3],
+                    ".\n",
+                    origin,
+                    if meaning.is_empty() { "" } else { ": " },
+                    meaning,
+                ]);
+                Choices {
+                    icon: Icon::Warning,
+                    title: c"Delete this passkey?",
+                    message: message.as_c_str(),
+                    sub_message: sub_message.as_c_str(),
+                    confirm: c"Delete",
+                    reject: c"Keep",
+                }
+            }
         };
         let mut deadline = self.begin(timeout_ms);
         let answer = self.choose(&choices, &mut deadline);
@@ -1080,6 +1212,9 @@ impl Ui for DeviceUi<'_> {
                 success: false,
                 message: c"Reset cancelled",
             },
+            // The passkey list comes back at once and shows the answer: a status page here would
+            // only flash before it.
+            (_, Prompt::Delete { .. }) => Ending::Continued,
             // A selection or a token is followed by the request it prepares, and an excluded
             // registration has said all there is.
             _ => Ending::Answered,
@@ -1223,6 +1358,87 @@ impl Ui for DeviceUi<'_> {
             Choice::Rejected => signed_in(false),
             Choice::Cancelled | Choice::TimedOut => Ending::Unanswered,
         });
+        outcome
+    }
+
+    /// The passkeys, most recently created first, one screen each from the one at `start`:
+    /// "Delete" picks it for the deletion screen, "Next" shows the next, and the last one's "Done"
+    /// leaves the list. An empty list says so.
+    fn browse<P: Passkeys>(
+        &mut self,
+        passkeys: &mut P,
+        start: usize,
+        timeout_ms: u32,
+    ) -> Choice<usize> {
+        let mut deadline = self.begin(timeout_ms);
+        let total = passkeys.count();
+        if total == 0 {
+            let empty = Choices {
+                icon: Icon::Notice,
+                title: c"No passkeys",
+                message: c"No passkeys",
+                sub_message:
+                    c"This security key keeps no passkey that signs in without a username yet.",
+                confirm: c"OK",
+                reject: c"Close",
+            };
+            let answer = self.choose(&empty, &mut deadline);
+            self.end(Ending::Unanswered);
+            return unanswered(answer);
+        }
+        let mut total_buffer = [0u8; NUMBER_LEN];
+        let total_text = number(total, &mut total_buffer);
+        let mut outcome = Choice::Rejected;
+        for index in start.min(total - 1)..total {
+            let mut position_buffer = [0u8; NUMBER_LEN];
+            // `index` is below `total`, a count of index entries, so the next one fits.
+            let position = number(index + 1, &mut position_buffer);
+            let last = index + 1 == total;
+            // The passkey's texts live only while its screen is composed.
+            let Some((message, sub_message)) = passkeys.read(index, |passkey| {
+                let label = account_label(&passkey.account);
+                (
+                    Text::new(&[PASSKEY_FOR, passkey.rp_id]),
+                    Text::new(&[
+                        label[0],
+                        label[1],
+                        label[2],
+                        label[3],
+                        ".\n",
+                        passkey.account.origin.map_or("", origin_name),
+                        PASSKEY,
+                        position,
+                        ACCOUNT_OF,
+                        total_text,
+                    ]),
+                )
+            }) else {
+                break;
+            };
+            let choices = Choices {
+                icon: Icon::Accounts,
+                title: c"Passkey",
+                message: message.as_c_str(),
+                sub_message: sub_message.as_c_str(),
+                confirm: c"Delete",
+                reject: if last { c"Done" } else { c"Next" },
+            };
+            match self.choose(&choices, &mut deadline) {
+                Answer::Confirmed => {
+                    outcome = Choice::Chose(index);
+                    break;
+                }
+                Answer::Rejected if !last => {}
+                answer => {
+                    outcome = unanswered(answer);
+                    break;
+                }
+            }
+        }
+        // A chosen passkey goes on to its deletion screen, which ends on its own page.
+        if !matches!(outcome, Choice::Chose(_)) {
+            self.end(Ending::Unanswered);
+        }
         outcome
     }
 
