@@ -120,7 +120,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 .and_then(|()| self.remove_entry(&keys, indexed.0, &indexed.1));
             match deleted {
                 // The list goes on at the passkey after the deleted one, or after a kept one at
-                // that one again.
+                // that one again; it comes back at once, so the deletion screen ends without a
+                // status page of its own and the list shows the answer.
                 Ok(()) | Err(StatusCode::OperationDenied) => start = index,
                 _ => return,
             }
