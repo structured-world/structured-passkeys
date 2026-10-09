@@ -10,6 +10,9 @@ use super::credential::{
     AT, Options, PUBLIC_KEY, authenticator_data, descriptors, flags, options, presence, shown,
     shown_rp_id,
 };
+use super::extensions::{
+    HmacSecretOutput, MakeCredentialExtensions, Outputs, Salts, make_credential_extensions,
+};
 use super::{Authenticator, Link, StatusCode};
 use crate::attestation::{ES256, encode_packed_statement, sign_self_attestation};
 use crate::cbor::{Decoder, Encoder, Key};
@@ -18,7 +21,7 @@ use crate::credential_id::{
     SealError, User,
 };
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN, is_p256_private_key};
-use crate::keys::{DeviceKeys, KeyRing};
+use crate::keys::{CredRandom, DeviceKeys, KeyRing};
 use crate::pin::Permissions;
 use crate::storage::{DeviceKey, Reservation, Storage};
 use crate::ui::{Account, Choice, Prompt, Registration, USER_ACTION_TIMEOUT_MS, Ui};
@@ -44,6 +47,7 @@ pub struct MakeCredentialRequest {
     /// The algorithm pubKeyCredParams chose, `None` when it lists none this authenticator has.
     algorithm: Option<i64>,
     exclude_list: Vec<Vec<u8>>,
+    extensions: MakeCredentialExtensions,
     options: Options,
     pin_uv_auth_param: Option<Bytes<KEY_LEN>>,
     pin_uv_auth_protocol: Option<u64>,
@@ -151,7 +155,8 @@ fn attestation_none(decoder: &mut Decoder<'_>) -> Result<bool, crate::cbor::Erro
 }
 
 /// Parses the CBOR parameters of authenticatorMakeCredential (§6.1). Unknown members are ignored
-/// (§8); clientDataHash, rp, user and pubKeyCredParams are required.
+/// (§8); clientDataHash, rp, user and pubKeyCredParams are required, and hmac-secret-mc requires
+/// `"hmac-secret": true` (CTAP 2.2 §12.8).
 pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCode> {
     let mut decoder = Decoder::new(parameters);
     let mut missing = false;
@@ -161,6 +166,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
         let mut user = None;
         let mut algorithm_chosen = None;
         let mut exclude_list = Vec::new();
+        let mut extensions = MakeCredentialExtensions::default();
         let mut request_options = Options::default();
         let mut pin_uv_auth_param = None;
         let mut pin_uv_auth_protocol = None;
@@ -178,9 +184,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
                 // excludes nothing, as an omitted one, so it is accepted rather than failing a
                 // registration that loses nothing by going ahead.
                 Key::Int(0x05) => exclude_list = descriptors(value, &mut missing)?,
-                // An extension this authenticator does not support is ignored (§6.1.2 step
-                // 19.1); the member must still be a map.
-                Key::Int(0x06) => value.map(|_| Ok(()))?,
+                Key::Int(0x06) => extensions = make_credential_extensions(value, &mut missing)?,
                 Key::Int(0x07) => request_options = options(value)?,
                 Key::Int(0x08) => pin_uv_auth_param = Some(Bytes::new(value.bytes()?)),
                 Key::Int(0x09) => pin_uv_auth_protocol = Some(value.unsigned()?),
@@ -198,6 +202,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
             user,
             algorithm_chosen,
             exclude_list,
+            extensions,
             request_options,
             pin_uv_auth_param,
             pin_uv_auth_protocol,
@@ -211,6 +216,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
         user,
         algorithm_chosen,
         exclude_list,
+        extensions,
         request_options,
         pin_uv_auth_param,
         pin_uv_auth_protocol,
@@ -223,7 +229,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
     else {
         return Err(StatusCode::MissingParameter);
     };
-    if missing {
+    if missing || (extensions.hmac_secret_mc.is_some() && !extensions.hmac_secret) {
         return Err(StatusCode::MissingParameter);
     }
     // WebAuthn L3 §5.8.1: the hash of the client data is SHA-256, 32 bytes.
@@ -236,6 +242,7 @@ pub(super) fn parse(parameters: &[u8]) -> Result<MakeCredentialRequest, StatusCo
         user,
         algorithm,
         exclude_list,
+        extensions,
         options: request_options,
         pin_uv_auth_param,
         pin_uv_auth_protocol,
@@ -255,11 +262,14 @@ fn names(user: &UserEntity) -> (Option<String>, Option<String>) {
     )
 }
 
-/// A new credential: its ID, public key and private key.
+/// A new credential: its ID, public key and private key, and its CredRandomWithUV when the
+/// request carries hmac-secret-mc. A slot's value is read here, as the slot opens only once its
+/// entry is committed.
 struct Created {
     id: Vec<u8>,
     public_key: [u8; PUBLIC_KEY_LEN],
     private_key: Zeroizing<[u8; KEY_LEN]>,
+    cred_random_uv: Option<Zeroizing<[u8; KEY_LEN]>>,
 }
 
 impl<C: Crypto, S: Storage> Authenticator<C, S> {
@@ -341,8 +351,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let keys = KeyRing::new(&mut self.crypto);
         let shown_rp = shown_rp_id(&self.crypto, &request.rp_id);
         // Step 16: a credential of the excludeList is reported only after user presence, so the
-        // answer cannot probe for registrations unnoticed. Credentials are created with
-        // credProtect level 1, so none is skipped for want of user verification.
+        // answer cannot probe for registrations unnoticed. Every registration verifies the user,
+        // so credProtect level 3 skips none here.
         for id in &request.exclude_list {
             let Some(credential) = self.locate(&keys, &request.rp_id, id) else {
                 continue;
@@ -401,11 +411,31 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             }
         };
         self.consume_token_flags();
+        // hmac-secret-mc is processed as getAssertion's hmac-secret (§12.8), whose salts are read
+        // after consent and user verification (§12.7). They are read before the key is created,
+        // so a request they fail leaves no key behind.
+        let salts = request
+            .extensions
+            .hmac_secret_mc
+            .as_ref()
+            .map(|input| self.salts(input))
+            .transpose()?;
         // Steps 21 to 23: the key pair, stored as the origin and discoverability require. A
         // discoverable credential enters the index only once its response is written: until
         // then the one it replaces keeps its entry and key, as the RP has received no other.
         let (created, reservation) = self.create(&keys, request, &rp_id_hash, origin, rk, alg)?;
-        let written = self.attest(request, &rp_id_hash, (uv, origin), &created, encoder);
+        let written = self
+            .extension_outputs(request, salts.as_ref(), &created)
+            .and_then(|outputs| {
+                self.attest(
+                    request,
+                    &rp_id_hash,
+                    (uv, origin),
+                    &created,
+                    &outputs,
+                    encoder,
+                )
+            });
         match (written, reservation) {
             (Ok(()), Some(reservation)) => {
                 self.store.commit(reservation, &created.id)?;
@@ -420,6 +450,32 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         Ok(())
     }
 
+    /// The extension outputs of the registration of `created` (§12): the credProtect level it
+    /// was given, `"hmac-secret": true`, since every credential has its CredRandom values, and
+    /// the hmac-secret-mc output under CredRandomWithUV, as every registration verifies the user.
+    /// Each only when the request carried its extension.
+    fn extension_outputs(
+        &mut self,
+        request: &MakeCredentialRequest,
+        salts: Option<&Salts>,
+        created: &Created,
+    ) -> Result<Outputs, StatusCode> {
+        let hmac_secret_mc = match (salts, &created.cred_random_uv) {
+            (Some(salts), Some(cred_random)) => Some(self.hmac_secret_output(salts, cred_random)?),
+            (None, _) => None,
+            // `create` draws or derives the value whenever the request carries hmac-secret-mc.
+            (Some(_), None) => return Err(StatusCode::Other),
+        };
+        Ok(Outputs {
+            cred_protect: request.extensions.cred_protect,
+            hmac_secret: request
+                .extensions
+                .hmac_secret
+                .then_some(HmacSecretOutput::Created),
+            hmac_secret_mc,
+        })
+    }
+
     /// Writes the response for `created` (§6.1.2 step 24): packed self attestation, or none when
     /// the preference puts it first.
     fn attest(
@@ -428,12 +484,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         rp_id_hash: &[u8; KEY_LEN],
         (uv, origin): (bool, Origin),
         created: &Created,
+        extensions: &Outputs,
         encoder: &mut Encoder<'_>,
     ) -> Result<(), StatusCode> {
         let auth_data = authenticator_data(
             rp_id_hash,
             flags(true, uv, origin) | AT,
             Some((&created.id, &created.public_key)),
+            extensions,
         )?;
         if request.attestation_none {
             write_full(
@@ -516,22 +574,29 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         alg: i64,
         reservation: Option<&Reservation>,
     ) -> Result<Created, StatusCode> {
+        // Every registration verifies the user, so hmac-secret-mc takes CredRandomWithUV.
+        let wanted = request.extensions.hmac_secret_mc.is_some();
+        let which = CredRandom::WithUv;
         let mut seed = Zeroizing::new([0u8; SEED_LEN]);
-        let (key, private_key) = match (origin, reservation) {
+        let (key, private_key, cred_random_uv) = match (origin, reservation) {
             (Origin::SeedRecoverable, _) => {
                 self.crypto.random(&mut seed[..]);
                 let private_key = keys
                     .credential_key(&self.crypto, &seed)
                     .map_err(|_| StatusCode::Other)?;
-                (KeySource::Seed(*seed), private_key)
+                let cred_random = wanted.then(|| keys.cred_random(&self.crypto, &seed, which));
+                (KeySource::Seed(*seed), private_key, cred_random)
             }
             (Origin::DeviceOnly, None) => {
-                let device_key = self.store.device_key_or_create(&mut self.crypto);
+                let device_keys =
+                    DeviceKeys::new(self.store.device_key_or_create(&mut self.crypto));
                 self.crypto.random(&mut seed[..]);
-                let private_key = DeviceKeys::new(device_key)
+                let private_key = device_keys
                     .credential_key(&self.crypto, &seed)
                     .map_err(|_| StatusCode::Other)?;
-                (KeySource::Device(*seed), private_key)
+                let cred_random =
+                    wanted.then(|| device_keys.cred_random(&self.crypto, &seed, which));
+                (KeySource::Device(*seed), private_key, cred_random)
             }
             (Origin::DeviceOnly, Some(reservation)) => {
                 let mut private_key = Zeroizing::new([0u8; KEY_LEN]);
@@ -555,7 +620,12 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 let key = self
                     .store
                     .store_key(&mut self.crypto, reservation, &secrets)?;
-                (key, secrets.private_key)
+                let DeviceKey {
+                    private_key,
+                    cred_random_uv,
+                    ..
+                } = secrets;
+                (key, private_key, wanted.then_some(cred_random_uv))
             }
         };
         let public_key = self
@@ -571,10 +641,14 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let store = user
             .is_some()
             .then(|| self.store.store_id_or_create(&mut self.crypto));
+        // §12.1: level 1, userVerificationOptional, unless the request asks for another.
         let credential = Credential {
             key,
             alg,
-            cred_protect: CredProtect::Optional,
+            cred_protect: request
+                .extensions
+                .cred_protect
+                .unwrap_or(CredProtect::Optional),
             user,
             reset_id: self.store.config().reset_id,
             store,
@@ -591,6 +665,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             id,
             public_key,
             private_key,
+            cred_random_uv,
         })
     }
 }

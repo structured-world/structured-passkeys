@@ -57,6 +57,11 @@ application runs inside a Ledger wallet, where the operating system owns all thr
     step 10 says.
   - Every transport takes the same 1024-byte messages, the CTAP minimum, so getInfo reports one
     `maxMsgSize` whichever transport carries it; the HID buffer is no larger than the NFC one.
+  - The hmac-secret CredRandom values (CTAP 2.2 §12.7, random in a dedicated key) of a credential
+    the recovery phrase restores derive from the phrase like its key, so the restored credential
+    gives the same PRF outputs and the relying party's data encrypted with them stays readable.
+    A device-only credential keeps random values in its key slot (discoverable) or derives them
+    from the device key, which never leaves the device (non-discoverable).
 - A new mapping is a decision about the product, not a review fix: it comes with its reason in
   the code and is added to this list.
 

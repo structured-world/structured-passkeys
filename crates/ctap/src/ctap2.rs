@@ -46,7 +46,7 @@
 //! let store = Store::open(MemoryStorage::new(4, 4));
 //! let settings = Settings { max_msg_size, transports: Transports::Usb };
 //! let mut authenticator = Authenticator::new(settings, crypto, store);
-//! let mut response = [0u8; 128];
+//! let mut response = [0u8; 256];
 //! let length = authenticator.process(&[0x04], Link::Usb, &mut Present, &mut response);
 //! assert_eq!(response[0], StatusCode::Ok as u8);
 //! assert!(length > 1);
@@ -56,6 +56,7 @@ mod client_pin;
 mod config;
 mod credential;
 mod credential_management;
+mod extensions;
 mod get_assertion;
 mod make_credential;
 mod settings;
@@ -635,7 +636,7 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         let pin_set = config.pin.is_some();
         let always_uv = config.always_uv;
         encoder
-            .map(7)?
+            .map(8)?
             // versions (0x01), required. Requests are processed by the CTAP 2.2 rules whatever
             // versions are listed: "FIDO_2_0" names the CTAP 2.0 command set (§6.4), and where
             // CTAP 2.2 changed a 2.0 rule (`up` in makeCredential, a zero-length pinUvAuthParam)
@@ -644,6 +645,15 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             .unsigned(0x01)?
             .array(1)?
             .text("FIDO_2_0")?
+            // extensions (0x02): each implemented extension, whatever versions lists. §12.8 ties
+            // hmac-secret-mc only to hmac-secret, and platforms offer the PRF at registration by
+            // this list alone.
+            .unsigned(0x02)?
+            .array(extensions::NAMES.len())?;
+        for name in extensions::NAMES {
+            encoder.text(name)?;
+        }
+        encoder
             // aaguid (0x03), required.
             .unsigned(0x03)?
             .bytes(&AAGUID)?

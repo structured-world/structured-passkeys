@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::client_pin::tests::{Value, command, hmac, parse_response, run, uv_token};
 use super::super::make_credential::tests::{
-    BE, BS, CLIENT_DATA_HASH, Made, OK, RP_ID, UP, UV, descriptors, options, register, verifies,
+    BE, BS, CLIENT_DATA_HASH, ED, Made, OK, RP_ID, UP, UV, descriptors, options, register, verifies,
 };
 use super::super::tests::{
     Asked, Scripted, Shown, TestAuthenticator, authenticator, authenticator_with,
@@ -35,31 +35,36 @@ const PIN_AUTH_INVALID: u8 = 0x33;
 
 /// What a getAssertion response holds.
 #[derive(Debug, Default)]
-struct Asserted {
-    id: Vec<u8>,
-    auth_data: Vec<u8>,
+pub(in crate::ctap2) struct Asserted {
+    pub(in crate::ctap2) id: Vec<u8>,
+    pub(in crate::ctap2) auth_data: Vec<u8>,
     signature: Vec<u8>,
     /// `user` as `(id, name, displayName)`.
     user: Option<(Vec<u8>, Option<String>, Option<String>)>,
-    number_of_credentials: Option<u64>,
+    pub(in crate::ctap2) number_of_credentials: Option<u64>,
     user_selected: Option<bool>,
 }
 
 impl Asserted {
-    fn flags(&self) -> u8 {
+    pub(in crate::ctap2) fn flags(&self) -> u8 {
         self.auth_data[32]
+    }
+
+    /// The encoded extension outputs after the counter, present exactly with ED.
+    pub(in crate::ctap2) fn extensions(&self) -> &[u8] {
+        &self.auth_data[37..]
     }
 
     /// Whether the signature verifies under `made`'s key over authenticatorData ||
     /// clientDataHash (WebAuthn L3 §6.3.3 step 11).
-    fn signed_by(&self, made: &Made) -> bool {
+    pub(in crate::ctap2) fn signed_by(&self, made: &Made) -> bool {
         let mut signed = self.auth_data.clone();
         signed.extend_from_slice(&CLIENT_DATA_HASH);
         self.id == made.id && verifies(&made.public_key, &signed, &self.signature)
     }
 }
 
-fn asserted(body: &[u8]) -> Asserted {
+pub(in crate::ctap2) fn asserted(body: &[u8]) -> Asserted {
     let mut decoder = Decoder::new(body);
     let asserted = decoder
         .map(|entries| {
@@ -109,10 +114,14 @@ fn asserted(body: &[u8]) -> Asserted {
         })
         .expect("a response map");
     decoder.finish().expect("one item");
-    assert_eq!(asserted.auth_data.len(), 37, "no attested credential data");
+    assert_eq!(
+        asserted.auth_data.len() == 37,
+        asserted.flags() & ED == 0,
+        "no attested credential data, extension outputs exactly with ED"
+    );
     assert_eq!(asserted.auth_data[..32], Sha256::digest(RP_ID)[..]);
     assert_eq!(
-        asserted.auth_data[33..],
+        asserted.auth_data[33..37],
         [0, 0, 0, 0],
         "signature counter 0"
     );

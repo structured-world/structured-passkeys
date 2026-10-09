@@ -6,12 +6,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
+use super::extensions::Outputs;
 use super::{AAGUID, Authenticator, Link, StatusCode};
 use crate::attestation::encode_cose_key;
 use crate::cbor::{self, Decoder, Encoder, Full, Key};
 use crate::credential_id::{self, Credential, KeySource, Origin, truncate_on_char_boundary};
 use crate::crypto::{Crypto, KEY_LEN, PUBLIC_KEY_LEN};
-use crate::keys::{DeviceKeys, KeyRing};
+use crate::keys::{CredRandom, DeviceKeys, KeyRing};
 use crate::pin::{Permissions, Protocol};
 use crate::storage::{EntryId, MAX_RP_ID_LEN, Storage, stored_rp_id};
 use crate::ui::{Answer, MAX_SHOWN_LEN, Prompt, RP_ID_FINGERPRINT_LEN, USER_ACTION_TIMEOUT_MS, Ui};
@@ -26,6 +27,8 @@ pub(super) const BE: u8 = 0x08;
 pub(super) const BS: u8 = 0x10;
 /// Authenticator data flag AT, attested credential data included.
 pub(super) const AT: u8 = 0x40;
+/// Authenticator data flag ED, extension data included.
+pub(super) const ED: u8 = 0x80;
 
 /// The credential type every descriptor and parameter of this authenticator has (WebAuthn L3
 /// §5.8.2).
@@ -53,15 +56,21 @@ pub(super) const fn flags(up: bool, uv: bool, origin: Origin) -> u8 {
 
 /// The authenticator data (WebAuthn L3 §6.1): RP ID hash, flags, a signature counter of 0
 /// (WebAuthn L3 §6.1.1 allows an authenticator without one), and, for a new credential, the
-/// attested credential data (§6.5.1) with its ID and COSE public key.
+/// attested credential data (§6.5.1) with its ID and COSE public key, then the extension outputs,
+/// if any, with the ED flag.
 pub(super) fn authenticator_data(
     rp_id_hash: &[u8; KEY_LEN],
     flags: u8,
     attested: Option<(&[u8], &[u8; PUBLIC_KEY_LEN])>,
+    extensions: &Outputs,
 ) -> Result<Vec<u8>, StatusCode> {
     let mut data = Vec::with_capacity(KEY_LEN + 5);
     data.extend_from_slice(rp_id_hash);
-    data.push(flags);
+    data.push(if extensions.is_empty() {
+        flags
+    } else {
+        flags | ED
+    });
     data.extend_from_slice(&[0; 4]);
     if let Some((id, public_key)) = attested {
         // At most MAX_CREDENTIAL_ID_LEN, which fits 16 bits.
@@ -75,6 +84,9 @@ pub(super) fn authenticator_data(
         data.extend_from_slice(&length.to_be_bytes());
         data.extend_from_slice(id);
         data.extend_from_slice(&key[..key_len]);
+    }
+    if !extensions.is_empty() {
+        data.extend(extensions.encode()?);
     }
     Ok(data)
 }
@@ -456,6 +468,29 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
                 .credential_key(&self.crypto, cs)
                 .ok(),
             KeySource::Slot { index, tag } => Some(self.store.key(*index, tag)?.private_key),
+        }
+    }
+
+    /// The `which` CredRandom of a located credential's `key` (key model, CredRandom): the value
+    /// its slot holds, or the one derived from its credential seed.
+    pub(super) fn cred_random(
+        &self,
+        keys: &KeyRing,
+        key: &KeySource,
+        which: CredRandom,
+    ) -> Option<Zeroizing<[u8; KEY_LEN]>> {
+        match key {
+            KeySource::Seed(cs) => Some(keys.cred_random(&self.crypto, cs, which)),
+            KeySource::Device(cs) => {
+                Some(DeviceKeys::new(self.store.device_key()?).cred_random(&self.crypto, cs, which))
+            }
+            KeySource::Slot { index, tag } => {
+                let secrets = self.store.key(*index, tag)?;
+                Some(match which {
+                    CredRandom::WithUv => secrets.cred_random_uv,
+                    CredRandom::WithoutUv => secrets.cred_random,
+                })
+            }
         }
     }
 }

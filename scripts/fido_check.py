@@ -62,6 +62,12 @@ deleteCredential of the device-only and of the recovery phrase key, with no scre
 nothing beyond the token), leaves IDs that no longer sign; toggleAlwaysUv turns getInfo's alwaysUv
 on and off again. The consent for the credential management token is compared with its snapshot.
 
+Extensions (§12), in Speculos and on a device, on non-discoverable credentials with built-in UV:
+getInfo lists credProtect, hmac-secret and hmac-secret-mc; a registration with all three answers
+the credProtect level, `"hmac-secret": true` and the hmac-secret-mc output, which a sign-in with UV
+returns again for the same salt, while one without UV returns another; a credential of credProtect
+3 is not found without UV.
+
 The passkey list of the device's settings, in Speculos: a new passkey is listed first; deleting it
 from the list through its deletion screen leaves an ID that no longer signs, and the list, empty
 then, says so. The list and the deletion screen are compared with their snapshots.
@@ -158,6 +164,8 @@ OTHER_ACCOUNT = "Other account"
 EXCLUDED_TITLE = "Already registered"
 EXCLUDED_CONFIRM = "OK"
 DELETE_CONFIRM = "Delete"
+# The extensions getInfo lists (§6.4).
+EXTENSIONS = ["credProtect", "hmac-secret", "hmac-secret-mc"]
 # The longest domain, 253 characters (RFC 1035 §2.3.4), which a screen shows whole.
 LONG_RP_ID = "a." * 121 + "example.com"
 # The start of a registration screen: a Nano heads a long one with the short question.
@@ -875,6 +883,117 @@ def check_credentials(device: CtapHidDevice, user, snapshot) -> dict[str, object
     }
 
 
+def check_extensions(device: CtapHidDevice, user) -> None:
+    """credProtect, hmac-secret and hmac-secret-mc (CTAP 2.2 §12.1, §12.7, §12.8), the PRF of
+    WebAuthn, with built-in UV on non-discoverable credentials, which no list or count of the other
+    checks sees."""
+    ctap = Ctap2(device)
+    check(
+        ctap.info.extensions == EXTENSIONS,
+        f"getInfo: extensions {ctap.info.extensions}",
+    )
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    rp = {"id": RP_ID, "name": "Example"}
+    params = [{"type": "public-key", "alg": -7}]
+    protocol = PinProtocolV2()
+    salt = hashlib.sha256(b"prf salt").digest()
+
+    def hmac_input(session: PinSession) -> dict:
+        salt_enc = protocol.encrypt(session.secret, salt)
+        return {
+            1: session.key_agreement,
+            2: salt_enc,
+            3: protocol.authenticate(session.secret, salt_enc),
+            4: protocol.VERSION,
+        }
+
+    # The PRF at registration: hmac-secret-mc under CredRandomWithUV, with credProtect 2.
+    session = PinSession(ctap, protocol)
+    status, made = pressed(
+        user,
+        [(REGISTER_TITLE, REGISTER_CONFIRM, None)],
+        lambda: ctap.make_credential(
+            client_data_hash,
+            rp,
+            {"id": b"user-prf", "name": "prf user"},
+            params,
+            extensions={
+                "credProtect": 2,
+                "hmac-secret": True,
+                "hmac-secret-mc": hmac_input(session),
+            },
+            options={"uv": True},
+        ),
+    )
+    outputs = made.auth_data.extensions if made else {}
+    at_registration = (
+        protocol.decrypt(session.secret, outputs["hmac-secret-mc"])
+        if "hmac-secret-mc" in outputs
+        else b""
+    )
+    check(
+        status == CtapError.ERR.SUCCESS
+        and outputs.get("credProtect") == 2
+        and outputs.get("hmac-secret") is True
+        and len(at_registration) == 32,
+        f"makeCredential: credProtect, hmac-secret and the hmac-secret-mc output ({status!r})",
+    )
+    allow = [{"type": "public-key", "id": made.auth_data.credential_data.credential_id}]
+
+    def sign_in(uv: bool) -> bytes:
+        session = PinSession(ctap, protocol)
+        status, assertion = pressed(
+            user,
+            [(SIGN_IN_TITLE, SIGN_IN, None)],
+            lambda: ctap.get_assertion(
+                RP_ID,
+                client_data_hash,
+                allow,
+                extensions={"hmac-secret": hmac_input(session)},
+                options={"uv": uv},
+            ),
+        )
+        output = assertion.auth_data.extensions.get("hmac-secret") if assertion else None
+        check(
+            status == CtapError.ERR.SUCCESS and output is not None,
+            f"getAssertion with uv {uv}: an hmac-secret output ({status!r})",
+        )
+        return protocol.decrypt(session.secret, output)
+
+    with_uv = sign_in(True)
+    check(with_uv == at_registration, "hmac-secret: the sign-in with UV gives the registration's PRF")
+    without_uv = sign_in(False)
+    check(
+        len(without_uv) == 32 and without_uv != with_uv,
+        "hmac-secret: without UV the PRF differs",
+    )
+    # credProtect 3: never used without UV, refused before any screen.
+    status, protected = pressed(
+        user,
+        [(REGISTER_TITLE, REGISTER_CONFIRM, None)],
+        lambda: ctap.make_credential(
+            client_data_hash,
+            rp,
+            {"id": b"user-protected", "name": "protected user"},
+            params,
+            extensions={"credProtect": 3},
+            options={"uv": True},
+        ),
+    )
+    check(
+        status == CtapError.ERR.SUCCESS and protected.auth_data.extensions == {"credProtect": 3},
+        f"makeCredential: credProtect 3 ({status!r})",
+    )
+    protected_allow = [
+        {"type": "public-key", "id": protected.auth_data.credential_data.credential_id}
+    ]
+    status = ctap_status(lambda: ctap.get_assertion(RP_ID, client_data_hash, protected_allow))
+    check(
+        status == CtapError.ERR.NO_CREDENTIALS,
+        f"getAssertion: credProtect 3 without UV finds no credential ({status!r})",
+    )
+
+
 def uv_token(ctap: Ctap2, user, permissions: int, snapshot=None) -> bytes:
     """A pinUvAuthToken with `permissions` and no RP ID from built-in user verification, after the
     consent on the device."""
@@ -1134,6 +1253,7 @@ def main() -> None:
     registered = check_credentials(device, user, snapshot)
     check_credential_management(device, user, snapshot, registered)
     check_config(device, user)
+    check_extensions(device, user)
     if args.speculos:
         check_settings_list(device, user, snapshot)
         # The reset left the PIN unset, so it can be set; a device keeps its PIN.

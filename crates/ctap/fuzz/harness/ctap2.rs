@@ -7,8 +7,9 @@
 //! (CTAP 2.2 §6.5.5.7), the NFC tap included, built-in UV only on an unlocked device, a PIN try
 //! spent only by a PIN check that fails, one at a time (§6.5.5.6, §6.5.5.7), and a selection only
 //! with user presence (§6.9). For the credential commands, authenticator data reports user
-//! presence only when the user answered on the device or the tap counted, and a new credential
-//! always comes with both UP and UV (§6.1.2 steps 11 and 18).
+//! presence only when the user answered on the device or the tap counted, a new credential
+//! always comes with both UP and UV (§6.1.2 steps 11 and 18), and a getAssertion asking for
+//! hmac-secret without user presence is refused with CTAP2_ERR_UNSUPPORTED_OPTION (§12.7).
 
 use structured_passkeys_ctap::cbor::{Decoder, Key, validate};
 use structured_passkeys_ctap::credential_id::Origin;
@@ -126,6 +127,65 @@ fn client_pin_sub_command(request: &[u8]) -> Option<u64> {
         .flatten()
 }
 
+/// An authenticatorGetAssertion with the hmac-secret extension and the `up` option false, which
+/// CTAP 2.2 §12.7 refuses with CTAP2_ERR_UNSUPPORTED_OPTION.
+struct HmacSecretWithoutPresence {
+    /// Whether the request also carries what a check before §12.7's answers first: a
+    /// pinUvAuthParam (§6.2.2 steps 1 and 2) or the `rk` option (step 5).
+    checked_earlier: bool,
+}
+
+/// The request as an [`HmacSecretWithoutPresence`], if it is one.
+fn hmac_secret_without_presence(request: &[u8]) -> Option<HmacSecretWithoutPresence> {
+    let Some((&0x02, parameters)) = request.split_first() else {
+        return None;
+    };
+    Decoder::new(parameters)
+        .map(|entries| {
+            let mut hmac_secret = false;
+            let mut up_false = false;
+            let mut checked_earlier = false;
+            while let Some(key) = entries.next_key()? {
+                let value = entries.value();
+                match key {
+                    Key::Int(0x06) => {
+                        checked_earlier = true;
+                        value.skip()?;
+                    }
+                    Key::Int(0x04) => {
+                        hmac_secret = value.map(|extensions| {
+                            let mut found = false;
+                            while let Some(name) = extensions.next_key()? {
+                                found |= name == Key::Text("hmac-secret");
+                                extensions.value().skip()?;
+                            }
+                            Ok(found)
+                        })?;
+                    }
+                    Key::Int(0x05) => {
+                        up_false = value.map(|options| {
+                            let mut found = false;
+                            while let Some(name) = options.next_key()? {
+                                let option = options.value();
+                                if name == Key::Text("up") {
+                                    found = !option.bool()?;
+                                } else {
+                                    checked_earlier |= name == Key::Text("rk");
+                                    option.skip()?;
+                                }
+                            }
+                            Ok(found)
+                        })?;
+                    }
+                    _ => value.skip()?,
+                }
+            }
+            Ok((hmac_secret && up_false).then_some(HmacSecretWithoutPresence { checked_earlier }))
+        })
+        .ok()
+        .flatten()
+}
+
 /// The flags byte of the authenticator data in a makeCredential or getAssertion response body.
 fn auth_data_flags(body: &[u8]) -> Option<u8> {
     Decoder::new(body)
@@ -176,6 +236,8 @@ pub fn run(data: &[u8]) {
             selection: 0,
         });
     }
+    // Whether the request is well formed, so the checks of its command run.
+    let parses = authenticator.parse(request).is_ok();
     let mut response = [0u8; 1024];
     let length = authenticator.process(request, link, &mut Fuzzed(answers), &mut response);
     assert!(length >= 1, "every request is answered");
@@ -206,6 +268,18 @@ pub fn run(data: &[u8]) {
         if request[0] == 0x01 {
             assert_eq!(flags & (UP | UV), UP | UV, "a credential with UP and UV");
             assert_eq!(answers & 0x20, 0, "a credential only on an unlocked device");
+        }
+    }
+    // hmac-secret needs user presence: a getAssertion that asks for it with `up` false is
+    // CTAP2_ERR_UNSUPPORTED_OPTION (§12.7), unless a check that comes before refuses it first:
+    // malformed parameters, a pinUvAuthParam's own steps, or the `rk` option. It never succeeds.
+    if let Some(hmac) = hmac_secret_without_presence(request) {
+        assert!(!succeeded, "hmac-secret never without user presence");
+        if parses && !hmac.checked_earlier {
+            assert_eq!(
+                response[0], 0x2B,
+                "hmac-secret without presence is UNSUPPORTED_OPTION"
+            );
         }
     }
     // authenticatorSelection answers OK only with user presence: a confirmation on the device, or

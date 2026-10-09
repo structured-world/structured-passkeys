@@ -190,7 +190,10 @@ const IV: [u8; 16] = [0x99; 16];
 
 impl Session {
     /// getKeyAgreement, then ECDH with a fixed platform key and the protocol's kdf.
-    fn start(authenticator: &mut TestAuthenticator, protocol: Protocol) -> Self {
+    pub(in crate::ctap2) fn start(
+        authenticator: &mut TestAuthenticator,
+        protocol: Protocol,
+    ) -> Self {
         let mut ui = Scripted::new(Answer::Confirmed);
         let response = run(
             authenticator,
@@ -231,7 +234,7 @@ impl Session {
         }
     }
 
-    fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+    pub(in crate::ctap2) fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
         match self.protocol {
             Protocol::One => cbc(&self.aes_key, &[0; 16], plaintext, true),
             Protocol::Two => {
@@ -257,8 +260,13 @@ impl Session {
         mac[..self.protocol.signature_len()].to_vec()
     }
 
-    fn key_agreement(&self) -> Value {
+    pub(in crate::ctap2) fn key_agreement(&self) -> Value {
         Value::Raw(self.cose_key.clone())
+    }
+
+    /// The platform key as an encoded COSE_Key.
+    pub(in crate::ctap2) fn cose_key(&self) -> &[u8] {
+        &self.cose_key
     }
 }
 

@@ -3,7 +3,7 @@
 
 use zeroize::Zeroizing;
 
-use super::{APPLICATION_PATH, DeviceKeys, KeyRing};
+use super::{APPLICATION_PATH, CredRandom, DeviceKeys, KeyRing};
 use crate::crypto::{Crypto, CryptoError, KEY_LEN, NONCE_LEN, PUBLIC_KEY_LEN, Signature, TAG_LEN};
 use crate::soft::SoftCrypto;
 
@@ -67,6 +67,40 @@ fn device_credential_key_derives_under_the_device_key() {
         hex("4aedc94cefdba1c9fffc78ede132f84e44e50e437210f44369a362a22849210d")[..]
     );
     assert_eq!(format!("{keys:?}"), "DeviceKeys");
+}
+
+/// The two CredRandom values of a seed-recoverable credential with cs 33..33 (derive.py:
+/// cred_random_uv, cred_random_no_uv): K_hmac below K_root, then the UV label. A swapped label
+/// would give a credential the same secret with and without UV.
+#[test]
+fn cred_random_follows_the_hierarchy() {
+    let mut crypto = crypto();
+    let keys = KeyRing::new(&mut crypto);
+    assert_eq!(
+        keys.cred_random(&crypto, &[0x33; KEY_LEN], CredRandom::WithUv)[..],
+        hex("dba903a41652f013d02d99c238471562d4589822f204f86c342d74d24da2e6f1")[..]
+    );
+    assert_eq!(
+        keys.cred_random(&crypto, &[0x33; KEY_LEN], CredRandom::WithoutUv)[..],
+        hex("501a6b8d8c2d958e4f040c95b610d1f4d947013fc6dd333edd81e9f0a361ab28")[..]
+    );
+}
+
+/// The CredRandom values of a non-discoverable device-only credential with cs 33..33 under the
+/// device key 55..55 (derive.py: device_cred_random_uv, device_cred_random_no_uv): K_dev in place
+/// of K_root, so the recovery phrase does not reproduce them.
+#[test]
+fn device_cred_random_derives_under_the_device_key() {
+    let crypto = crypto();
+    let keys = DeviceKeys::new(Zeroizing::new([0x55; KEY_LEN]));
+    assert_eq!(
+        keys.cred_random(&crypto, &[0x33; KEY_LEN], CredRandom::WithUv)[..],
+        hex("d676c9250e75dbf1c01927f68569d8b1e5017b4710a787a93d273d0e2ca0a454")[..]
+    );
+    assert_eq!(
+        keys.cred_random(&crypto, &[0x33; KEY_LEN], CredRandom::WithoutUv)[..],
+        hex("0bccc28130529ac0ea9541f3e22fe69b4b1b3e43dd7c1f222e1c278cf5c5836a")[..]
+    );
 }
 
 /// The software platform with the HKDF block for counter 0 replaced by 2^256 - 1, outside P-256's
