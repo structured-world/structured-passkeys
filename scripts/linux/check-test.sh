@@ -31,7 +31,8 @@
 #   - a process group whose only member is a zombie counts as stopped;
 #   - under a rootless runtime (the caller is root in the container, no other
 #     id exists there) the build and a stop's cleanup, run by a user other than
-#     root, hand the files the container wrote back to that user;
+#     root, hand the files the container wrote back to that user; skipped on a
+#     host that gives an unprivileged user no user namespace;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
 set -euo pipefail
@@ -532,41 +533,51 @@ held_stop=""
 rm -rf "$fenced" "$fenced.removing"
 fenced=""
 
-# A rootless runtime run by a user other than root (nobody here): the container
-# runs as that user mapped to root, where the user's own ids do not exist. The
-# build and a stop's cleanup hand what the container wrote back to that user.
-nobody=65534
-as_nobody() {
-    setpriv --reuid="$nobody" --regid="$nobody" --clear-groups -- env FAKE_DOCKER_EXEC=1 "$@"
-}
-# Everything nobody runs from $tmp must be reachable.
-chmod 711 "$tmp"
-chmod 755 "$tmp/bin" "$FAKE_TOOLCHAIN"
-if ! as_nobody unshare --user --map-root-user true 2>/dev/null; then
-    fail "rootless: this host gives an unprivileged user no user namespace"
+# A rootless runtime run by a user other than root: the container runs as that
+# user mapped to root, where the user's own ids do not exist. The build and a
+# stop's cleanup hand what the container wrote back to that user. Run as root,
+# this test plays that user as nobody; run by another account, as that account.
+if [[ $(id -u) -eq 0 ]]; then
+    runner="65534:65534"
+    as_runner() {
+        setpriv --reuid=65534 --regid=65534 --clear-groups -- env FAKE_DOCKER_EXEC=1 "$@"
+    }
+    # Everything nobody runs from $tmp must be reachable.
+    chmod 711 "$tmp"
+    chmod 755 "$tmp/bin" "$FAKE_TOOLCHAIN"
+else
+    runner="$(id -u):$(id -g)"
+    as_runner() {
+        env FAKE_DOCKER_EXEC=1 "$@"
+    }
+fi
+# A user namespace for an unprivileged user is a host capability a rootful
+# runtime does not need, so a host without it skips this case; the check host
+# has it.
+if ! as_runner unshare --user --map-root-user true 2>/dev/null; then
+    echo "check-test: rootless case skipped, no user namespace for an unprivileged user" >&2
 else
     build="$tmp/rootless-build"
     mkdir -p "$build/app"
     cp -R "$repo/scripts" "$build/"
-    chown -R "$nobody:$nobody" "$build"
-    if as_nobody bash "$build/scripts/device-build.sh" >"$tmp/rootless-build.out" 2>&1; then
+    chown -R "$runner" "$build"
+    if as_runner bash "$build/scripts/device-build.sh" >"$tmp/rootless-build.out" 2>&1; then
         artifact="$build/app/target/apex_p/release/structured-passkeys-app"
         owner=$(stat -c %u:%g "$artifact" 2>/dev/null || true)
-        [[ "$owner" == "$nobody:$nobody" ]] || fail "rootless: $artifact is owned by '${owner}'"
+        [[ "$owner" == "$runner" ]] || fail "rootless: $artifact is owned by '${owner}'"
     else
         fail "rootless: the build failed handing its files back"
         cat "$tmp/rootless-build.out" >&2
     fi
 
-    handback="/tmp/structured-passkeys-check-test-handback-$$"
-    mkdir -m 700 "$handback"
+    handback=$(mktemp -d /tmp/structured-passkeys-check-test-handback.XXXXXXXX)
     mkdir -p "$handback/src/scripts" "$handback/src/app/target"
     cp "$repo/scripts/linux/remote.sh" "$handback/remote.sh"
     cp "$repo/scripts/dev-tools-image.sh" "$handback/src/scripts/"
     echo built >"$handback/src/app/target/file"
     echo this-run >"$handback/owner"
-    chown -R "$nobody:$nobody" "$handback"
-    if as_nobody bash "$handback/remote.sh" stop "$handback" this-run 2>"$tmp/handback.err"; then
+    chown -R "$runner" "$handback"
+    if as_runner bash "$handback/remote.sh" stop "$handback" this-run 2>"$tmp/handback.err"; then
         if grep -q "cannot hand back" "$tmp/handback.err"; then
             fail "handback: the stop could not hand back the files the container wrote"
             cat "$tmp/handback.err" >&2
