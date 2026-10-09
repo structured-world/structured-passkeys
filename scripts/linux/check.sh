@@ -26,7 +26,8 @@
 # (default 1800) without a successful connection. A stopped run (Ctrl-C) stops
 # the remote run and its containers too.
 #
-# STRUCTURED_PASSKEYS_LINUX is an SSH destination that can run docker.
+# STRUCTURED_PASSKEYS_LINUX is an SSH destination that can run docker: Docker
+# itself, or Podman with its docker command (podman-docker).
 set -euo pipefail
 
 destination="${STRUCTURED_PASSKEYS_LINUX:?set STRUCTURED_PASSKEYS_LINUX to the SSH destination of the Linux check host}"
