@@ -112,7 +112,8 @@ case "$mode" in
             # which a container removed by force never reaches, and a user other
             # than root cannot remove them. The image is the one the run used.
             if [[ $(id -u) -ne 0 && -d "$removing/src" ]] &&
-                ! docker run --rm --volume "$removing/src:/app" --entrypoint chown \
+                ! docker run --rm --security-opt label=disable \
+                    --volume "$removing/src:/app" --entrypoint chown \
                     "$(bash "$removing/src/scripts/dev-tools-image.sh")" \
                     -R "$(id -u):$(id -g)" /app >/dev/null; then
                 echo "cannot hand back the files containers wrote in $removing" >&2

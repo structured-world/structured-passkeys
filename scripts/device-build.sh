@@ -22,7 +22,10 @@ fi
 
 docker pull --quiet "$image" >/dev/null
 # The expansion stays nounset-safe for an empty array on Bash before 4.4.
+# Without an SELinux label on the container, the mount is usable on a host with
+# SELinux enforcing (Podman labels containers there) and the host files keep their labels.
 docker run --rm ${name[@]+"${name[@]}"} \
+    --security-opt label=disable \
     --volume "$root:/app" \
     --workdir /app/app \
     --env OWNER="$(id -u):$(id -g)" \
