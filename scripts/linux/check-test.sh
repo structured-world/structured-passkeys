@@ -29,6 +29,9 @@
 #   - a run that reaches its process id file while its stop removes the
 #     directory starts nothing there;
 #   - a process group whose only member is a zombie counts as stopped;
+#   - under a rootless runtime (the caller is root in the container, no other
+#     id exists there) the build and a stop's cleanup, run by a user other than
+#     root, hand the files the container wrote back to that user;
 #   - the checkout the test runs from keeps its artifacts: the checks run in a
 #     copy of the scripts.
 set -euo pipefail
@@ -45,6 +48,7 @@ twice=""
 late=""
 fenced=""
 foreign=""
+handback=""
 launched=""
 # A check still running is stopped before the fake host it uses goes: without
 # its fake ssh it could not clean up its run. A held stop is released and
@@ -69,6 +73,7 @@ finish() {
     [[ -n "$late" ]] && rm -rf "$late"
     [[ -n "$fenced" ]] && rm -rf "$fenced" "$fenced.removing"
     [[ -n "$foreign" ]] && rm -rf "$foreign"
+    [[ -n "$handback" ]] && rm -rf "$handback" "$handback.removing"
     rm -rf "$tmp"
     exit "$code"
 }
@@ -117,7 +122,10 @@ EOF
 
 # docker pull|run|ps|rm: `run` writes every target's artifacts into the mounted
 # checkout after FAKE_DOCKER_SECONDS, ignoring SIGTERM with FAKE_DOCKER_IGNORE_TERM;
-# `ps` knows no containers.
+# `ps` knows no containers. With FAKE_DOCKER_EXEC `run` runs the container's
+# command instead, as a rootless runtime does: in a user namespace where the
+# caller is root and no other id exists, the mount point read as the host
+# directory it mounts, with the image's tools faked by $FAKE_TOOLCHAIN on PATH.
 cat >"$tmp/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
@@ -127,13 +135,42 @@ case "$1" in
         fi
         shift
         app=""
-        while [[ $# -gt 0 ]]; do
-            if [[ "$1" == --volume ]]; then
-                app="${2%%:*}"
-                shift
-            fi
+        mount=""
+        workdir=""
+        entrypoint=()
+        while [[ $# -gt 0 && "$1" == -* ]]; do
+            case "$1" in
+                --volume)
+                    app="${2%%:*}"
+                    mount="${2#*:}"
+                    shift
+                    ;;
+                --workdir)
+                    workdir=$2
+                    shift
+                    ;;
+                --entrypoint)
+                    entrypoint=("$2")
+                    shift
+                    ;;
+                --env)
+                    export "${2?}"
+                    shift
+                    ;;
+                --name | --security-opt) shift ;;
+            esac
             shift
         done
+        # The image.
+        shift
+        if [[ -n "${FAKE_DOCKER_EXEC:-}" ]]; then
+            command=("${entrypoint[@]}" "$@")
+            for i in "${!command[@]}"; do
+                command[i]=$(sed -E "s#(^|[=[:space:]])$mount(/|[[:space:]]|\$)#\1$app\2#g" <<<"${command[i]}")
+            done
+            cd "$app${workdir#"$mount"}" || exit 1
+            PATH="$FAKE_TOOLCHAIN:$PATH" exec unshare --user --map-root-user -- "${command[@]}"
+        fi
         echo "fake container"
         sleep "${FAKE_DOCKER_SECONDS:-0}"
         for target in nanosplus nanox stax flex apex_p; do
@@ -185,6 +222,25 @@ exec "$FAKE_REAL_FIND" "$@"
 EOF
 chmod +x "$tmp/bin/ssh" "$tmp/bin/docker" "$tmp/bin/find"
 export PATH="$tmp/bin:$PATH"
+
+# The image's tools for FAKE_DOCKER_EXEC: `cargo ledger build <target>` writes
+# the target's artifacts, `cargo clippy` passes, and the ELF has no symbols.
+export FAKE_TOOLCHAIN="$tmp/toolchain"
+mkdir "$FAKE_TOOLCHAIN"
+cat >"$FAKE_TOOLCHAIN/cargo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == ledger ]]; then
+    release="target/$3/release"
+    mkdir -p "$release"
+    for file in structured-passkeys-app structured-passkeys-app.hex structured-passkeys-app.apdu structured-passkeys-app.sha256; do
+        echo "$3" >"$release/$file"
+    done
+fi
+EOF
+cat >"$FAKE_TOOLCHAIN/arm-none-eabi-nm" <<'EOF'
+#!/usr/bin/env bash
+EOF
+chmod +x "$FAKE_TOOLCHAIN/cargo" "$FAKE_TOOLCHAIN/arm-none-eabi-nm"
 export STRUCTURED_PASSKEYS_LINUX=fake-host
 # The fake host is this machine, so its runs see this: they skip this test.
 export CHECK_TEST_NESTED=1
@@ -475,6 +531,54 @@ fi
 held_stop=""
 rm -rf "$fenced" "$fenced.removing"
 fenced=""
+
+# A rootless runtime run by a user other than root (nobody here): the container
+# runs as that user mapped to root, where the user's own ids do not exist. The
+# build and a stop's cleanup hand what the container wrote back to that user.
+nobody=65534
+as_nobody() {
+    setpriv --reuid="$nobody" --regid="$nobody" --clear-groups -- env FAKE_DOCKER_EXEC=1 "$@"
+}
+# Everything nobody runs from $tmp must be reachable.
+chmod 711 "$tmp"
+chmod 755 "$tmp/bin" "$FAKE_TOOLCHAIN"
+if ! as_nobody unshare --user --map-root-user true 2>/dev/null; then
+    fail "rootless: this host gives an unprivileged user no user namespace"
+else
+    build="$tmp/rootless-build"
+    mkdir -p "$build/app"
+    cp -R "$repo/scripts" "$build/"
+    chown -R "$nobody:$nobody" "$build"
+    if as_nobody bash "$build/scripts/device-build.sh" >"$tmp/rootless-build.out" 2>&1; then
+        artifact="$build/app/target/apex_p/release/structured-passkeys-app"
+        owner=$(stat -c %u:%g "$artifact" 2>/dev/null || true)
+        [[ "$owner" == "$nobody:$nobody" ]] || fail "rootless: $artifact is owned by '${owner}'"
+    else
+        fail "rootless: the build failed handing its files back"
+        cat "$tmp/rootless-build.out" >&2
+    fi
+
+    handback="/tmp/structured-passkeys-check-test-handback-$$"
+    mkdir -m 700 "$handback"
+    mkdir -p "$handback/src/scripts" "$handback/src/app/target"
+    cp "$repo/scripts/linux/remote.sh" "$handback/remote.sh"
+    cp "$repo/scripts/dev-tools-image.sh" "$handback/src/scripts/"
+    echo built >"$handback/src/app/target/file"
+    echo this-run >"$handback/owner"
+    chown -R "$nobody:$nobody" "$handback"
+    if as_nobody bash "$handback/remote.sh" stop "$handback" this-run 2>"$tmp/handback.err"; then
+        if grep -q "cannot hand back" "$tmp/handback.err"; then
+            fail "handback: the stop could not hand back the files the container wrote"
+            cat "$tmp/handback.err" >&2
+        fi
+        [[ ! -e "$handback" && ! -e "$handback.removing" ]] || fail "handback: $handback left on the host"
+    else
+        fail "handback: the stop failed"
+        cat "$tmp/handback.err" >&2
+    fi
+    rm -rf "$handback" "$handback.removing"
+    handback=""
+fi
 
 # A stopped check, its run ignoring SIGTERM.
 FAKE_SSH_DROPS="" FAKE_DOCKER_SECONDS=30 FAKE_DOCKER_IGNORE_TERM=1 start_check stopped
