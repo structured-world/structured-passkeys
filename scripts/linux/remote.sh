@@ -110,12 +110,14 @@ case "$mode" in
             # Files a container wrote as root into the checkout are handed back
             # first: the build returns app/target only when its command ends,
             # which a container removed by force never reaches, and a user other
-            # than root cannot remove them. The image is the one the run used.
+            # than root cannot remove them. The image is the one the run used. They
+            # go to the owner of the checkout as the container sees it: a rootless
+            # runtime maps this user to root in the container.
             if [[ $(id -u) -ne 0 && -d "$removing/src" ]] &&
                 ! docker run --rm --security-opt label=disable \
                     --volume "$removing/src:/app" --entrypoint chown \
                     "$(bash "$removing/src/scripts/dev-tools-image.sh")" \
-                    -R "$(id -u):$(id -g)" /app >/dev/null; then
+                    -R --reference=/app /app >/dev/null; then
                 echo "cannot hand back the files containers wrote in $removing" >&2
             fi
             if ! { find "$removing" -mindepth 1 -maxdepth 1 ! -name owner -exec rm -rf {} + &&

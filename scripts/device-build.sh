@@ -24,11 +24,12 @@ docker pull --quiet "$image" >/dev/null
 # The expansion stays nounset-safe for an empty array on Bash before 4.4.
 # Without an SELinux label on the container, the mount is usable on a host with
 # SELinux enforcing (Podman labels containers there) and the host files keep their labels.
+# The label guards no boundary here: the checked tree's own scripts already run on the host
+# itself (scripts/linux/remote.sh), unconfined, as the account the check logs in with.
 docker run --rm ${name[@]+"${name[@]}"} \
     --security-opt label=disable \
     --volume "$root:/app" \
     --workdir /app/app \
-    --env OWNER="$(id -u):$(id -g)" \
     "$image" bash -c '
         status=0
         for target in nanosplus nanox stax flex apex_p; do
@@ -53,8 +54,11 @@ docker run --rm ${name[@]+"${name[@]}"} \
                 status=1
             fi
         done
+        # Handed to the owner of the checkout as the container sees it, not to the
+        # caller'"'"'s numeric ids: rootless Podman or Docker maps the caller to root here,
+        # and its uid in here is a subordinate id on the host.
         if [[ -d target ]]; then
-            chown -R "$OWNER" target || status=1
+            chown -R --reference=/app target || status=1
         fi
         exit "$status"
     '
