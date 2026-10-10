@@ -152,8 +152,9 @@ fn apdu(message: &[u8]) -> Result<([u8; 4], &[u8]), StatusWord> {
 }
 
 /// Parses a CTAP1/U2F request message into the command it asks for, or the status word that
-/// refuses it. P1 and P2 of U2F_REGISTER and U2F_VERSION are not checked: §4.1 and §6.1 give them
-/// no meaning, and platforms differ in what they send (Firefox sends P1 0x03 with a registration).
+/// refuses it. P1 of U2F_REGISTER and U2F_VERSION and P2 of every command are not checked: §4.1
+/// and §6.1 give them no meaning, §3.3 defines no status word to refuse one with, and platforms
+/// differ in what they send (Firefox sends P1 0x03 with a registration).
 ///
 /// # Errors
 ///

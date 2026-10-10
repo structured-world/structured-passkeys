@@ -643,7 +643,9 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             // CTAP 2.2 changed a 2.0 rule (`up` in makeCredential, a zero-length pinUvAuthParam)
             // it did so for requests a CTAP 2.0 platform never sends, as other CTAP 2.1
             // authenticators that list "FIDO_2_0" do. "U2F_V2" names the CTAP1/U2F messages over
-            // CTAPHID_MSG, disabled while alwaysUv is on (§7.2.2).
+            // CTAPHID_MSG, disabled while alwaysUv is on (§7.2.2). §6.4 sets no order for
+            // versions (unlike pinUvAuthProtocols and algorithms), so U2F_V2 first states no
+            // preference: a platform takes the CTAP2 path whenever FIDO_2_0 is listed.
             .unsigned(0x01)?
             .array(if always_uv { 1 } else { 2 })?;
         if !always_uv {

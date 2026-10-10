@@ -674,6 +674,20 @@ fn cancel_reaches_only_the_active_request() {
     assert_eq!(transport.active(), Some(1), "the CTAP layer still answers");
 }
 
+/// CANCEL acts only on a CTAPHID_CBOR request: one on the channel of a pending CTAPHID_MSG is
+/// ignored, so it cannot abort a U2F registration waiting on its screen (§11.2.9.1.5).
+#[test]
+fn cancel_does_not_reach_a_u2f_message() {
+    let mut transport = with_channels::<1024>(1);
+    transport.receive(&init_packet(1, 0x03, 3, &[0x00, 0x03, 0x00]), 0);
+    assert_eq!(transport.request_command(), Some(Command::Msg));
+    assert_eq!(
+        exchange(&mut transport, &init_packet(1, 0x11, 0, &[]), 0),
+        (Event::None, vec![])
+    );
+    assert_eq!(transport.active(), Some(1), "the U2F request still waits");
+}
+
 /// Sends a PING of `payload` on channel 1 of `transport`, packet by packet.
 fn ping_request<const N: usize>(transport: &mut Transport<N>, payload: &[u8], now: u64) {
     let bcnt = u16::try_from(payload.len()).expect("a test payload fits BCNT");

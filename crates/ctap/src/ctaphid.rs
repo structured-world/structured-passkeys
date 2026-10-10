@@ -245,7 +245,8 @@ pub enum Event {
         /// `Command::Msg` or `Command::Cbor`.
         command: Command,
     },
-    /// `CTAPHID_CANCEL` for the request being processed on `cid`: the CTAP layer ends it with
+    /// `CTAPHID_CANCEL` for the `CTAPHID_CBOR` request being processed on `cid` (a pending
+    /// `CTAPHID_MSG` ignores CANCEL): the CTAP layer ends it with
     /// `CTAP2_ERR_KEEPALIVE_CANCEL` (§11.2.9.1.5). Never answered by itself.
     Cancel {
         /// Channel of the cancelled request.
@@ -841,9 +842,16 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
 
         match self.state {
-            State::Processing { cid: active, .. } if cid == active => {
+            State::Processing {
+                cid: active,
+                command: pending,
+                ..
+            } if cid == active => {
                 return match command {
-                    Ok(Command::Cancel) => Event::Cancel { cid },
+                    // §11.2.9.1.5: CANCEL acts only on a CTAPHID_CBOR request; a pending
+                    // CTAPHID_MSG ignores it and is answered by its own screen.
+                    Ok(Command::Cancel) if pending == Command::Cbor => Event::Cancel { cid },
+                    Ok(Command::Cancel) => Event::None,
                     // §11.2.5.3: INIT on the active channel aborts its transaction.
                     Ok(Command::Init) => {
                         self.reset();
