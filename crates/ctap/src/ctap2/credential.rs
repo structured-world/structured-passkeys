@@ -379,10 +379,22 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
     /// no reset revoked it and its key still exists (§6.2.2 step 9.1, "created by this
     /// authenticator").
     pub(super) fn locate(&self, keys: &KeyRing, rp_id: &str, id: &[u8]) -> Option<Credential> {
+        self.locate_for_hash(keys, &self.crypto.sha256(&[rp_id.as_bytes()]), id)
+    }
+
+    /// [`Self::locate`] for the RP whose RP ID hashes to `rp_id_hash`: for a CTAP1/U2F
+    /// authentication, whose application parameter is that hash.
+    pub(super) fn locate_for_hash(
+        &self,
+        keys: &KeyRing,
+        rp_id_hash: &[u8; KEY_LEN],
+        id: &[u8],
+    ) -> Option<Credential> {
         let reset_id = self.store.config().reset_id;
-        let mut credential = credential_id::open(&self.crypto, keys, rp_id, id, reset_id).ok()?;
+        let mut credential =
+            credential_id::open_for_hash(&self.crypto, keys, rp_id_hash, id, reset_id).ok()?;
         if credential.user.is_some()
-            && let Some(entry) = self.entry_of(rp_id, id)
+            && let Some(entry) = self.entry_of(rp_id_hash, id)
         {
             self.apply_names(keys, entry, id, &mut credential);
         }
@@ -392,29 +404,24 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             // Created by this NVM: it lives exactly as long as its index entry, so deleting or
             // replacing the entry revokes it (§6.1.3, key model "deletion").
             (KeySource::Seed(_), Some(store)) if self.store.store_id() == Some(store) => {
-                self.indexed(rp_id, id)
+                self.entry_of(rp_id_hash, id).is_some()
             }
             // From another install or device with the same recovery phrase: the phrase restores
             // it, unless this NVM holds a newer credential for its user.
             (KeySource::Seed(_), _) => credential
                 .user
                 .as_ref()
-                .is_none_or(|user| !self.overwritten(keys, rp_id, &user.id, id)),
+                .is_none_or(|user| !self.overwritten(keys, rp_id_hash, &user.id, id)),
         };
         live.then_some(credential)
     }
 
-    /// Whether the index holds the discoverable credential `id` for `rp_id`.
-    fn indexed(&self, rp_id: &str, id: &[u8]) -> bool {
-        self.entry_of(rp_id, id).is_some()
-    }
-
-    /// The index entry holding the discoverable credential `id` for `rp_id`, if any.
-    fn entry_of(&self, rp_id: &str, id: &[u8]) -> Option<EntryId> {
-        let rp_id_hash = self.crypto.sha256(&[rp_id.as_bytes()]);
+    /// The index entry holding the discoverable credential `id` for the RP whose RP ID hashes to
+    /// `rp_id_hash`, if any.
+    fn entry_of(&self, rp_id_hash: &[u8; KEY_LEN], id: &[u8]) -> Option<EntryId> {
         self.store
             .entries()
-            .find(|entry| entry.rp_id_hash == &rp_id_hash && entry.credential_id == id)
+            .find(|entry| entry.rp_id_hash == rp_id_hash && entry.credential_id == id)
             .map(|entry| entry.id)
     }
 
@@ -441,18 +448,29 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         }
     }
 
-    /// Whether the index holds another credential for `rp_id` and the same user than the
+    /// Whether the index holds another credential for the RP of `rp_id_hash` and the same user as the
     /// discoverable credential `id`: one makeCredential overwrote it (§6.1.2 step 17.2), and its
     /// ID must no longer yield a credential, also where the ID carries all its state (§6.1.3).
     /// No entry for the user is not an overwrite: it is NVM installed fresh, where the recovery
     /// phrase brings a seed-recoverable credential back.
-    fn overwritten(&self, keys: &KeyRing, rp_id: &str, user_id: &[u8], id: &[u8]) -> bool {
+    fn overwritten(
+        &self,
+        keys: &KeyRing,
+        rp_id_hash: &[u8; KEY_LEN],
+        user_id: &[u8],
+        id: &[u8],
+    ) -> bool {
         let reset_id = self.store.config().reset_id;
-        let rp_id_hash = self.crypto.sha256(&[rp_id.as_bytes()]);
-        self.store.newest_first(&rp_id_hash).iter().any(|entry| {
+        self.store.newest_first(rp_id_hash).iter().any(|entry| {
             entry.credential_id != id
-                && credential_id::open(&self.crypto, keys, rp_id, entry.credential_id, reset_id)
-                    .is_ok_and(|stored| stored.user.is_some_and(|user| user.id == user_id))
+                && credential_id::open_for_hash(
+                    &self.crypto,
+                    keys,
+                    rp_id_hash,
+                    entry.credential_id,
+                    reset_id,
+                )
+                .is_ok_and(|stored| stored.user.is_some_and(|user| user.id == user_id))
         })
     }
 

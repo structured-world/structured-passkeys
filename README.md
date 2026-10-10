@@ -8,6 +8,9 @@ A FIDO2 / passkey authenticator application for Ledger devices, written in Rust.
   phrase, reported as backed up).
 - CTAP 2.1 with the CTAP 2.2 extensions current relying parties request (`hmac-secret-mc` for the
   WebAuthn PRF extension), credential management, client PIN.
+- CTAP1/U2F over USB for sites and platforms that still use it, with keys from the recovery phrase,
+  each signature confirmed on the device; off while user verification is required for every
+  ceremony.
 - Encrypted backup and restore of the discoverable index through a host tool.
 - Targets: Nano S Plus, Nano X, Stax, Flex, Nano Gen5.
 

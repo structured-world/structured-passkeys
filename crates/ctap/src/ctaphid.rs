@@ -111,6 +111,22 @@ pub enum Command {
     Error = 0x3F,
 }
 
+impl Command {
+    /// The response that refuses a request of this command while the authenticator is busy with
+    /// another transport: CTAP1_ERR_CHANNEL_BUSY for a CTAP2 request (CTAP 2.2 §8.2, "Client SHOULD
+    /// retry the request after a short delay"). A U2F message is answered by a status word, and U2F
+    /// has no busy one: SW_CONDITIONS_NOT_SATISFIED is the status platforms retry (U2F raw messages
+    /// §3.3).
+    pub const fn busy_answer(self) -> &'static [u8] {
+        const CBOR_BUSY: [u8; 1] = [crate::ctap2::StatusCode::ChannelBusy as u8];
+        const MSG_BUSY: [u8; 2] = crate::ctap1::StatusWord::ConditionsNotSatisfied.to_bytes();
+        match self {
+            Command::Msg => &MSG_BUSY,
+            _ => &CBOR_BUSY,
+        }
+    }
+}
+
 /// A command code that §11.2.9 does not define.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownCommand(pub u8);
@@ -229,7 +245,8 @@ pub enum Event {
         /// `Command::Msg` or `Command::Cbor`.
         command: Command,
     },
-    /// `CTAPHID_CANCEL` for the request being processed on `cid`: the CTAP layer ends it with
+    /// `CTAPHID_CANCEL` for the `CTAPHID_CBOR` request being processed on `cid` (a pending
+    /// `CTAPHID_MSG` ignores CANCEL): the CTAP layer ends it with
     /// `CTAP2_ERR_KEEPALIVE_CANCEL` (§11.2.9.1.5). Never answered by itself.
     Cancel {
         /// Channel of the cancelled request.
@@ -537,6 +554,15 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
     }
 
+    /// The command of the request waiting for an answer: `CTAPHID_CBOR` carries a CTAP2 request,
+    /// `CTAPHID_MSG` a CTAP1/U2F message (§11.2.9.1.1).
+    pub const fn request_command(&self) -> Option<Command> {
+        match self.state {
+            State::Processing { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+
     /// The payload of the request waiting for an answer.
     pub fn request(&self) -> Option<&[u8]> {
         match self.state {
@@ -816,9 +842,16 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
 
         match self.state {
-            State::Processing { cid: active, .. } if cid == active => {
+            State::Processing {
+                cid: active,
+                command: pending,
+                ..
+            } if cid == active => {
                 return match command {
-                    Ok(Command::Cancel) => Event::Cancel { cid },
+                    // §11.2.9.1.5: CANCEL acts only on a CTAPHID_CBOR request; a pending
+                    // CTAPHID_MSG ignores it and is answered by its own screen.
+                    Ok(Command::Cancel) if pending == Command::Cbor => Event::Cancel { cid },
+                    Ok(Command::Cancel) => Event::None,
                     // §11.2.5.3: INIT on the active channel aborts its transaction.
                     Ok(Command::Init) => {
                         self.reset();

@@ -674,6 +674,20 @@ fn cancel_reaches_only_the_active_request() {
     assert_eq!(transport.active(), Some(1), "the CTAP layer still answers");
 }
 
+/// CANCEL acts only on a CTAPHID_CBOR request: one on the channel of a pending CTAPHID_MSG is
+/// ignored, so it cannot abort a U2F registration waiting on its screen (§11.2.9.1.5).
+#[test]
+fn cancel_does_not_reach_a_u2f_message() {
+    let mut transport = with_channels::<1024>(1);
+    transport.receive(&init_packet(1, 0x03, 3, &[0x00, 0x03, 0x00]), 0);
+    assert_eq!(transport.request_command(), Some(Command::Msg));
+    assert_eq!(
+        exchange(&mut transport, &init_packet(1, 0x11, 0, &[]), 0),
+        (Event::None, vec![])
+    );
+    assert_eq!(transport.active(), Some(1), "the U2F request still waits");
+}
+
 /// Sends a PING of `payload` on channel 1 of `transport`, packet by packet.
 fn ping_request<const N: usize>(transport: &mut Transport<N>, payload: &[u8], now: u64) {
     let bcnt = u16::try_from(payload.len()).expect("a test payload fits BCNT");
@@ -1208,4 +1222,14 @@ fn empty_cbor_and_msg_requests_are_invalid_length() {
         assert_eq!(transport.active(), None);
     }
     cbor_request(&mut transport, 1, 0);
+}
+
+/// A request refused while another transport runs gets an answer its own protocol reads as
+/// "retry": the one CTAP2 status byte CTAP1_ERR_CHANNEL_BUSY (0x06, CTAP 2.2 §8.2) for CBOR, and
+/// for MSG the two-byte status word SW_CONDITIONS_NOT_SATISFIED (0x6985), the U2F response a
+/// platform retries (U2F raw messages §3.3); a one-byte answer is no U2F response at all.
+#[test]
+fn a_busy_refusal_answers_in_the_request_protocol() {
+    assert_eq!(Command::Cbor.busy_answer(), [0x06]);
+    assert_eq!(Command::Msg.busy_answer(), [0x69, 0x85]);
 }

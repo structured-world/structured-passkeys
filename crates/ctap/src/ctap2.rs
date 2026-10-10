@@ -60,6 +60,7 @@ mod extensions;
 mod get_assertion;
 mod make_credential;
 mod settings;
+mod u2f;
 
 pub use client_pin::{ClientPinRequest, FEATURES, SubCommand};
 pub use config::ConfigRequest;
@@ -641,9 +642,16 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             // versions are listed: "FIDO_2_0" names the CTAP 2.0 command set (§6.4), and where
             // CTAP 2.2 changed a 2.0 rule (`up` in makeCredential, a zero-length pinUvAuthParam)
             // it did so for requests a CTAP 2.0 platform never sends, as other CTAP 2.1
-            // authenticators that list "FIDO_2_0" do.
+            // authenticators that list "FIDO_2_0" do. "U2F_V2" names the CTAP1/U2F messages over
+            // CTAPHID_MSG, disabled while alwaysUv is on (§7.2.2). §6.4 sets no order for
+            // versions (unlike pinUvAuthProtocols and algorithms), so U2F_V2 first states no
+            // preference: a platform takes the CTAP2 path whenever FIDO_2_0 is listed.
             .unsigned(0x01)?
-            .array(1)?
+            .array(if always_uv { 1 } else { 2 })?;
+        if !always_uv {
+            encoder.text("U2F_V2")?;
+        }
+        encoder
             .text("FIDO_2_0")?
             // extensions (0x02): each implemented extension, whatever versions lists. §12.8 ties
             // hmac-secret-mc only to hmac-secret, and platforms offer the PRF at registration by

@@ -38,7 +38,7 @@ const PIN_AUTH_INVALID: u8 = 0x33;
 pub(in crate::ctap2) struct Asserted {
     pub(in crate::ctap2) id: Vec<u8>,
     pub(in crate::ctap2) auth_data: Vec<u8>,
-    signature: Vec<u8>,
+    pub(in crate::ctap2) signature: Vec<u8>,
     /// `user` as `(id, name, displayName)`.
     user: Option<(Vec<u8>, Option<String>, Option<String>)>,
     pub(in crate::ctap2) number_of_credentials: Option<u64>,

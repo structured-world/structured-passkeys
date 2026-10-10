@@ -40,8 +40,10 @@ QUESTIONS = (
     "Sign in",
     "Reset the security key",
     "Already registered",
+    "Register a security key",
+    "Not registered",
 )
-CONFIRM = ("Allow", "Create passkey", "Sign in", "Reset", "OK")
+CONFIRM = ("Allow", "Create passkey", "Sign in", "Reset", "OK", "Register")
 # The application's name on its home screen.
 HOME = "Structured Passkeys"
 OTHER_ACCOUNT = "Other account"

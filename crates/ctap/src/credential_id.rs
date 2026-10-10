@@ -254,10 +254,6 @@ pub fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-fn aad<C: Crypto>(crypto: &C, rp_id: &str) -> [u8; 1 + KEY_LEN] {
-    aad_for_hash(&crypto.sha256(&[rp_id.as_bytes()]))
-}
-
 fn aad_for_hash(rp_id_hash: &[u8; KEY_LEN]) -> [u8; 1 + KEY_LEN] {
     let mut aad = [0u8; 1 + KEY_LEN];
     aad[0] = VERSION;
@@ -340,6 +336,22 @@ pub fn seal<C: Crypto>(
     rp_id: &str,
     credential: &Credential,
 ) -> Result<Vec<u8>, SealError> {
+    let rp_id_hash = crypto.sha256(&[rp_id.as_bytes()]);
+    seal_for_hash(crypto, keys, &rp_id_hash, credential)
+}
+
+/// [`seal`] for the RP whose RP ID hashes to `rp_id_hash`: for a CTAP1/U2F registration, whose
+/// application parameter is that hash and the only form of the RP it carries.
+///
+/// # Errors
+///
+/// As [`seal`].
+pub fn seal_for_hash<C: Crypto>(
+    crypto: &mut C,
+    keys: &KeyRing,
+    rp_id_hash: &[u8; KEY_LEN],
+    credential: &Credential,
+) -> Result<Vec<u8>, SealError> {
     if !key_fits(&credential.key, credential.user.is_some()) {
         return Err(SealError::KeySource);
     }
@@ -365,7 +377,7 @@ pub fn seal<C: Crypto>(
     let mut nonce = [0u8; NONCE_LEN];
     crypto.random(&mut nonce);
     let key = keys.wrap_key(crypto);
-    let aad = aad(crypto, rp_id);
+    let aad = aad_for_hash(rp_id_hash);
     let data = &mut plaintext[..length];
     let tag = crypto.aes256_gcm_seal(&key, &nonce, &aad, data);
     let mut id = Vec::with_capacity(1 + NONCE_LEN + length + TAG_LEN);

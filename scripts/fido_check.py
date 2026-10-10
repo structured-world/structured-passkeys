@@ -10,7 +10,7 @@
                               --apdu-port 9999`, whose APDU port then carries the FIDO HID
                               reports
 
-Checks: INIT allocates a channel and reports CTAPHID protocol 2 with CBOR and without MSG; PING
+Checks: INIT allocates a channel and reports CTAPHID protocol 2 with CBOR and MSG; PING
 echoes 1-byte and 1024-byte payloads, and a 1025-byte one is ERR_INVALID_LEN (the message size of
 every transport); getInfo parses with strict CBOR checks and reports the application AAGUID, a
 1024-byte maxMsgSize and the transports of the model (nfc and usb on Stax, Flex and Nano Gen5).
@@ -68,6 +68,13 @@ the credProtect level, `"hmac-secret": true` and the hmac-secret-mc output, whic
 returns again for the same salt, while one without UV returns another; a credential of credProtect
 3 is not found without UV.
 
+CTAP1/U2F messages (U2F raw messages v1.2), in Speculos and on a device: getInfo lists U2F_V2;
+U2F_VERSION; a registration refused, then confirmed, whose signature verifies with its
+certificate; check-only for this application and another; sign-ins confirmed with the enforce and
+the don't-enforce control byte, verified with the registration's key, and one refused; the key
+handle signing over CTAP2 for the appid URL; with alwaysUv on, SW_COMMAND_NOT_ALLOWED and no
+U2F_V2. The registration and sign-in screens are compared with their snapshots.
+
 The passkey list of the device's settings, in Speculos: a new passkey is listed first; deleting it
 from the list through its deletion screen leaves an ID that no longer signs, and the list, empty
 then, says so. The list and the deletion screen are compared with their snapshots.
@@ -92,7 +99,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from fido2.cose import ES256
 from fido2.ctap import CtapError
+from fido2.ctap1 import APDU, ApduError, Ctap1
 from fido2.ctap2 import Config, CredentialManagement, Ctap2
 from fido2.ctap2.pin import PinProtocolV1, PinProtocolV2
 from fido2.hid import CAPABILITY, CtapHidDevice, list_descriptors, open_connection
@@ -170,6 +179,19 @@ EXTENSIONS = ["credProtect", "hmac-secret", "hmac-secret-mc"]
 LONG_RP_ID = "a." * 121 + "example.com"
 # The start of a registration screen: a Nano heads a long one with the short question.
 REGISTER_START = "Create a passkey"
+# CTAP1/U2F: the application of the checks, as a platform sends the appid extension's URL, and
+# the screens, which name it by the first 8 bytes of its SHA-256.
+U2F_APP_ID = "https://u2f.example"
+U2F_LABEL = "U2F site #" + hashlib.sha256(U2F_APP_ID.encode()).digest()[:8].hex().upper()
+U2F_REGISTER_START = "Register a security key"
+U2F_REGISTER = "Register"
+U2F_REGISTER_REJECT = "Don't register"
+U2F_SIGN_IN_START = "Sign in"
+SIGN_IN_REJECT = "Don't sign in"
+# U2F_AUTHENTICATE's "don't-enforce-user-presence-and-sign" control byte (U2F raw messages §5.1).
+U2F_DONT_ENFORCE = 0x08
+U2F_NOT_REGISTERED = "Not registered"
+U2F_NOT_REGISTERED_CONFIRM = "OK"
 
 
 class KeepaliveLog:
@@ -283,11 +305,19 @@ def screen_shows(text: str) -> bool:
 
 
 def button(text: str) -> dict | None:
-    """The text element of the current screen that reads exactly `text`: a button label, not a
-    title that happens to contain the same word."""
-    for event in screen_texts():
-        if event["text"].strip() == text:
-            return event
+    """The text element of the current screen where the label `text` starts, read exactly: a
+    button label, not a title that happens to contain the same word. A label NBGL wraps arrives
+    as one text element per line, as the reject text of a review's footer."""
+    texts = screen_texts()
+    for start, event in enumerate(texts):
+        words = []
+        for following in texts[start:]:
+            words.append(following["text"].strip())
+            shown = " ".join(words)
+            if shown == text:
+                return event
+            if not text.startswith(shown + " "):
+                break
     return None
 
 
@@ -1079,6 +1109,157 @@ def check_credential_management(
         )
 
 
+def u2f_answered(user, start: str, labels: tuple[str, str], confirm: bool, call, snapshot=None):
+    """Runs the U2F `call` while the user answers the screen that starts with `start`, checking in
+    Speculos that it names the application by its label; returns the status word, 0x9000 with the
+    result, or the error status with None."""
+
+    def answer() -> None:
+        if isinstance(user, SpeculosUser):
+            wait_for_screen(start)
+            if snapshot is not None:
+                snapshot()
+            shown = user.read_until(labels[0] if confirm else labels[1])
+            check(
+                "".join(U2F_LABEL.split()) in shown,
+                f"U2F: the screen names the application {U2F_LABEL}",
+            )
+        user.answer(confirm, labels)
+
+    def run():
+        try:
+            return APDU.OK, call()
+        except ApduError as error:
+            return error.code, None
+
+    return while_answering(1.0, answer, run)
+
+
+def check_u2f(device: CtapHidDevice, user, snapshot) -> None:
+    """CTAP1/U2F messages over CTAPHID_MSG (U2F raw messages v1.2): getInfo lists U2F_V2 and
+    INIT reports MSG; U2F_VERSION answers U2F_V2; a registration confirmed on the device returns a
+    key handle, a certificate of the credential key and a signature that python-fido2 verifies
+    with that certificate; a refused one is SW_CONDITIONS_NOT_SATISFIED; check-only tells the key
+    handle of this application (SW_CONDITIONS_NOT_SATISFIED) from another's (SW_WRONG_DATA); a
+    sign-in confirmed on the device signs with user presence and a counter of 0, with the
+    enforce and the don't-enforce control byte alike, and a refused one gives no signature;
+    Chromium's probe registration shows the "not registered" screen and then succeeds; the
+    same key handle signs over CTAP2 for the appid URL as RP ID; with alwaysUv on, U2F is
+    SW_COMMAND_NOT_ALLOWED and getInfo leaves U2F_V2 out."""
+    ctap = Ctap2(device)
+    ctap1 = Ctap1(device)
+    check("U2F_V2" in ctap.info.versions, f"getInfo: versions {ctap.info.versions}")
+    check(ctap1.get_version() == "U2F_V2", "U2F_VERSION answers U2F_V2")
+    app_param = hashlib.sha256(U2F_APP_ID.encode()).digest()
+    client_param = hashlib.sha256(b"u2f client data").digest()
+    register_labels = (U2F_REGISTER, U2F_REGISTER_REJECT)
+    sign_in_labels = (SIGN_IN, SIGN_IN_REJECT)
+
+    status, _ = u2f_answered(
+        user, U2F_REGISTER_START, register_labels, False,
+        lambda: ctap1.register(client_param, app_param),
+    )
+    check(status == APDU.USE_NOT_SATISFIED, f"U2F: a refused registration is {status:#06x}")
+    status, registration = u2f_answered(
+        user, U2F_REGISTER_START, register_labels, True,
+        lambda: ctap1.register(client_param, app_param),
+        snapshot("u2f_register", U2F_REGISTER_START),
+    )
+    check(status == APDU.OK, f"U2F: a confirmed registration ({status:#06x})")
+    # python-fido2 checks the signature with the certificate's key, which is the credential's.
+    registration.verify(app_param, client_param)
+    check(
+        registration.certificate and len(registration.key_handle) <= 255,
+        f"U2F: the registration verifies with its {len(registration.certificate)}-byte certificate",
+    )
+    key_handle = registration.key_handle
+
+    for app, expected in ((app_param, APDU.USE_NOT_SATISFIED), (bytes(32), APDU.WRONG_DATA)):
+        try:
+            ctap1.authenticate(client_param, app, key_handle, check_only=True)
+            status = APDU.OK
+        except ApduError as error:
+            status = error.code
+        check(status == expected, f"U2F: check-only answers {status:#06x}")
+
+    status, signed = u2f_answered(
+        user, U2F_SIGN_IN_START, sign_in_labels, True,
+        lambda: ctap1.authenticate(client_param, app_param, key_handle),
+        snapshot("u2f_sign_in", U2F_SIGN_IN_START),
+    )
+    check(
+        status == APDU.OK and signed.user_presence == 1 and signed.counter == 0,
+        f"U2F: a confirmed sign-in signs with presence and counter 0 ({status:#06x})",
+    )
+    signed.verify(app_param, client_param, registration.public_key)
+    data = client_param + app_param + bytes([len(key_handle)]) + key_handle
+    status, response = u2f_answered(
+        user, U2F_SIGN_IN_START, sign_in_labels, True,
+        lambda: ctap1.send_apdu(ins=Ctap1.INS.AUTHENTICATE, p1=U2F_DONT_ENFORCE, data=data),
+    )
+    check(
+        status == APDU.OK and response[0] == 1,
+        f"U2F: don't-enforce still asks on the device and signs ({status:#06x})",
+    )
+    status, _ = u2f_answered(
+        user, U2F_SIGN_IN_START, sign_in_labels, False,
+        lambda: ctap1.authenticate(client_param, app_param, key_handle),
+    )
+    check(status == APDU.USE_NOT_SATISFIED, f"U2F: a refused sign-in is {status:#06x}")
+
+    # Chromium's probe registration, sent when none of its key handles is this device's: the
+    # "not registered" screen, then a registration Chromium reads as "not registered here".
+    probe_snapshot = snapshot("u2f_not_registered", U2F_NOT_REGISTERED)
+
+    def answer_probe() -> None:
+        if not isinstance(user, SpeculosUser):
+            user.follow([(U2F_NOT_REGISTERED, U2F_NOT_REGISTERED_CONFIRM)])
+            return
+        wait_for_screen(U2F_NOT_REGISTERED)
+        if probe_snapshot is not None:
+            probe_snapshot()
+        user.press(U2F_NOT_REGISTERED_CONFIRM)
+
+    def probe():
+        try:
+            return APDU.OK, ctap1.register(bytes([0x42] * 32), bytes([0x41] * 32))
+        except ApduError as error:
+            return error.code, None
+
+    status, _ = while_answering(1.0, answer_probe, probe)
+    check(status == APDU.OK, f"U2F: the probe registration ends after its screen ({status:#06x})")
+
+    # The appid extension: the platform asks CTAP2 with the appid URL as the RP ID. CTAP has no
+    # appid extension; the client sends the appId in place of the rpId (WebAuthn L3 §10.1.1).
+    client_data_hash = hashlib.sha256(b"client data").digest()
+    status, assertion = pressed(
+        user,
+        # A Nano opens the question on its short title, "Sign in?".
+        [(U2F_SIGN_IN_START, SIGN_IN, None)],
+        lambda: ctap.get_assertion(
+            U2F_APP_ID, client_data_hash, [{"type": "public-key", "id": key_handle}]
+        ),
+    )
+    check(status == CtapError.ERR.SUCCESS, f"getAssertion: the U2F key handle as appid ({status!r})")
+    assertion.verify(client_data_hash, ES256.from_ctap1(registration.public_key))
+
+    token = uv_token(ctap, user, PERMISSION_ACFG)
+    config = Config(ctap, PinProtocolV2(), token)
+    config.toggle_always_uv()
+    try:
+        ctap1.get_version()
+        status = APDU.OK
+    except ApduError as error:
+        status = error.code
+    versions = ctap.get_info().versions
+    config.toggle_always_uv()
+    check(
+        status == 0x6986 and "U2F_V2" not in versions,
+        f"U2F: with alwaysUv, SW_COMMAND_NOT_ALLOWED ({status:#06x}) and versions {versions}",
+    )
+    check(ctap1.get_version() == "U2F_V2", "U2F: back with alwaysUv off")
+
+
 def check_config(device: CtapHidDevice, user) -> None:
     """authenticatorConfig toggleAlwaysUv (CTAP 2.2 §6.11.2) with an acfg token from built-in UV:
     getInfo reports alwaysUv on, then off again."""
@@ -1205,8 +1386,8 @@ def main() -> None:
     check(device.version == 2, f"INIT: channel {device._channel_id:#x}, CTAPHID protocol 2")
     capabilities = CAPABILITY(device.capabilities)
     check(
-        CAPABILITY.CBOR in capabilities and CAPABILITY.NMSG in capabilities,
-        f"INIT: capabilities {capabilities!r} (CBOR, no MSG)",
+        CAPABILITY.CBOR in capabilities and CAPABILITY.NMSG not in capabilities,
+        f"INIT: capabilities {capabilities!r} (CBOR and MSG)",
     )
 
     if args.speculos:
@@ -1254,6 +1435,7 @@ def main() -> None:
     check_credential_management(device, user, snapshot, registered)
     check_config(device, user)
     check_extensions(device, user)
+    check_u2f(device, user, snapshot)
     if args.speculos:
         check_settings_list(device, user, snapshot)
         # The reset left the PIN unset, so it can be set; a device keeps its PIN.

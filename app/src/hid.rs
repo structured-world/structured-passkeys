@@ -15,6 +15,7 @@ use core::cell::{Cell, RefCell, UnsafeCell};
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 
+pub use structured_passkeys_ctap::ctaphid::Command;
 use structured_passkeys_ctap::ctaphid::{
     DeviceInfo, Event, KeepaliveStatus, REPORT_SIZE, Report, Transport,
 };
@@ -204,7 +205,7 @@ unsafe extern "C" {
     fn USBD_CtlSendData(pdev: *mut c_void, pbuf: *mut u8, len: u32) -> UsbdStatus;
 }
 
-/// What INIT reports: the application version, CBOR only (U2F messages are not implemented).
+/// What INIT reports: the application version, CTAP2 over CBOR and CTAP1/U2F messages.
 const DEVICE_INFO: DeviceInfo = DeviceInfo {
     version: [
         version_part(env!("CARGO_PKG_VERSION_MAJOR")),
@@ -212,7 +213,7 @@ const DEVICE_INFO: DeviceInfo = DeviceInfo {
         version_part(env!("CARGO_PKG_VERSION_PATCH")),
     ],
     cbor: true,
-    msg: false,
+    msg: true,
 };
 
 /// A version number of at most 255, as INIT carries one byte per part.
@@ -397,10 +398,11 @@ impl Hid {
     }
 }
 
-/// The request the transport handed out since the last call, given to `parse`; `None` when there
-/// is none. The request stays in the transport's buffer, which the main loop must not hold while
-/// it runs the command, so `parse` returns what the command needs.
-pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
+/// The request the transport handed out since the last call, given to `parse` with the command
+/// that carried it (`CTAPHID_CBOR` or `CTAPHID_MSG`); `None` when there is none. The request
+/// stays in the transport's buffer, which the main loop must not hold while it runs the command,
+/// so `parse` returns what the command needs.
+pub fn take_request<R>(parse: impl FnOnce(Command, &[u8]) -> R) -> Option<R> {
     with_hid(|hid| {
         if !core::mem::take(&mut hid.pending) {
             return None;
@@ -408,25 +410,30 @@ pub fn take_request<R>(parse: impl FnOnce(&[u8]) -> R) -> Option<R> {
         hid.running = hid.transport.active();
         hid.superseded = false;
         hid.cancelled = false;
-        hid.transport.request().map(parse)
+        let command = hid.transport.request_command()?;
+        hid.transport
+            .request()
+            .map(|request| parse(command, request))
     })
     .flatten()
 }
 
 /// Refuses the request the transport handed out while a request from another transport runs, or
-/// while the settings' screens wait: it is answered at once with CTAP1_ERR_CHANNEL_BUSY (CTAP 2.2
-/// §8.2: "Client SHOULD retry the request after a short delay"), as the NFC applet answers in the
-/// other direction, rather than run afterwards with its CANCEL unheard meanwhile.
+/// while the settings' screens wait: it is answered at once with the retryable refusal of its
+/// protocol ([`Command::busy_answer`]), as the NFC applet answers in the other direction, rather
+/// than run afterwards with its CANCEL unheard meanwhile.
 pub fn refuse_request() {
     with_hid(|hid| {
-        if core::mem::take(&mut hid.pending)
-            && hid
-                .transport
-                .respond(
-                    &[structured_passkeys_ctap::ctap2::StatusCode::ChannelBusy as u8],
-                    hid.now_ms,
-                )
-                .is_ok()
+        if !core::mem::take(&mut hid.pending) {
+            return;
+        }
+        let Some(command) = hid.transport.request_command() else {
+            return;
+        };
+        if hid
+            .transport
+            .respond(command.busy_answer(), hid.now_ms)
+            .is_ok()
         {
             hid.pump();
         }

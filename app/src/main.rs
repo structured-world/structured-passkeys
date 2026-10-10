@@ -19,8 +19,9 @@ use ledger_device_sdk::include_gif;
 use ledger_device_sdk::io::ApduTransport;
 use ledger_device_sdk::io::{self, CommError, CommandOrEvent, DecodedEventType, StatusWords};
 use ledger_device_sdk::nbgl::NbglGlyph;
+use structured_passkeys_ctap::ctap1;
 use structured_passkeys_ctap::ctap2::{
-    Authenticator, Link, MIN_MESSAGE_SIZE, MaxMsgSize, Settings, Transports,
+    Authenticator, Command, Link, MIN_MESSAGE_SIZE, MaxMsgSize, Settings, StatusCode, Transports,
 };
 use structured_passkeys_ctap::storage::Store;
 use zeroize::Zeroize;
@@ -122,13 +123,24 @@ extern "C" fn sample_main(_arg0: u32) {
             None => {}
         }
         // Parsed while the transport holds the request; run once it is released, so the screen
-        // of a waiting command can take events.
-        if let Some(command) = hid::take_request(|request| authenticator.parse(request)) {
+        // of a waiting command can take events. CTAPHID_MSG carries CTAP1/U2F messages,
+        // CTAPHID_CBOR CTAP2 requests.
+        if let Some(request) = hid::take_request(|command, request| match command {
+            hid::Command::Msg => HidRequest::Ctap1(ctap1::parse(request)),
+            _ => HidRequest::Ctap2(authenticator.parse(request)),
+        }) {
             #[cfg(any(target_os = "stax", target_os = "flex", target_os = "apex_p"))]
             sync_tap(&mut authenticator, &interfaces.nfc);
             let mut ui =
                 ui::DeviceUi::new(comm, &mut home, &HOME_GLYPH, Link::Usb, &mut interfaces);
-            let length = authenticator.execute(command, Link::Usb, &mut ui, &mut response[..]);
+            let length = match request {
+                HidRequest::Ctap2(command) => {
+                    authenticator.execute(command, Link::Usb, &mut ui, &mut response[..])
+                }
+                HidRequest::Ctap1(message) => {
+                    authenticator.execute_ctap1(message, &mut ui, &mut response[..])
+                }
+            };
             hid::respond(&response[..length]);
             response[..length].zeroize();
         }
@@ -154,6 +166,19 @@ extern "C" fn sample_main(_arg0: u32) {
             }
         }
     }
+}
+
+/// A request over FIDO HID, parsed by the protocol its CTAPHID command carries.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held for one pass of the loop: the parsed CTAP2 command needs its stack bytes \
+              whichever request it is, and boxing it would add a heap allocation per request"
+)]
+enum HidRequest {
+    /// `CTAPHID_CBOR`: a CTAP2 request.
+    Ctap2(Result<Command, StatusCode>),
+    /// `CTAPHID_MSG`: a CTAP1/U2F message.
+    Ctap1(Result<ctap1::Request, ctap1::StatusWord>),
 }
 
 /// Answers a command on the Ledger management channel. No management command is implemented:
