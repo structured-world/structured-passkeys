@@ -112,6 +112,13 @@ pub enum Prompt<'a> {
         /// The RP ID of the request.
         rp_id: &'a str,
     },
+    /// A CTAP1/U2F registration (U2F raw messages §4.1): test-of-user-presence for a new key from
+    /// the recovery phrase, the only origin a U2F credential takes. The message carries no RP ID,
+    /// only its hash, so `rp_id` is the label the authenticator makes of it.
+    U2fRegistration {
+        /// The label of the application parameter.
+        rp_id: &'a str,
+    },
     /// Delete the discoverable credential of `account` for `rp_id`, chosen in the settings list.
     /// A device-only one cannot come back, a seed-recoverable one only through the recovery
     /// phrase on another device or after a reinstall.

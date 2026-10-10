@@ -243,6 +243,8 @@ const TOKEN_ASKS: &str = "Your browser or system asks to ";
 const TOKEN_ON: &str = " on ";
 const EXCLUDED_HAS: &str = "This security key already has a passkey for ";
 const REGISTER_FOR: &str = "For ";
+const U2F_REGISTER_WITH: &str = "Register a security key with ";
+const U2F_KEY: &str = "A U2F key, created only from your recovery phrase.\n";
 const SIGN_IN_AS: &str = "As ";
 const DELETE_FOR: &str = "Delete the passkey for ";
 const DELETE_OF: &str = "Of ";
@@ -262,6 +264,15 @@ const _: () = {
     assert!(EXCLUDED_HAS.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
     // The titles: "Delete the passkey for <RP>?" is the longest.
     assert!(DELETE_FOR.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
+    assert!(U2F_REGISTER_WITH.len() + MAX_SHOWN_RP_ID_LEN + 1 < TEXT_LEN);
+    // A U2F registration: what its key is.
+    assert!(
+        U2F_KEY.len()
+            + origin_name(Origin::SeedRecoverable).len()
+            + 2
+            + origin_meaning(Origin::SeedRecoverable).len()
+            < TEXT_LEN
+    );
     let origins = [Origin::DeviceOnly, Origin::SeedRecoverable];
     let mut index = 0;
     while index < origins.len() {
@@ -1171,6 +1182,25 @@ impl Ui for DeviceUi<'_> {
                     reject: c"Close",
                 }
             }
+            // A U2F registration names the site by the label of its application parameter, the
+            // only form of it the message carries, and the one key type U2F takes.
+            Prompt::U2fRegistration { rp_id } => {
+                message = Text::new(&[U2F_REGISTER_WITH, rp_id, "?"]);
+                sub_message = Text::new(&[
+                    U2F_KEY,
+                    origin_name(Origin::SeedRecoverable),
+                    ": ",
+                    origin_meaning(Origin::SeedRecoverable),
+                ]);
+                Choices {
+                    icon: Icon::App,
+                    title: c"Register a security key?",
+                    message: message.as_c_str(),
+                    sub_message: sub_message.as_c_str(),
+                    confirm: c"Register",
+                    reject: c"Don't register",
+                }
+            }
             // A deletion names the RP, the account and what becomes of its key.
             Prompt::Delete { rp_id, account } => {
                 message = Text::new(&[DELETE_FOR, rp_id, "?"]);
@@ -1211,6 +1241,14 @@ impl Ui for DeviceUi<'_> {
             (Answer::Rejected, Prompt::Reset) => Ending::Reported {
                 success: false,
                 message: c"Reset cancelled",
+            },
+            (Answer::Confirmed, Prompt::U2fRegistration { .. }) => Ending::Reported {
+                success: true,
+                message: c"Registration confirmed",
+            },
+            (Answer::Rejected, Prompt::U2fRegistration { .. }) => Ending::Reported {
+                success: false,
+                message: c"Registration cancelled",
             },
             // The passkey list comes back at once and shows the answer: a status page here would
             // only flash before it.

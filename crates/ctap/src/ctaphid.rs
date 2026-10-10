@@ -537,6 +537,15 @@ impl<const N: usize, S: BorrowMut<[u8; N]>> Transport<N, S> {
         }
     }
 
+    /// The command of the request waiting for an answer: `CTAPHID_CBOR` carries a CTAP2 request,
+    /// `CTAPHID_MSG` a CTAP1/U2F message (§11.2.9.1.1).
+    pub const fn request_command(&self) -> Option<Command> {
+        match self.state {
+            State::Processing { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+
     /// The payload of the request waiting for an answer.
     pub fn request(&self) -> Option<&[u8]> {
         match self.state {

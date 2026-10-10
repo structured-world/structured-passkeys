@@ -6,6 +6,7 @@
 //! - [`ctaphid`]: the USB HID transport (framing, reassembly, channels).
 //! - [`nfc`]: the NFC transport (ISO/IEC 7816-4 applet, chaining, status updates).
 //! - [`cbor`]: the CTAP2 canonical CBOR encoding.
+//! - [`ctap1`]: CTAP1/U2F messages over `CTAPHID_MSG`.
 //! - [`ctap2`]: CTAP2 command dispatch, status codes and authenticatorGetInfo.
 //! - [`crypto`]: the cryptographic platform the device implements, and HKDF on top of it.
 //! - [`pin`]: the PIN/UV auth protocols and the pinUvAuthToken state.
@@ -20,6 +21,7 @@ pub mod attestation;
 pub mod cbor;
 pub mod credential_id;
 pub mod crypto;
+pub mod ctap1;
 pub mod ctap2;
 pub mod ctaphid;
 pub mod keys;

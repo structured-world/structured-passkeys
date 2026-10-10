@@ -37,6 +37,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ctap1"
+path = "fuzz_targets/ctap1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ctap2"
 path = "fuzz_targets/ctap2.rs"
 test = false

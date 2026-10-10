@@ -86,6 +86,8 @@ pub(super) enum Asked {
     Excluded { rp_id: String },
     /// The deletion of this account's credential.
     Delete { rp_id: String, account: Shown },
+    /// A CTAP1/U2F registration for the application this label stands for.
+    U2fRegistration { rp_id: String },
     /// A registration for this account, the origin selector starting on `default_origin`.
     Registration {
         rp_id: String,
@@ -120,6 +122,9 @@ impl Asked {
             Prompt::Delete { rp_id, account } => Asked::Delete {
                 rp_id: String::from(rp_id),
                 account: Shown::from_account(&account),
+            },
+            Prompt::U2fRegistration { rp_id } => Asked::U2fRegistration {
+                rp_id: String::from(rp_id),
             },
         }
     }
@@ -383,17 +388,20 @@ pub(super) const OPTIONS_WITHOUT_PIN: [u8; 80] = [
     0xF5, // "pinUvAuthToken": true
 ];
 
-/// getInfo answers CTAP2_OK and the map {1: ["FIDO_2_0"], 2: ["credProtect", "hmac-secret",
-/// "hmac-secret-mc"], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9: ["usb"], 13: 4} in canonical
-/// order: the required versions, FIDO_2_0 for the CTAP 2.0 command set the conformance suite
-/// covers, the implemented extensions, among them hmac-secret-mc, which platforms take as the
-/// offer of the PRF at registration, and aaguid, the options, maxMsgSize, the PIN/UV auth
-/// protocols, two first, the transports, and minPINLength, which "MUST be present if the
-/// authenticator supports authenticatorClientPIN" (§6.4), at the 4 code points of §6.5.1.
+/// getInfo answers CTAP2_OK and the map {1: ["U2F_V2", "FIDO_2_0"], 2: ["credProtect",
+/// "hmac-secret", "hmac-secret-mc"], 3: AAGUID, 4: options, 5: 1024, 6: [2, 1], 9: ["usb"], 13: 4}
+/// in canonical order: the required versions, U2F_V2 for the CTAP1/U2F messages and FIDO_2_0 for
+/// the CTAP 2.0 command set the conformance suite covers, the implemented extensions, among them
+/// hmac-secret-mc, which platforms take as the offer of the PRF at registration, and aaguid, the
+/// options, maxMsgSize, the PIN/UV auth protocols, two first, the transports, and minPINLength,
+/// which "MUST be present if the authenticator supports authenticatorClientPIN" (§6.4), at the 4
+/// code points of §6.5.1.
 #[test]
 fn get_info_reports_the_implemented_members() {
     let response = process(&[0x04]);
-    let mut expected = vec![0x00, 0xA8, 0x01, 0x81, 0x68];
+    let mut expected = vec![0x00, 0xA8, 0x01, 0x82, 0x66];
+    expected.extend_from_slice(b"U2F_V2");
+    expected.push(0x68);
     expected.extend_from_slice(b"FIDO_2_0");
     expected.extend_from_slice(&[0x02, 0x83, 0x6B]);
     expected.extend_from_slice(b"credProtect");
@@ -409,6 +417,26 @@ fn get_info_reports_the_implemented_members() {
     expected.extend_from_slice(&[0x0D, 0x04]);
     assert_eq!(response, expected);
     assert_eq!(validate(&response[1..]), Ok(()), "canonical CBOR");
+}
+
+/// With alwaysUv on, U2F is disabled (§7.2.2) and versions is ["FIDO_2_0"] alone; turned off,
+/// U2F_V2 is back.
+#[test]
+fn always_uv_leaves_u2f_out_of_versions() {
+    let mut authenticator = authenticator();
+    let mut ui = Scripted::new(Answer::Confirmed);
+    let mut response = [0u8; 256];
+    authenticator.toggle_always_uv();
+    let length = authenticator.process(&[0x04], Link::Usb, &mut ui, &mut response);
+    let mut versions = vec![0x00, 0xA8, 0x01, 0x81, 0x68];
+    versions.extend_from_slice(b"FIDO_2_0");
+    versions.push(0x02);
+    assert!(response[..length].starts_with(&versions));
+    authenticator.toggle_always_uv();
+    let length = authenticator.process(&[0x04], Link::Usb, &mut ui, &mut response);
+    let mut versions = vec![0x00, 0xA8, 0x01, 0x82, 0x66];
+    versions.extend_from_slice(b"U2F_V2");
+    assert!(response[..length].starts_with(&versions));
 }
 
 /// A device with NFC lists both transports, ["nfc", "usb"], whichever one getInfo arrives on:
