@@ -62,6 +62,14 @@ application runs inside a Ledger wallet, where the operating system owns all thr
     gives the same PRF outputs and the relying party's data encrypted with them stays readable.
     A device-only credential keeps random values in its key slot (discoverable) or derives them
     from the device key, which never leaves the device (non-discoverable).
+  - A CTAP1/U2F registration takes the seed-recoverable origin with no choice: it is the default
+    for a server-side credential, and a U2F registration is one, made without user verification
+    on a screen that is only the test of user presence.
+  - The signature counter is 0 in every CTAP2 assertion and every U2F authentication, although
+    U2F raw messages §5.4 describes an incrementing one: a counter in the application's storage
+    restarts with every application update, and a seed-recoverable credential used on two devices
+    runs two counters; relying parties read either as a cloned authenticator. U2F credentials now
+    reach relying parties through the WebAuthn `appid` extension, where 0 means no counter.
 - A new mapping is a decision about the product, not a review fix: it comes with its reason in
   the code and is added to this list.
 

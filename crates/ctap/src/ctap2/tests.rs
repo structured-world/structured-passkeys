@@ -88,6 +88,8 @@ pub(super) enum Asked {
     Delete { rp_id: String, account: Shown },
     /// A CTAP1/U2F registration for the application this label stands for.
     U2fRegistration { rp_id: String },
+    /// The browser's U2F probe: this device is not registered with the site.
+    U2fNotRegistered,
     /// A registration for this account, the origin selector starting on `default_origin`.
     Registration {
         rp_id: String,
@@ -126,6 +128,7 @@ impl Asked {
             Prompt::U2fRegistration { rp_id } => Asked::U2fRegistration {
                 rp_id: String::from(rp_id),
             },
+            Prompt::U2fNotRegistered => Asked::U2fNotRegistered,
         }
     }
 }

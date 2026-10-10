@@ -111,6 +111,22 @@ pub enum Command {
     Error = 0x3F,
 }
 
+impl Command {
+    /// The response that refuses a request of this command while the authenticator is busy with
+    /// another transport: CTAP1_ERR_CHANNEL_BUSY for a CTAP2 request (CTAP 2.2 §8.2, "Client SHOULD
+    /// retry the request after a short delay"). A U2F message is answered by a status word, and U2F
+    /// has no busy one: SW_CONDITIONS_NOT_SATISFIED is the status platforms retry (U2F raw messages
+    /// §3.3).
+    pub const fn busy_answer(self) -> &'static [u8] {
+        const CBOR_BUSY: [u8; 1] = [crate::ctap2::StatusCode::ChannelBusy as u8];
+        const MSG_BUSY: [u8; 2] = crate::ctap1::StatusWord::ConditionsNotSatisfied.to_bytes();
+        match self {
+            Command::Msg => &MSG_BUSY,
+            _ => &CBOR_BUSY,
+        }
+    }
+}
+
 /// A command code that §11.2.9 does not define.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnknownCommand(pub u8);

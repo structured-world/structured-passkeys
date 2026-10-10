@@ -190,6 +190,8 @@ U2F_SIGN_IN_START = "Sign in"
 SIGN_IN_REJECT = "Don't sign in"
 # U2F_AUTHENTICATE's "don't-enforce-user-presence-and-sign" control byte (U2F raw messages §5.1).
 U2F_DONT_ENFORCE = 0x08
+U2F_NOT_REGISTERED = "Not registered"
+U2F_NOT_REGISTERED_CONFIRM = "OK"
 
 
 class KeepaliveLog:
@@ -1140,7 +1142,8 @@ def check_u2f(device: CtapHidDevice, user, snapshot) -> None:
     with that certificate; a refused one is SW_CONDITIONS_NOT_SATISFIED; check-only tells the key
     handle of this application (SW_CONDITIONS_NOT_SATISFIED) from another's (SW_WRONG_DATA); a
     sign-in confirmed on the device signs with user presence and a counter of 0, with the
-    enforce and the don't-enforce control byte alike, and a refused one gives no signature; the
+    enforce and the don't-enforce control byte alike, and a refused one gives no signature;
+    Chromium's probe registration shows the "not registered" screen and then succeeds; the
     same key handle signs over CTAP2 for the appid URL as RP ID; with alwaysUv on, U2F is
     SW_COMMAND_NOT_ALLOWED and getInfo leaves U2F_V2 out."""
     ctap = Ctap2(device)
@@ -1204,7 +1207,30 @@ def check_u2f(device: CtapHidDevice, user, snapshot) -> None:
     )
     check(status == APDU.USE_NOT_SATISFIED, f"U2F: a refused sign-in is {status:#06x}")
 
-    # The appid extension: the platform asks CTAP2 with the appid URL as the RP ID.
+    # Chromium's probe registration, sent when none of its key handles is this device's: the
+    # "not registered" screen, then a registration Chromium reads as "not registered here".
+    probe_snapshot = snapshot("u2f_not_registered", U2F_NOT_REGISTERED)
+
+    def answer_probe() -> None:
+        if not isinstance(user, SpeculosUser):
+            user.follow([(U2F_NOT_REGISTERED, U2F_NOT_REGISTERED_CONFIRM)])
+            return
+        wait_for_screen(U2F_NOT_REGISTERED)
+        if probe_snapshot is not None:
+            probe_snapshot()
+        user.press(U2F_NOT_REGISTERED_CONFIRM)
+
+    def probe():
+        try:
+            return APDU.OK, ctap1.register(bytes([0x42] * 32), bytes([0x41] * 32))
+        except ApduError as error:
+            return error.code, None
+
+    status, _ = while_answering(1.0, answer_probe, probe)
+    check(status == APDU.OK, f"U2F: the probe registration ends after its screen ({status:#06x})")
+
+    # The appid extension: the platform asks CTAP2 with the appid URL as the RP ID. CTAP has no
+    # appid extension; the client sends the appId in place of the rpId (WebAuthn L3 §10.1.1).
     client_data_hash = hashlib.sha256(b"client data").digest()
     status, assertion = pressed(
         user,

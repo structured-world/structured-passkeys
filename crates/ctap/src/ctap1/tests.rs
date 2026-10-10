@@ -56,6 +56,16 @@ fn version_in_every_encoding() {
     }
 }
 
+/// An extended Le alone with a nonzero value (ISO/IEC 7816-4 §5.1, case 2E: `00 Le1 Le2`) carries
+/// no data: `00 00 06` asks for the six bytes of U2F_VERSION's answer, and `00 FF FF` for any length.
+#[test]
+fn version_with_a_nonzero_extended_le() {
+    for le in [[0x00, 0x06], [0x01, 0x00], [0xFF, 0xFF]] {
+        let message = [0x00, 0x03, 0x00, 0x00, 0x00, le[0], le[1]];
+        assert_eq!(parse(&message), Ok(Request::Version), "{message:02x?}");
+    }
+}
+
 /// U2F_VERSION carries no data (§6.1): data is SW_WRONG_LENGTH.
 #[test]
 fn version_with_data_is_wrong_length() {

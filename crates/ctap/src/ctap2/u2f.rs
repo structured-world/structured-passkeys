@@ -25,13 +25,17 @@ const REGISTRATION_SIGNED_RESERVED: u8 = 0x00;
 /// The user presence byte of an authentication (§5.4): presence verified. Every signature here
 /// is confirmed on the device.
 const USER_PRESENT: u8 = 0x01;
-/// The counter of an authentication (§5.4): always 0, as for CTAP2 credentials (key model,
-/// signature counter).
+/// The counter of an authentication (§5.4): always 0, as for CTAP2 credentials, although §5.4
+/// describes one incremented by every authentication. A counter in the application's storage
+/// restarts with every application update and runs separately on each device that holds a
+/// seed-recoverable key; relying parties read both as a cloned authenticator, and through the
+/// WebAuthn `appid` extension, where U2F credentials are used now, 0 means no counter.
 const COUNTER: [u8; 4] = [0; 4];
 
 /// The application parameter of the registration Chromium sends to a U2F device that holds none
 /// of the credentials of an authentication, so the user touches the device and the browser can
-/// report that it is not registered: 32 bytes of 0x41, the hash of no real application.
+/// report that it is not registered: 32 bytes of 0x41, the hash of no real application. The key
+/// handle it gets is for no relying party, and nothing of it is stored.
 const PROBE_APPLICATION: [u8; APPLICATION_LEN] = [0x41; APPLICATION_LEN];
 /// The challenge parameter of that registration, 32 bytes of 0x42.
 const PROBE_CHALLENGE: [u8; CHALLENGE_LEN] = [0x42; CHALLENGE_LEN];
@@ -139,21 +143,27 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
         ui: &mut U,
         data: &mut Vec<u8>,
     ) -> Result<(), StatusWord> {
-        // The probe registration needs no screen: it names no site, and the answer that the user
-        // is not present ends it.
-        if application == &PROBE_APPLICATION && challenge == &PROBE_CHALLENGE {
-            return Err(StatusWord::ConditionsNotSatisfied);
-        }
-        let label = u2f_label(application);
-        // §4.3: SW_CONDITIONS_NOT_SATISFIED until test-of-user-presence; a refusal, a timeout or a
-        // cancelled request leaves the user not present.
-        if ui.confirm(
-            Prompt::U2fRegistration {
-                rp_id: label.as_str(),
-            },
-            USER_ACTION_TIMEOUT_MS,
-        ) != Answer::Confirmed
-        {
+        // §4.3: SW_CONDITIONS_NOT_SATISFIED until test-of-user-presence; a timeout or a cancelled
+        // request leaves the user not present.
+        let present = if application == &PROBE_APPLICATION && challenge == &PROBE_CHALLENGE {
+            // The browser retries SW_CONDITIONS_NOT_SATISFIED until its timeout and reports the
+            // device as not registered only after a successful registration, whose content it
+            // ignores: either answer of the screen is the presence it waits for.
+            matches!(
+                ui.confirm(Prompt::U2fNotRegistered, USER_ACTION_TIMEOUT_MS),
+                Answer::Confirmed | Answer::Rejected
+            )
+        } else {
+            // A refusal of a real registration leaves the user not present too.
+            let label = u2f_label(application);
+            ui.confirm(
+                Prompt::U2fRegistration {
+                    rp_id: label.as_str(),
+                },
+                USER_ACTION_TIMEOUT_MS,
+            ) == Answer::Confirmed
+        };
+        if !present {
             return Err(StatusWord::ConditionsNotSatisfied);
         }
         let keys = KeyRing::new(&mut self.crypto);
@@ -166,6 +176,8 @@ impl<C: Crypto, S: Storage> Authenticator<C, S> {
             .crypto
             .p256_public_key(&private_key)
             .map_err(|_| StatusWord::Unknown)?;
+        // Seed-recoverable, the default origin of a server-side credential, which a U2F one is:
+        // its screen is only the test of user presence and offers no other origin.
         let credential = Credential {
             key: KeySource::Seed(*seed),
             alg: ES256,

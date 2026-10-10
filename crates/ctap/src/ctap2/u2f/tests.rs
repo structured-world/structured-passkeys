@@ -174,30 +174,78 @@ fn registration_without_presence_is_conditions_not_satisfied() {
     }
 }
 
-/// The probe registration (application 0x41..., challenge 0x42...) is answered at once with
-/// SW_CONDITIONS_NOT_SATISFIED and shows no screen; a registration that differs in one byte is a
-/// real one and asks.
+/// The probe registration (application 0x41..., challenge 0x42...) asks on the "not registered"
+/// screen, and either answer completes it with a registration of §4.3's layout, signed over the
+/// probe's parameters: Chromium retries SW_CONDITIONS_NOT_SATISFIED until its timeout and
+/// reports the device as not registered only after a successful response. A registration that
+/// differs in one byte is a real one and asks on the registration screen.
 #[test]
-fn the_probe_registration_shows_no_screen() {
-    let mut authenticator = authenticator();
+fn the_probe_registration_completes_after_the_not_registered_screen() {
+    for answer in [Answer::Confirmed, Answer::Rejected] {
+        let mut authenticator = authenticator();
+        let mut ui = Scripted::new(answer);
+        let probe = Request::Register {
+            challenge: [0x42; 32],
+            application: [0x41; 32],
+        };
+        let made = registered(&u2f(&mut authenticator, &mut ui, probe));
+        let signed = [
+            &[0x00][..],
+            &[0x41; 32],
+            &[0x42; 32],
+            &made.key_handle,
+            &made.public_key,
+        ]
+        .concat();
+        assert!(
+            verifies(&made.public_key, &signed, &made.signature),
+            "{answer:?}"
+        );
+        assert_eq!(
+            ui.asked,
+            [(Asked::U2fNotRegistered, USER_ACTION_TIMEOUT_MS)],
+            "{answer:?}"
+        );
+    }
     let mut ui = Scripted::new(Answer::Confirmed);
-    let probe = Request::Register {
-        challenge: [0x42; 32],
-        application: [0x41; 32],
-    };
-    assert_eq!(
-        u2f(&mut authenticator, &mut ui, probe),
-        CONDITIONS_NOT_SATISFIED
-    );
-    assert_eq!(ui.asked, []);
     let mut challenge = [0x42; 32];
     challenge[31] = 0x43;
     let real = Request::Register {
         challenge,
         application: [0x41; 32],
     };
-    registered(&u2f(&mut authenticator, &mut ui, real));
-    assert_eq!(ui.asked.len(), 1);
+    registered(&u2f(&mut authenticator(), &mut ui, real));
+    assert_eq!(
+        ui.asked,
+        [(
+            Asked::U2fRegistration {
+                rp_id: u2f_label(&[0x41; 32]),
+            },
+            USER_ACTION_TIMEOUT_MS,
+        )]
+    );
+}
+
+/// A probe the user leaves unanswered or the platform cancels stays SW_CONDITIONS_NOT_SATISFIED,
+/// test-of-user-presence not met (§4.3), with no key handle.
+#[test]
+fn an_unanswered_probe_is_conditions_not_satisfied() {
+    for answer in [Answer::TimedOut, Answer::Cancelled] {
+        let mut ui = Scripted::new(answer);
+        let probe = Request::Register {
+            challenge: [0x42; 32],
+            application: [0x41; 32],
+        };
+        assert_eq!(
+            u2f(&mut authenticator(), &mut ui, probe),
+            CONDITIONS_NOT_SATISFIED,
+            "{answer:?}"
+        );
+        assert_eq!(
+            ui.asked,
+            [(Asked::U2fNotRegistered, USER_ACTION_TIMEOUT_MS)]
+        );
+    }
 }
 
 /// An authentication with a key handle of this application signs application || 0x01 || counter

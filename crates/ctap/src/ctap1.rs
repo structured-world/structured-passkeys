@@ -128,10 +128,10 @@ fn apdu(message: &[u8]) -> Result<([u8; 4], &[u8]), StatusWord> {
         .split_first_chunk::<4>()
         .ok_or(StatusWord::WrongLength)?;
     let data = match body {
-        // No data and no Le, or a short Le alone.
-        [] | [_] => &[][..],
-        // Extended: `00`, then Lc on two bytes, the data and an optional two-byte Le; or `00`
-        // and a two-byte Le alone, which reads as an Lc of zero.
+        // No data and no Le, a short Le alone, or an extended Le alone (`00 Le1 Le2`, ISO/IEC
+        // 7816-4 §5.1 case 2E): command data follows an extended Lc, so three bytes hold no data.
+        [] | [_] | [0x00, _, _] => &[][..],
+        // Extended: `00`, then Lc on two bytes, the data and an optional two-byte Le.
         [0x00, high, low, rest @ ..] => {
             let lc = usize::from(u16::from_be_bytes([*high, *low]));
             match rest.len().checked_sub(lc) {

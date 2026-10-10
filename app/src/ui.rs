@@ -1201,6 +1201,16 @@ impl Ui for DeviceUi<'_> {
                     reject: c"Don't register",
                 }
             }
+            // The browser's U2F probe names no site; either answer ends it, and the browser then
+            // says the key is not registered there.
+            Prompt::U2fNotRegistered => Choices {
+                icon: Icon::Notice,
+                title: c"Not registered",
+                message: c"Not registered",
+                sub_message: c"This security key is not registered with this website.",
+                confirm: c"OK",
+                reject: c"Close",
+            },
             // A deletion names the RP, the account and what becomes of its key.
             Prompt::Delete { rp_id, account } => {
                 message = Text::new(&[DELETE_FOR, rp_id, "?"]);
@@ -1254,7 +1264,7 @@ impl Ui for DeviceUi<'_> {
             // only flash before it.
             (_, Prompt::Delete { .. }) => Ending::Continued,
             // A selection or a token is followed by the request it prepares, and an excluded
-            // registration has said all there is.
+            // registration or an unregistered key has said all there is.
             _ => Ending::Answered,
         };
         self.end(ending);

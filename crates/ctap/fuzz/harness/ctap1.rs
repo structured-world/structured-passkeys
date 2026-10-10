@@ -6,8 +6,9 @@
 //! registered beforehand, so signing paths are reached. A message must never panic, and for any
 //! input: the response ends with a status word of U2F raw messages §3.3; while alwaysUv is on it
 //! is SW_COMMAND_NOT_ALLOWED alone (CTAP 2.2 §7.2.2); a signature comes back only after the user
-//! confirmed on the device; a check-only authentication never succeeds (§5.1); and a successful
-//! registration has the layout of §4.3.
+//! confirmed on the device, or answered the browser's probe registration either way (its key
+//! handle is for no relying party); a check-only authentication never succeeds (§5.1); and a
+//! successful registration has the layout of §4.3.
 
 use structured_passkeys_ctap::credential_id::Origin;
 use structured_passkeys_ctap::crypto::KEY_LEN;
@@ -155,6 +156,11 @@ pub fn run(data: &[u8]) {
         (parsed, check_only)
     };
     let registration = matches!(request, Ok(Request::Register { .. }));
+    let probe = matches!(
+        request,
+        Ok(Request::Register { challenge, application })
+            if challenge == [0x42; 32] && application == [0x41; 32]
+    );
     let signing = matches!(
         request,
         Ok(Request::Register { .. } | Request::Authenticate { .. })
@@ -179,10 +185,9 @@ pub fn run(data: &[u8]) {
     }
     assert!(!check_only, "a check-only authentication never succeeds");
     if signing {
-        assert_eq!(
-            answer,
-            Answer::Confirmed,
-            "a signature only after confirmation"
+        assert!(
+            answer == Answer::Confirmed || (probe && answer == Answer::Rejected),
+            "a signature only after confirmation, or after either answer to the browser's probe"
         );
     }
     if registration {
