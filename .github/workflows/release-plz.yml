@@ -41,7 +41,7 @@ jobs:
       - name: Rust toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: Release pull request
-        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.5.141
         with:
           command: release-pr
         env:
@@ -77,7 +77,7 @@ jobs:
         run: rustup toolchain install
       - name: Tag and release
         id: release
-        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5.139
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.5.141
         with:
           command: release
         env:
